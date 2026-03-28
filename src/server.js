@@ -199,7 +199,7 @@ app.post("/api/chat", async (req, res, next) => {
 
     project.chatHistory = Array.isArray(project.chatHistory) ? project.chatHistory : [];
     project.draftHistory = Array.isArray(project.draftHistory) ? project.draftHistory : [];
-    const contextualAttachments = await extendAttachmentsWithLatestDraft(project, promptText, attachments);
+    const contextualAttachments = await extendAttachmentsWithChatContext(project, promptText, attachments);
     let memory = await studioMemoryService.getMemory(project);
     const brain = await studioBrainService.getBrain();
     const toolManifest = await studioBrainService.getToolManifest();
@@ -287,17 +287,17 @@ app.post("/api/chat", async (req, res, next) => {
         summary: promptText
       });
     } else if (action === "commit_draft") {
-      const latestDraft = getLatestOpenDraft(project);
-      if (!latestDraft) {
-        assistantReply = "There is no draft waiting in chat to add yet.";
+      const latestSource = getLatestCommitSource(project, promptText);
+      if (!latestSource) {
+        assistantReply = "There is no recent generated image in chat to add yet.";
       } else {
         const targetLayerName =
-          route.targetLayerName || guessLayerNameFromPrompt(promptText) || latestDraft.targetLayerName || "Accessory";
-        const commitResult = await commitDraftToLayer(project, latestDraft.id, targetLayerName);
+          route.targetLayerName || guessLayerNameFromPrompt(promptText) || latestSource.targetLayerName || "Accessory";
+        const commitResult = await commitGeneratedSourceToLayer(project, latestSource, targetLayerName);
         project = commitResult.project;
         memory = commitResult.memory;
-        assistantGenerated = toAssistantGeneratedImage(commitResult.draft);
-        assistantReply = assistantReply || `Added that draft into ${commitResult.layer.name}.`;
+        assistantGenerated = toAssistantGeneratedImage(commitResult.source);
+        assistantReply = assistantReply || `Added that image into ${commitResult.layer.name} and put it on the preview.`;
       }
     } else {
       if (route.canvasWidth && route.canvasHeight) {
@@ -329,8 +329,8 @@ app.post("/api/chat", async (req, res, next) => {
       createdAt: new Date().toISOString()
     });
     project.chatHistory.push({
-      id: createId("assistant"),
-      role: "assistant",
+      id: createId("draw-tech"),
+      role: "draw-tech",
       text: assistantReply,
       generatedImage: assistantGenerated,
       createdAt: new Date().toISOString()
@@ -536,6 +536,38 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
   }
 });
 
+app.get("/api/projects/:projectId/preview/render", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const sources = await getPreviewCompositeSources(project);
+
+    if (!sources.length) {
+      res.status(404).json({ error: "No selected preview layers to render." });
+      return;
+    }
+
+    const width = Math.max(1, Number(project.canvas?.width || 1024));
+    const height = Math.max(1, Number(project.canvas?.height || 1024));
+    const compositeBuffer = await sharp({
+      create: {
+        width,
+        height,
+        channels: 4,
+        background: { r: 0, g: 0, b: 0, alpha: 0 }
+      }
+    })
+      .composite(sources.map((source) => ({ input: source.absolutePath })))
+      .png()
+      .toBuffer();
+
+    res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "no-store");
+    res.end(compositeBuffer);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/projects/:projectId/export/hashlips", async (req, res, next) => {
   try {
     const project = await projectService.readProject(req.params.projectId);
@@ -592,15 +624,18 @@ app.post("/api/projects/:projectId/layers/:layerId/select", async (req, res, nex
     }
 
     const variantId = String(req.body?.variantId || "");
-    layer.selectedVariantId = layer.variants.some((variant) => variant.id === variantId)
-      ? variantId
+    const hasVariant = layer.variants.some((variant) => variant.id === variantId);
+    layer.selectedVariantId = hasVariant
+      ? layer.selectedVariantId === variantId
+        ? null
+        : variantId
       : null;
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
     const memory = await studioMemoryService.appendChangelog(project, {
       type: "selection",
-      title: `Selected ${layer.name} variant`,
-      detail: variantId || "Cleared active variant selection."
+      title: layer.selectedVariantId ? `Selected ${layer.name} variant` : `Cleared ${layer.name} variant`,
+      detail: layer.selectedVariantId || "Cleared active variant selection."
     });
     res.json({ project, memory });
   } catch (error) {
@@ -615,7 +650,7 @@ app.post("/api/projects/:projectId/drafts/:draftId/commit", async (req, res, nex
     res.json({
       project: result.project,
       memory: result.memory,
-      draft: result.draft,
+      draft: result.source,
       layer: result.layer,
       variant: result.variant
     });
@@ -949,28 +984,74 @@ async function commitDraftToLayer(project, draftId, targetLayerName) {
     throw error;
   }
 
-  const layer = ensureLayer(project, targetLayerName || draft.targetLayerName || "Accessory");
+  return commitGeneratedSourceToLayer(project, draft, targetLayerName);
+}
+
+async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
+  const layer = ensureLayer(project, targetLayerName || source.targetLayerName || "Accessory");
   if (!Array.isArray(layer.variants)) {
     layer.variants = [];
   }
 
+  const existingVariant =
+    layer.variants.find((item) => item.imageUrl === source.imageUrl) ||
+    layer.variants.find(
+      (item) =>
+        cleanText(item.prompt) &&
+        cleanText(item.prompt) === cleanText(source.prompt) &&
+        cleanText(item.name) === cleanText(source.name)
+    ) ||
+    null;
+
+  if (existingVariant) {
+    layer.selectedVariantId = existingVariant.id;
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    let memory = await studioMemoryService.appendChangelog(project, {
+      type: "select-existing",
+      title: `Reused ${existingVariant.name}`,
+      detail: `Already present in ${layer.name}, so it was selected instead of duplicated.`
+    });
+    memory = await refreshMemoryIfPossible(project, memory);
+    return {
+      project,
+      memory,
+      source: {
+        ...source,
+        status: "committed",
+        committedLayerId: layer.id,
+        committedLayerName: layer.name,
+        committedVariantId: existingVariant.id
+      },
+      layer,
+      variant: existingVariant
+    };
+  }
+
   const variant = {
     id: createId("variant"),
-    name: cleanText(draft.name) || `${layer.name} Variant`,
-    notes: cleanText(draft.notes),
-    prompt: cleanText(draft.prompt),
-    imageUrl: draft.imageUrl,
-    analysis: draft.analysis || null,
+    name: cleanText(source.name) || `${layer.name} Variant`,
+    notes: cleanText(source.notes),
+    prompt: cleanText(source.prompt),
+    imageUrl: source.imageUrl,
+    analysis: source.analysis || null,
     createdAt: new Date().toISOString()
   };
 
   layer.variants.push(variant);
   layer.selectedVariantId = variant.id;
-  draft.status = "committed";
-  draft.committedLayerId = layer.id;
-  draft.committedLayerName = layer.name;
-  draft.committedVariantId = variant.id;
-  draft.updatedAt = new Date().toISOString();
+
+  const draft = Array.isArray(project.draftHistory)
+    ? project.draftHistory.find((item) => item.id === source.id)
+    : null;
+  if (draft) {
+    draft.status = "committed";
+    draft.committedLayerId = layer.id;
+    draft.committedLayerName = layer.name;
+    draft.committedVariantId = variant.id;
+    draft.updatedAt = new Date().toISOString();
+  }
+
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
 
@@ -980,7 +1061,19 @@ async function commitDraftToLayer(project, draftId, targetLayerName) {
     detail: `Added to ${layer.name}.`
   });
   memory = await refreshMemoryIfPossible(project, memory);
-  return { project, memory, draft, layer, variant };
+  return {
+    project,
+    memory,
+    source: {
+      ...source,
+      status: "committed",
+      committedLayerId: layer.id,
+      committedLayerName: layer.name,
+      committedVariantId: variant.id
+    },
+    layer,
+    variant
+  };
 }
 
 function ensureLayer(project, layerName) {
@@ -1057,23 +1150,23 @@ async function resolveAttachments(ids) {
   return attachments;
 }
 
-async function extendAttachmentsWithLatestDraft(project, promptText, attachments) {
+async function extendAttachmentsWithChatContext(project, promptText, attachments) {
   const values = Array.isArray(attachments) ? [...attachments] : [];
-  const latestDraft = getLatestOpenDraft(project);
-  if (!latestDraft || !shouldUseLatestDraftAsReference(promptText)) {
+  const source = getLatestCommitSource(project, promptText);
+  if (!source || !shouldUseLatestDraftAsReference(promptText)) {
     return values;
   }
 
   try {
-    const absolutePath = path.join(rootDir, latestDraft.imageUrl.replace(/^\//, "").replaceAll("/", path.sep));
+    const absolutePath = publicAssetUrlToAbsolutePath(source.imageUrl);
     const fileBuffer = await fs.readFile(absolutePath);
     values.push({
-      id: latestDraft.id,
-      name: latestDraft.name || "Latest draft",
+      id: source.id,
+      name: source.name || "Latest generated image",
       mimeType: "image/png",
       width: Number(project.canvas?.width || 0),
       height: Number(project.canvas?.height || 0),
-      imageUrl: latestDraft.imageUrl,
+      imageUrl: source.imageUrl,
       dataUrl: `data:image/png;base64,${fileBuffer.toString("base64")}`
     });
   } catch {
@@ -1130,8 +1223,167 @@ function getLatestOpenDraft(project) {
   return (project.draftHistory || []).find((draft) => cleanText(draft.status) !== "committed") || null;
 }
 
+function getLatestCommitSource(project, promptText = "") {
+  const referencedChatImage = findChatReferencedImage(project, promptText);
+  if (referencedChatImage) {
+    return referencedChatImage;
+  }
+
+  const latestDraft = getLatestOpenDraft(project);
+  if (latestDraft) {
+    return latestDraft;
+  }
+
+  for (const message of [...(project.chatHistory || [])].reverse()) {
+    if (message.role === "user") {
+      continue;
+    }
+
+    if (message.generatedImage?.imageUrl) {
+      return {
+        id: cleanText(message.generatedImage.id) || createId("generated"),
+        type: cleanText(message.generatedImage.type) || "preview",
+        name: cleanText(message.generatedImage.name) || "Generated image",
+        notes: cleanText(message.generatedImage.notes),
+        prompt: cleanText(message.generatedImage.prompt),
+        imageUrl: message.generatedImage.imageUrl,
+        targetLayerName: cleanText(message.generatedImage.targetLayerName),
+        status: cleanText(message.generatedImage.status) || "ready"
+      };
+    }
+  }
+
+  const preview = Array.isArray(project.previewHistory) ? project.previewHistory[0] : null;
+  if (!preview?.imageUrl) {
+    return null;
+  }
+
+  return {
+    id: cleanText(preview.id) || createId("preview"),
+    type: "preview",
+    name: "Preview",
+    notes: cleanText(preview.notes),
+    prompt: cleanText(preview.prompt),
+    imageUrl: preview.imageUrl,
+    targetLayerName: "",
+    status: "ready"
+  };
+}
+
+function findChatReferencedImage(project, promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const generatedMessages = [...(project.chatHistory || [])]
+    .reverse()
+    .filter((message) => message.role !== "user" && message.generatedImage?.imageUrl);
+
+  if (!generatedMessages.length) {
+    return null;
+  }
+
+  const scoredMatches = generatedMessages
+    .map((message) => {
+      const image = message.generatedImage || {};
+      return {
+        message,
+        score: scoreGeneratedImageMatch(image, message, promptText)
+      };
+    })
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  if (scoredMatches[0]?.message?.generatedImage) {
+    return normalizeGeneratedChatImage(scoredMatches[0].message.generatedImage);
+  }
+
+  const referencePhrases = ["it", "that", "from chat", "from earlier", "last preview", "last one", "the one"];
+  if (referencePhrases.some((phrase) => lowered.includes(phrase))) {
+    return normalizeGeneratedChatImage(generatedMessages[0].generatedImage);
+  }
+
+  return null;
+}
+
+function normalizeGeneratedChatImage(image) {
+  return {
+    id: cleanText(image.id) || createId("generated"),
+    type: cleanText(image.type) || "preview",
+    name: cleanText(image.name) || "Generated image",
+    notes: cleanText(image.notes),
+    prompt: cleanText(image.prompt),
+    imageUrl: image.imageUrl,
+    targetLayerName: cleanText(image.targetLayerName),
+    status: cleanText(image.status) || "ready"
+  };
+}
+
+function scoreGeneratedImageMatch(image, message, promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const tokens = extractPromptTokens(promptText);
+  const name = cleanText(image.name).toLowerCase();
+  const targetLayer = cleanText(image.targetLayerName).toLowerCase();
+  const notes = cleanText(image.notes).toLowerCase();
+  const prompt = cleanText(image.prompt).toLowerCase();
+  const text = cleanText(message.text).toLowerCase();
+  let score = 0;
+
+  if (name && lowered.includes(name)) {
+    score += 14;
+  }
+
+  if (targetLayer && lowered.includes(targetLayer)) {
+    score += 12;
+  }
+
+  for (const token of tokens) {
+    if (name === token) {
+      score += 12;
+    } else if (name.includes(token)) {
+      score += 8;
+    }
+
+    if (targetLayer === token) {
+      score += 10;
+    } else if (targetLayer.includes(token)) {
+      score += 7;
+    }
+
+    if (text.includes(token)) {
+      score += 4;
+    }
+
+    if (prompt.includes(token)) {
+      score += 3;
+    }
+
+    if (notes.includes(token)) {
+      score += 1;
+    }
+  }
+
+  if (image.type === "preview" && /(preview|base|main|character|cat)/.test(lowered)) {
+    score += 3;
+  }
+
+  return score;
+}
+
+function extractPromptTokens(promptText) {
+  return [...new Set(
+    cleanText(promptText)
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((token) => token.length >= 3 && !["add", "put", "onto", "into", "then", "with", "from", "that", "this", "chat", "preview", "folder", "layer"].includes(token))
+  )];
+}
+
 function guessLayerNameFromPrompt(promptText) {
   const lowered = cleanText(promptText).toLowerCase();
+  const folderMatch = lowered.match(/([a-z0-9-]+)\s+folder/);
+  if (folderMatch?.[1]) {
+    const name = folderMatch[1];
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  }
+
   const known = ["background", "body", "face", "eyes", "mouth", "hat", "headwear", "clothes", "clothing", "fur", "accessory"];
   const match = known.find((item) => lowered.includes(item));
   if (!match) {
@@ -1194,7 +1446,7 @@ function buildHashLipsLayerFolders(project) {
     .map((layer, index) => {
       const variants = (layer.variants || []).map((variant, variantIndex) => ({
         ...variant,
-        absolutePath: path.join(rootDir, variant.imageUrl.replace(/^\//, "").replaceAll("/", path.sep)),
+        absolutePath: publicAssetUrlToAbsolutePath(variant.imageUrl),
         fileName: `${String(variantIndex + 1).padStart(2, "0")}_${sanitizeFileName(variant.name, "variant")}.png`
       }));
 
@@ -1283,7 +1535,7 @@ async function inspectVariantAgainstLayer(layer, variantBuffer) {
 
   for (const existing of Array.isArray(layer.variants) ? layer.variants.slice(-4) : []) {
     try {
-      const absolutePath = path.join(rootDir, existing.imageUrl.replace(/^\//, "").replaceAll("/", path.sep));
+      const absolutePath = publicAssetUrlToAbsolutePath(existing.imageUrl);
       const existingBuffer = await fs.readFile(absolutePath);
       const comparison = await assetToolService.comparePngBuffers(variantBuffer, existingBuffer);
       if (comparison.similarity > strongestSimilarity) {
@@ -1310,7 +1562,7 @@ async function inspectDraftAgainstHistory(project, draftBuffer) {
 
   for (const existing of (project.draftHistory || []).slice(0, 6)) {
     try {
-      const absolutePath = path.join(rootDir, existing.imageUrl.replace(/^\//, "").replaceAll("/", path.sep));
+      const absolutePath = publicAssetUrlToAbsolutePath(existing.imageUrl);
       const existingBuffer = await fs.readFile(absolutePath);
       const comparison = await assetToolService.comparePngBuffers(draftBuffer, existingBuffer);
       if (comparison.similarity > strongestSimilarity) {
@@ -1384,6 +1636,57 @@ function buildHashLipsExportManifest(project, layerFolders) {
       }))
     }))
   };
+}
+
+async function getPreviewCompositeSources(project) {
+  const sources = [];
+  const seen = new Set();
+  const preview = Array.isArray(project.previewHistory)
+    ? project.previewHistory.find((item) => item.id === project.selectedPreviewId) || project.previewHistory[0]
+    : null;
+
+  const pushSource = async (imageUrl) => {
+    const cleanUrl = cleanText(imageUrl);
+    if (!cleanUrl || seen.has(cleanUrl)) {
+      return;
+    }
+
+    const absolutePath = publicAssetUrlToAbsolutePath(cleanUrl);
+    try {
+      await fs.access(absolutePath);
+      sources.push({ imageUrl: cleanUrl, absolutePath });
+      seen.add(cleanUrl);
+    } catch {
+      // Ignore missing assets so one broken file does not stop the composite render.
+    }
+  };
+
+  await pushSource(preview?.imageUrl);
+
+  for (const layer of project.layers || []) {
+    const variant = (layer.variants || []).find((item) => item.id === layer.selectedVariantId);
+    await pushSource(variant?.imageUrl);
+  }
+
+  return sources;
+}
+
+function publicAssetUrlToAbsolutePath(assetUrl) {
+  const cleanUrl = cleanText(assetUrl);
+  if (!cleanUrl) {
+    return "";
+  }
+
+  const normalized = cleanUrl.replaceAll("/", path.sep);
+  if (cleanUrl.startsWith("/generated/")) {
+    return path.join(generatedDir, normalized.replace(/^\\generated\\/, ""));
+  }
+
+  if (cleanUrl.startsWith("/uploads/")) {
+    return path.join(uploadsDir, normalized.replace(/^\\uploads\\/, ""));
+  }
+
+  return path.join(rootDir, normalized.replace(/^[\\/]+/, ""));
 }
 
 function buildHashLipsConfig(project, layerFolders) {

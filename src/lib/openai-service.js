@@ -22,6 +22,7 @@ async function routeUserPrompt(apiKey, project, memory, brain, toolManifest, pro
     "Use commit_draft when the user is approving a recent draft and wants it added to a folder or layer.",
     "Use feedback when the user is telling you what they liked, disliked, or want remembered about prior generations or layer behavior.",
     "Use remove_variant or remove_layer only when the user clearly asks to delete.",
+    "You can use recent chat history and recent generated images to resolve references like it, that, the cat from earlier, the last preview, or the one in chat.",
     "assistantReply should be one short sentence for the visible chat log.",
     "If targetLayerName is obvious, fill it in with a human-friendly layer name.",
     "variantDirection should capture the requested visual change in a short art-director style phrase.",
@@ -273,6 +274,21 @@ function buildProjectPayload(project) {
     collectionGoal: project.collectionGoal,
     styleGuide: project.styleGuide,
     canvas: project.canvas,
+    recentChat: (project.chatHistory || []).slice(-10).map((message) => ({
+      role: cleanText(message.role),
+      text: cleanText(message.text),
+      generatedImage: message.generatedImage
+        ? {
+            id: cleanText(message.generatedImage.id),
+            type: cleanText(message.generatedImage.type),
+            name: cleanText(message.generatedImage.name),
+            notes: cleanText(message.generatedImage.notes),
+            prompt: cleanText(message.generatedImage.prompt),
+            targetLayerName: cleanText(message.generatedImage.targetLayerName),
+            status: cleanText(message.generatedImage.status)
+          }
+        : null
+    })),
     draftHistory: (project.draftHistory || []).slice(0, 8).map((draft) => ({
       id: draft.id,
       name: draft.name,

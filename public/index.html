@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=16" />
   </head>
   <body>
     <div class="app-shell">
@@ -59,13 +59,18 @@
             </div>
           </div>
 
-          <div class="prompt-row">
+          <div class="prompt-editor">
             <textarea
               id="promptInput"
               rows="3"
               placeholder="Example: Make me a cyber frog NFT preview with a moody neon city and strong collectible shapes."
             ></textarea>
-            <button id="sendPromptBtn" class="btn btn-primary btn-large">Generate</button>
+          </div>
+          <div class="prompt-submit-row">
+            <button id="sendPromptBtn" class="btn btn-primary btn-compact">Generate</button>
+            <div id="loadingRail" class="loading-rail" aria-hidden="true">
+              <div id="loadingFill" class="loading-fill"></div>
+            </div>
           </div>
         </div>
       </section>
@@ -105,6 +110,7 @@
           <div class="stage-wrap">
             <div id="stage" class="stage">
               <div class="stage-grid"></div>
+              <canvas id="previewCanvas" class="preview-canvas" aria-label="NFT preview canvas"></canvas>
               <img id="previewImage" class="stage-image stage-preview hidden" alt="" />
               <div id="layerStack" class="layer-stack"></div>
               <div id="stageEmpty" class="stage-empty">No preview yet</div>
@@ -139,7 +145,7 @@
       </section>
 
       <div id="toast" class="toast hidden"></div>
-      <script type="module" src="/app.js"></script>
+      <script type="module" src="/app.js?v=16"></script>
     </div>
   </body>
 </html>

@@ -2,7 +2,12 @@ const state = {
   project: null,
   config: null,
   pendingAttachments: [],
-  busy: false
+  busy: false,
+  previewAsset: {
+    requestKey: "",
+    loaded: false,
+    failed: false
+  }
 };
 
 const elements = {
@@ -16,12 +21,15 @@ const elements = {
   attachImagesBtn: document.getElementById("attachImagesBtn"),
   attachmentPreviewList: document.getElementById("attachmentPreviewList"),
   promptInput: document.getElementById("promptInput"),
+  loadingRail: document.getElementById("loadingRail"),
+  loadingFill: document.getElementById("loadingFill"),
   sendPromptBtn: document.getElementById("sendPromptBtn"),
   refreshPreviewBtn: document.getElementById("refreshPreviewBtn"),
   downloadHashlipsBtn: document.getElementById("downloadHashlipsBtn"),
   projectTitle: document.getElementById("projectTitle"),
   canvasBadge: document.getElementById("canvasBadge"),
   stage: document.getElementById("stage"),
+  previewCanvas: document.getElementById("previewCanvas"),
   previewImage: document.getElementById("previewImage"),
   stageEmpty: document.getElementById("stageEmpty"),
   layerStack: document.getElementById("layerStack"),
@@ -30,6 +38,20 @@ const elements = {
   layerCount: document.getElementById("layerCount"),
   toast: document.getElementById("toast")
 };
+
+elements.previewImage.addEventListener("load", () => {
+  state.previewAsset.loaded = true;
+  state.previewAsset.failed = false;
+  elements.previewImage.classList.remove("hidden");
+  syncPreviewStatus();
+});
+
+elements.previewImage.addEventListener("error", () => {
+  state.previewAsset.loaded = false;
+  state.previewAsset.failed = true;
+  elements.previewImage.classList.add("hidden");
+  syncPreviewStatus();
+});
 
 bootstrap().catch((error) => showToast(error.message, true));
 
@@ -165,34 +187,44 @@ function render() {
 
 function renderPreview() {
   const selectedPreview = getSelectedPreview();
-  const selectedVariants = (state.project?.layers || [])
-    .map((layer) => layer.variants.find((variant) => variant.id === layer.selectedVariantId))
-    .filter(Boolean);
+  const selectedVariants = getSelectedVariants();
+  const stackSources = buildPreviewStackSources(selectedPreview, selectedVariants);
+  const renderToken = stackSources.map((item) => `${item.imageUrl}:${item.cacheKey}`).join("|");
+  const previewUrl =
+    state.project?.id && stackSources.length
+      ? `/api/projects/${state.project.id}/preview/render?v=${encodeURIComponent(
+          state.project.updatedAt || renderToken || Date.now()
+        )}`
+      : "";
 
   elements.stage.style.aspectRatio = getAspectRatio(readCanvasFromState());
-  elements.layerStack.innerHTML = "";
+  elements.stage.style.background = "#e8e8e8";
+  elements.stage.style.position = "relative";
+  elements.stage.style.overflow = "hidden";
+  elements.previewCanvas.style.display = "none";
+  elements.layerStack.style.display = "none";
 
-  if (selectedPreview?.imageUrl) {
-    elements.previewImage.src = selectedPreview.imageUrl;
-    elements.previewImage.classList.remove("hidden");
+  if (previewUrl) {
+    state.previewAsset.requestKey = renderToken;
+    if (elements.previewImage.dataset.requestKey !== renderToken) {
+      state.previewAsset.loaded = false;
+      state.previewAsset.failed = false;
+      elements.previewImage.dataset.requestKey = renderToken;
+      elements.previewImage.classList.add("hidden");
+      elements.previewImage.src = previewUrl;
+    } else if (state.previewAsset.loaded && !state.previewAsset.failed) {
+      elements.previewImage.classList.remove("hidden");
+    }
   } else {
+    state.previewAsset.requestKey = "";
+    state.previewAsset.loaded = false;
+    state.previewAsset.failed = false;
+    elements.previewImage.dataset.requestKey = "";
     elements.previewImage.removeAttribute("src");
     elements.previewImage.classList.add("hidden");
   }
 
-  for (const variant of selectedVariants) {
-    const img = document.createElement("img");
-    img.className = "stack-layer";
-    img.src = variant.imageUrl;
-    img.alt = variant.name;
-    elements.layerStack.appendChild(img);
-  }
-
-  if (selectedPreview?.imageUrl || selectedVariants.length) {
-    elements.stageEmpty.classList.add("hidden");
-  } else {
-    elements.stageEmpty.classList.remove("hidden");
-  }
+  syncPreviewStatus();
 }
 
 function renderChat() {
@@ -208,7 +240,7 @@ function renderChat() {
     .map(
       (message) => `
         <article class="chat-entry ${message.role === "user" ? "user" : "assistant"}">
-          <div class="chat-role">${escapeHtml(message.role)}</div>
+          <div class="chat-role">${escapeHtml(message.role === "draw-tech" ? "Draw-Tech" : message.role)}</div>
           <div class="chat-text">${escapeHtml(message.text)}</div>
           ${
             message.generatedImage?.imageUrl
@@ -323,12 +355,14 @@ function renderLayers() {
                             <div class="variant-notes">${escapeHtml(variant.notes || "")}</div>
                             <div class="variant-actions">
                               <button
-                                class="btn ${variant.id === layer.selectedVariantId ? "btn-primary" : "btn-ghost"}"
+                                class="check-toggle ${variant.id === layer.selectedVariantId ? "is-checked" : ""}"
                                 data-action="select-variant"
                                 data-layer-id="${layer.id}"
                                 data-variant-id="${variant.id}"
+                                aria-pressed="${variant.id === layer.selectedVariantId ? "true" : "false"}"
                               >
-                                ${variant.id === layer.selectedVariantId ? "Check Marked" : "Check Mark"}
+                                <span class="check-toggle-box" aria-hidden="true">${variant.id === layer.selectedVariantId ? "✓" : ""}</span>
+                                <span>${variant.id === layer.selectedVariantId ? "On Preview" : "Show On Preview"}</span>
                               </button>
                               <button
                                 class="btn btn-danger"
@@ -340,7 +374,7 @@ function renderLayers() {
                               </button>
                               ${
                                 variant.id === layer.selectedVariantId
-                                  ? '<span class="selected-chip">Live on preview</span>'
+                                  ? '<span class="selected-chip">Checked into preview</span>'
                                   : ""
                               }
                             </div>
@@ -449,6 +483,52 @@ function getSelectedPreview() {
   return previews.find((item) => item.id === state.project.selectedPreviewId) || previews[0];
 }
 
+function getSelectedVariants() {
+  return (state.project?.layers || [])
+    .map((layer) => layer.variants.find((variant) => variant.id === layer.selectedVariantId))
+    .filter(Boolean);
+}
+
+function buildPreviewStackSources(selectedPreview, selectedVariants) {
+  const seen = new Set();
+  const items = [];
+
+  const pushSource = (source) => {
+    const imageUrl = String(source?.imageUrl || "").trim();
+    if (!imageUrl || seen.has(imageUrl)) {
+      return;
+    }
+
+    seen.add(imageUrl);
+    items.push({
+      imageUrl,
+      name: source.name || "Preview image",
+      cacheKey: source.createdAt || source.id || state.project?.updatedAt || "",
+      className: source.className || "stack-layer"
+    });
+  };
+
+  pushSource({
+    imageUrl: selectedPreview?.imageUrl,
+    name: selectedPreview?.name || state.project?.title || "Preview",
+    createdAt: selectedPreview?.createdAt,
+    id: selectedPreview?.id,
+    className: "stage-image stack-base-preview"
+  });
+
+  for (const variant of selectedVariants) {
+    pushSource({
+      imageUrl: variant.imageUrl,
+      name: variant.name,
+      createdAt: variant.createdAt,
+      id: variant.id,
+      className: "stack-layer"
+    });
+  }
+
+  return items;
+}
+
 function resolvePromptForSubmit(options = {}) {
   const typedPrompt = elements.promptInput.value.trim();
   if (typedPrompt) {
@@ -483,6 +563,7 @@ function syncBusyState() {
   document.querySelectorAll("button").forEach((button) => {
     button.disabled = state.busy;
   });
+  elements.loadingRail.classList.toggle("is-active", state.busy);
 }
 
 async function api(url, options = {}) {
@@ -517,6 +598,35 @@ function getAspectRatio(canvas) {
 
 function formatCanvas(canvas) {
   return `${Number(canvas?.width || 1024)} x ${Number(canvas?.height || 1024)}`;
+}
+
+function buildAssetUrl(url, cacheKey = "") {
+  const cleanUrl = String(url || "").trim();
+  if (!cleanUrl) {
+    return "";
+  }
+
+  const separator = cleanUrl.includes("?") ? "&" : "?";
+  return `${cleanUrl}${separator}v=${encodeURIComponent(String(cacheKey || "static"))}`;
+}
+
+function syncPreviewStatus() {
+  const hasPreview = buildPreviewStackSources(getSelectedPreview(), getSelectedVariants()).length > 0;
+  let message = "No preview yet";
+  let showStatus = false;
+
+  if (!hasPreview) {
+    showStatus = true;
+  } else if (!state.previewAsset.loaded && !state.previewAsset.failed) {
+    message = "Loading preview...";
+    showStatus = true;
+  } else if (state.previewAsset.failed) {
+    message = "Preview render failed.";
+    showStatus = true;
+  }
+
+  elements.stageEmpty.textContent = message;
+  elements.stageEmpty.classList.toggle("hidden", !showStatus);
 }
 
 function escapeHtml(value) {
