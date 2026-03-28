@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "name": "draw-tech-studio-tools",
+  "systemGuidance": "These are local backend image tools available to Draw Tech. Use them to keep prompts production-minded and layer-safe. Do not invent capabilities outside this manifest.",
+  "packages": [
+    {
+      "id": "sharp",
+      "label": "sharp",
+      "purpose": "High-speed image pipeline for resizing, compositing, alpha-safe normalization, and export."
+    },
+    {
+      "id": "jimp",
+      "label": "jimp",
+      "purpose": "Pure JavaScript bitmap utility for future paintovers, masking, and pixel-level transforms when a fallback tool is useful."
+    },
+    {
+      "id": "pngjs",
+      "label": "pngjs",
+      "purpose": "Raw PNG reader and writer for pixel inspection, alpha bounds, and low-level image analysis."
+    },
+    {
+      "id": "pixelmatch",
+      "label": "pixelmatch",
+      "purpose": "Pixel diff tool for spotting near-duplicate layer variants and weak iteration jumps."
+    },
+    {
+      "id": "image-size",
+      "label": "image-size",
+      "purpose": "Fast dimension inspection for uploads and generated assets."
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "canvas-normalization",
+      "name": "Canvas normalization",
+      "packages": ["sharp"],
+      "useWhen": [
+        "A generated image must be resized to the project's final canvas.",
+        "Layer exports need consistent HashLips-ready dimensions."
+      ]
+    },
+    {
+      "id": "layer-stack-safety",
+      "name": "Layer stack safety checks",
+      "packages": ["sharp", "pngjs"],
+      "useWhen": [
+        "Checking alpha bounds and whether a layer touches edges.",
+        "Estimating if an isolated layer is too empty or too full."
+      ]
+    },
+    {
+      "id": "duplicate-detection",
+      "name": "Duplicate detection",
+      "packages": ["pixelmatch", "pngjs", "sharp"],
+      "useWhen": [
+        "Comparing a new variant against earlier variants in the same layer.",
+        "Flagging when iteration drift is too small to be worth keeping."
+      ]
+    },
+    {
+      "id": "reference-inspection",
+      "name": "Reference inspection",
+      "packages": ["image-size"],
+      "useWhen": [
+        "Reading attachment dimensions before routing a prompt.",
+        "Understanding reference orientation and aspect."
+      ]
+    },
+    {
+      "id": "bitmap-fallback-edits",
+      "name": "Bitmap fallback edits",
+      "packages": ["jimp"],
+      "useWhen": [
+        "A future workflow needs simple programmatic paintover or bitmap transforms.",
+        "A pure JavaScript fallback is safer than a heavier native graphics stack."
+      ]
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 const state = {
   project: null,
-  memory: null,
   config: null,
+  pendingAttachments: [],
   busy: false
 };
 
@@ -9,38 +9,24 @@ const elements = {
   apiKeyInput: document.getElementById("apiKeyInput"),
   saveKeyBtn: document.getElementById("saveKeyBtn"),
   keyStatus: document.getElementById("keyStatus"),
-  titleInput: document.getElementById("titleInput"),
-  directionInput: document.getElementById("directionInput"),
-  goalInput: document.getElementById("goalInput"),
-  canvasPresetInput: document.getElementById("canvasPresetInput"),
   canvasWidthInput: document.getElementById("canvasWidthInput"),
   canvasHeightInput: document.getElementById("canvasHeightInput"),
-  layersInput: document.getElementById("layersInput"),
-  saveProjectBtn: document.getElementById("saveProjectBtn"),
-  newProjectBtn: document.getElementById("newProjectBtn"),
-  generatePreviewBtn: document.getElementById("generatePreviewBtn"),
+  imageUploadInput: document.getElementById("imageUploadInput"),
+  attachImagesBtn: document.getElementById("attachImagesBtn"),
+  attachmentPreviewList: document.getElementById("attachmentPreviewList"),
+  promptInput: document.getElementById("promptInput"),
+  sendPromptBtn: document.getElementById("sendPromptBtn"),
+  refreshPreviewBtn: document.getElementById("refreshPreviewBtn"),
   downloadHashlipsBtn: document.getElementById("downloadHashlipsBtn"),
-  memorySystemInput: document.getElementById("memorySystemInput"),
-  memoryGuidanceInput: document.getElementById("memoryGuidanceInput"),
-  changelogInput: document.getElementById("changelogInput"),
-  saveMemoryBtn: document.getElementById("saveMemoryBtn"),
-  refreshMemoryBtn: document.getElementById("refreshMemoryBtn"),
-  logNoteBtn: document.getElementById("logNoteBtn"),
-  lockDecisionBtn: document.getElementById("lockDecisionBtn"),
-  projectBadge: document.getElementById("projectBadge"),
-  summaryText: document.getElementById("summaryText"),
+  projectTitle: document.getElementById("projectTitle"),
   canvasBadge: document.getElementById("canvasBadge"),
   stage: document.getElementById("stage"),
   previewImage: document.getElementById("previewImage"),
   stageEmpty: document.getElementById("stageEmpty"),
   layerStack: document.getElementById("layerStack"),
-  previewHistory: document.getElementById("previewHistory"),
-  previewCount: document.getElementById("previewCount"),
+  chatLog: document.getElementById("chatLog"),
   layersPanel: document.getElementById("layersPanel"),
   layerCount: document.getElementById("layerCount"),
-  memorySummary: document.getElementById("memorySummary"),
-  memoryRules: document.getElementById("memoryRules"),
-  memoryLog: document.getElementById("memoryLog"),
   toast: document.getElementById("toast")
 };
 
@@ -58,149 +44,61 @@ elements.saveKeyBtn.addEventListener("click", async () => {
   });
 });
 
-elements.saveProjectBtn.addEventListener("click", async () => {
-  await withBusy(async () => {
-    const payload = readProjectForm();
-    if (!payload.layers.length) {
-      throw new Error("Add at least one layer name before saving the project.");
-    }
-
-    if (!state.project) {
-      const response = await api("/api/projects", {
-        method: "POST",
-        body: payload
-      });
-      state.project = response.project;
-      state.memory = response.memory || null;
-    } else {
-      const response = await api(`/api/projects/${state.project.id}`, {
-        method: "PUT",
-        body: payload
-      });
-      state.project = response.project;
-      state.memory = response.memory || state.memory;
-    }
-
-    populateForm(state.project);
-    populateMemoryForm(state.memory);
-    render();
-    showToast("Project saved.");
-  });
+elements.attachImagesBtn.addEventListener("click", () => {
+  elements.imageUploadInput.click();
 });
 
-elements.newProjectBtn.addEventListener("click", () => {
-  state.project = null;
-  state.memory = null;
-  populateForm(blankProjectShape());
-  populateMemoryForm(null);
-  render();
-  showToast("Form reset. Saved project files remain on disk.");
-});
+elements.imageUploadInput.addEventListener("change", async () => {
+  const files = Array.from(elements.imageUploadInput.files || []);
+  if (!files.length) {
+    return;
+  }
 
-elements.generatePreviewBtn.addEventListener("click", async () => {
   await withBusy(async () => {
-    const draft = readProjectForm();
-    if (!draft.layers.length) {
-      throw new Error("Add at least one layer name before generating a test NFT.");
+    const formData = new FormData();
+    for (const file of files) {
+      formData.append("images", file);
     }
 
-    if (!state.project) {
-      const created = await api("/api/projects", {
-        method: "POST",
-        body: draft
-      });
-      state.project = created.project;
-      state.memory = created.memory || null;
-    } else {
-      const saved = await api(`/api/projects/${state.project.id}`, {
-        method: "PUT",
-        body: draft
-      });
-      state.project = saved.project;
-      state.memory = saved.memory || state.memory;
-    }
-
-    const result = await api(`/api/projects/${state.project.id}/preview`, {
-      method: "POST"
+    const response = await fetch("/api/uploads", {
+      method: "POST",
+      body: formData
     });
-    state.project = result.project;
-    state.memory = result.memory || state.memory;
-    populateForm(state.project);
-    populateMemoryForm(state.memory);
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.error || "Upload failed.");
+    }
+
+    state.pendingAttachments.push(...(data.attachments || []));
+    state.pendingAttachments = state.pendingAttachments.slice(-6);
+    elements.imageUploadInput.value = "";
     render();
-    showToast("Test NFT generated.");
+    showToast("Image refs attached.");
   });
+});
+
+elements.sendPromptBtn.addEventListener("click", async () => {
+  await submitPrompt();
+});
+
+elements.refreshPreviewBtn.addEventListener("click", async () => {
+  await submitPrompt({ rerunLatest: true, preservePrompt: true });
+});
+
+elements.promptInput.addEventListener("keydown", async (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    await submitPrompt();
+  }
 });
 
 elements.downloadHashlipsBtn.addEventListener("click", () => {
   if (!state.project) {
-    showToast("Save a project first, then generate some layer variants.", true);
+    showToast("Generate something first.", true);
     return;
   }
 
   window.location.href = `/api/projects/${state.project.id}/export/hashlips`;
-});
-
-elements.saveMemoryBtn.addEventListener("click", async () => {
-  if (!state.project) {
-    showToast("Save a project first so the brain has somewhere to live.", true);
-    return;
-  }
-
-  await withBusy(async () => {
-    const response = await api(`/api/projects/${state.project.id}/memory`, {
-      method: "PUT",
-      body: {
-        systemPrompt: elements.memorySystemInput.value.trim(),
-        userGuidance: elements.memoryGuidanceInput.value.trim()
-      }
-    });
-    state.memory = response.memory;
-    populateMemoryForm(state.memory);
-    render();
-    showToast("Studio brain saved.");
-  });
-});
-
-elements.refreshMemoryBtn.addEventListener("click", async () => {
-  if (!state.project) {
-    showToast("Save a project first.", true);
-    return;
-  }
-
-  await withBusy(async () => {
-    const response = await api(`/api/projects/${state.project.id}/memory/refresh`, {
-      method: "POST"
-    });
-    state.memory = response.memory;
-    populateMemoryForm(state.memory);
-    render();
-    showToast("AI memory refreshed.");
-  });
-});
-
-elements.logNoteBtn.addEventListener("click", async () => {
-  await submitMemoryNote("note");
-});
-
-elements.lockDecisionBtn.addEventListener("click", async () => {
-  await submitMemoryNote("approval");
-});
-
-elements.canvasPresetInput.addEventListener("change", () => {
-  const preset = elements.canvasPresetInput.value;
-  if (preset === "1024x1536") {
-    elements.canvasWidthInput.value = "1024";
-    elements.canvasHeightInput.value = "1536";
-  } else if (preset === "1536x1024") {
-    elements.canvasWidthInput.value = "1536";
-    elements.canvasHeightInput.value = "1024";
-  } else {
-    elements.canvasWidthInput.value = "1024";
-    elements.canvasHeightInput.value = "1024";
-  }
-
-  render();
 });
 
 async function bootstrap() {
@@ -208,98 +106,67 @@ async function bootstrap() {
   if (state.config?.defaultProjectId) {
     const response = await api(`/api/projects/${state.config.defaultProjectId}`);
     state.project = response.project;
-    state.memory = response.memory || null;
-    populateForm(state.project);
-    populateMemoryForm(state.memory);
-  } else {
-    populateForm(blankProjectShape());
-    populateMemoryForm(null);
+    hydrateCanvasFromProject();
   }
   render();
 }
 
 async function loadConfig() {
-  const response = await api("/api/config");
-  state.config = response;
+  state.config = await api("/api/config");
 }
 
-function readProjectForm() {
-  const layers = elements.layersInput.value
-    .split(/\r?\n|,/)
-    .map((value) => value.trim())
-    .filter(Boolean)
-    .map((name, index) => {
-      const existingLayer = state.project?.layers?.find(
-        (layer) => layer.name.toLowerCase() === name.toLowerCase()
-      );
+async function submitPrompt(options = {}) {
+  const prompt = resolvePromptForSubmit(options);
+  if (!prompt) {
+    showToast("Type a prompt first or rerun a previous one.", true);
+    return;
+  }
 
-      return {
-        id: existingLayer?.id || `layer-${index + 1}-${slugify(name)}`,
-        name,
-        description: existingLayer?.description || "",
-        placementNotes: existingLayer?.placementNotes || "",
-        variantIdeas: existingLayer?.variantIdeas || [],
-        variants: existingLayer?.variants || [],
-        selectedVariantId: existingLayer?.selectedVariantId || null
-      };
+  await withBusy(async () => {
+    const response = await api("/api/chat", {
+      method: "POST",
+      body: {
+        projectId: state.project?.id || null,
+        prompt,
+        canvas: readCanvas(),
+        attachmentIds: state.pendingAttachments.map((item) => item.id)
+      }
     });
 
-  return {
-    title: elements.titleInput.value.trim(),
-    artDirection: elements.directionInput.value.trim(),
-    collectionGoal: elements.goalInput.value.trim(),
-    canvas: {
-      preset: elements.canvasPresetInput.value,
-      width: Number(elements.canvasWidthInput.value || 1024),
-      height: Number(elements.canvasHeightInput.value || 1024)
-    },
-    layers,
-    selectedPreviewId: state.project?.selectedPreviewId || null
-  };
-}
-
-function populateForm(project) {
-  elements.titleInput.value = project?.title || "";
-  elements.directionInput.value = project?.artDirection || "";
-  elements.goalInput.value = project?.collectionGoal || "";
-  elements.canvasPresetInput.value = project?.canvas?.generationSize || "1024x1024";
-  elements.canvasWidthInput.value = String(project?.canvas?.width || 1024);
-  elements.canvasHeightInput.value = String(project?.canvas?.height || 1024);
-  elements.layersInput.value = Array.isArray(project?.layers)
-    ? project.layers.map((layer) => layer.name).join("\n")
-    : "";
-}
-
-function populateMemoryForm(memory) {
-  elements.memorySystemInput.value = memory?.systemPrompt || "";
-  elements.memoryGuidanceInput.value = memory?.userGuidance || "";
+    state.project = response.project;
+    hydrateCanvasFromProject();
+    if (!options.preservePrompt) {
+      elements.promptInput.value = "";
+    }
+    state.pendingAttachments = [];
+    render();
+    showToast(response.assistantReply || "Done.");
+  });
 }
 
 function render() {
-  const hasRuntimeKey = state.config?.hasEnvKey || state.config?.hasSessionKey;
-  elements.keyStatus.textContent = hasRuntimeKey ? "Key ready" : "No key yet";
-  elements.keyStatus.className = `pill ${hasRuntimeKey ? "" : "pill-warn"}`.trim();
+  const hasKey = state.config?.hasEnvKey || state.config?.hasSessionKey;
+  elements.keyStatus.textContent = hasKey ? "Key ready" : "No key";
+  elements.keyStatus.className = `badge ${hasKey ? "" : "badge-warn"}`.trim();
 
-  elements.projectBadge.textContent = state.project ? state.project.title : "New project";
-  elements.summaryText.textContent =
-    state.project?.planSummary ||
-    "Save a project, generate a theme preview, then build out each layer variant.";
-  elements.canvasBadge.textContent = formatCanvasBadge(state.project?.canvas || readProjectForm().canvas);
+  elements.projectTitle.textContent = state.project?.title || "New Session";
+  elements.canvasBadge.textContent = formatCanvas(readCanvasFromState());
 
   renderPreview();
-  renderPreviewHistory();
+  renderPendingAttachments();
+  renderChat();
   renderLayers();
-  renderMemory();
   syncBusyState();
 }
 
 function renderPreview() {
   const selectedPreview = getSelectedPreview();
-  const selectedVariants = state.project?.layers
-    ?.map((layer) => layer.variants.find((variant) => variant.id === layer.selectedVariantId))
+  const selectedVariants = (state.project?.layers || [])
+    .map((layer) => layer.variants.find((variant) => variant.id === layer.selectedVariantId))
     .filter(Boolean);
 
-  elements.stage.style.aspectRatio = getStageAspectRatio(state.project?.canvas || readProjectForm().canvas);
+  elements.stage.style.aspectRatio = getAspectRatio(readCanvasFromState());
+  elements.layerStack.innerHTML = "";
 
   if (selectedPreview?.imageUrl) {
     elements.previewImage.src = selectedPreview.imageUrl;
@@ -309,8 +176,7 @@ function renderPreview() {
     elements.previewImage.classList.add("hidden");
   }
 
-  elements.layerStack.innerHTML = "";
-  for (const variant of selectedVariants || []) {
+  for (const variant of selectedVariants) {
     const img = document.createElement("img");
     img.className = "stack-layer";
     img.src = variant.imageUrl;
@@ -318,127 +184,171 @@ function renderPreview() {
     elements.layerStack.appendChild(img);
   }
 
-  if (selectedPreview?.imageUrl || selectedVariants?.length) {
+  if (selectedPreview?.imageUrl || selectedVariants.length) {
     elements.stageEmpty.classList.add("hidden");
   } else {
     elements.stageEmpty.classList.remove("hidden");
   }
 }
 
-function renderPreviewHistory() {
-  const previews = state.project?.previewHistory || [];
-  elements.previewCount.textContent = String(previews.length);
-
-  if (!previews.length) {
-    elements.previewHistory.className = "preview-history empty-state";
-    elements.previewHistory.textContent = "Generate your first test NFT to start the collection.";
+function renderChat() {
+  const messages = state.project?.chatHistory || [];
+  if (!messages.length) {
+    elements.chatLog.className = "chat-log empty-state";
+    elements.chatLog.textContent = "Send a prompt to start the session.";
     return;
   }
 
-  elements.previewHistory.className = "preview-history";
-  elements.previewHistory.innerHTML = previews
+  elements.chatLog.className = "chat-log";
+  elements.chatLog.innerHTML = messages
     .map(
-      (preview) => `
-        <article class="preview-card">
-          <img src="${preview.imageUrl}" alt="Preview ${escapeHtml(preview.id)}" />
-          <div class="preview-card-body">
-            <div class="card-head">
-              <strong>${formatDate(preview.createdAt)}</strong>
-              <button class="btn btn-ghost" data-action="pick-preview" data-preview-id="${preview.id}">
-                Use
-              </button>
-            </div>
-            <p class="hint">${escapeHtml(preview.notes || "Collection preview")}</p>
-          </div>
+      (message) => `
+        <article class="chat-entry ${message.role === "user" ? "user" : "assistant"}">
+          <div class="chat-role">${escapeHtml(message.role)}</div>
+          <div class="chat-text">${escapeHtml(message.text)}</div>
+          ${
+            message.generatedImage?.imageUrl
+              ? `
+                <div class="generated-card">
+                  <img class="generated-preview" src="${message.generatedImage.imageUrl}" alt="${escapeHtml(message.generatedImage.name || "Generated image")}" />
+                  <div class="generated-meta">
+                    <div class="generated-name">${escapeHtml(message.generatedImage.name || (message.generatedImage.type === "preview" ? "Preview" : "Draft"))}</div>
+                    <div class="generated-notes">${escapeHtml(message.generatedImage.notes || message.generatedImage.prompt || "")}</div>
+                    <div class="generated-actions">
+                      <span class="generated-status">${escapeHtml(message.generatedImage.status || "ready")}</span>
+                      ${
+                        message.generatedImage.type === "draft" && message.generatedImage.status !== "committed"
+                          ? `<button
+                              class="btn btn-ghost"
+                              data-action="commit-draft"
+                              data-draft-id="${message.generatedImage.id}"
+                              data-layer-name="${escapeHtml(message.generatedImage.targetLayerName || "")}"
+                            >
+                              Add To ${escapeHtml(message.generatedImage.targetLayerName || "Layer")}
+                            </button>`
+                          : ""
+                      }
+                    </div>
+                  </div>
+                </div>
+              `
+              : ""
+          }
+          ${
+            Array.isArray(message.attachments) && message.attachments.length
+              ? `<div class="chat-attachments">${message.attachments
+                  .map(
+                    (attachment) =>
+                      `<img class="chat-attachment-thumb" src="${attachment.imageUrl}" alt="${escapeHtml(attachment.name || "Attachment")}" />`
+                  )
+                  .join("")}</div>`
+              : ""
+          }
         </article>
       `
     )
     .join("");
+  bindChatActions();
+}
 
-  elements.previewHistory.querySelectorAll("[data-action='pick-preview']").forEach((button) => {
-    button.addEventListener("click", async () => {
-      state.project.selectedPreviewId = button.dataset.previewId;
-      const response = await api(`/api/projects/${state.project.id}`, {
-        method: "PUT",
-        body: readProjectForm()
-      });
-      state.project = response.project;
-      state.memory = response.memory || state.memory;
-      render();
+function renderPendingAttachments() {
+  if (!state.pendingAttachments.length) {
+    elements.attachmentPreviewList.className = "attachment-preview-list empty-inline";
+    elements.attachmentPreviewList.textContent = "No image refs attached";
+    return;
+  }
+
+  elements.attachmentPreviewList.className = "attachment-preview-list";
+  elements.attachmentPreviewList.innerHTML = state.pendingAttachments
+    .map(
+      (attachment) => `
+        <div class="attachment-chip">
+          <img src="${attachment.imageUrl}" alt="${escapeHtml(attachment.name || "Attachment")}" />
+          <button class="btn btn-ghost" data-action="remove-attachment" data-attachment-id="${attachment.id}">Remove</button>
+        </div>
+      `
+    )
+    .join("");
+
+  elements.attachmentPreviewList.querySelectorAll("[data-action='remove-attachment']").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.pendingAttachments = state.pendingAttachments.filter(
+        (item) => item.id !== button.dataset.attachmentId
+      );
+      renderPendingAttachments();
     });
   });
 }
 
 function renderLayers() {
   const layers = state.project?.layers || [];
-  elements.layerCount.textContent = String(layers.length);
+  elements.layerCount.textContent = `${layers.length} layer${layers.length === 1 ? "" : "s"}`;
 
   if (!layers.length) {
-    elements.layersPanel.className = "layers-panel empty-state";
-    elements.layersPanel.textContent = "Layer cards will show up here after you save a project.";
+    elements.layersPanel.className = "layer-folder-list empty-state";
+    elements.layersPanel.textContent = "Layer folders will appear here after the first prompt.";
     return;
   }
 
-  elements.layersPanel.className = "layers-panel";
+  elements.layersPanel.className = "layer-folder-list";
   elements.layersPanel.innerHTML = layers
     .map((layer) => {
       const variants = layer.variants || [];
-      const selectedId = layer.selectedVariantId;
-
       return `
-        <article class="layer-card">
-          <div class="layer-card-body">
-            <div class="layer-card-head">
-              <div>
-                <h3>${escapeHtml(layer.name)}</h3>
-                <p class="layer-description">${escapeHtml(
-                  layer.description || "Generate the preview first to let the bot define this layer."
-                )}</p>
-              </div>
-              <span class="pill">${variants.length} vars</span>
+        <details class="layer-folder" open>
+          <summary>
+            <div class="folder-title">
+              <div class="folder-name">${escapeHtml(layer.name)}</div>
+              <div class="folder-meta">${variants.length} image${variants.length === 1 ? "" : "s"}</div>
             </div>
-
-            <p class="hint">${escapeHtml(layer.placementNotes || "No placement guidance yet.")}</p>
-
-            <div class="variant-toolbar">
-              <label class="field">
-                <span>Count</span>
-                <input id="count-${layer.id}" type="number" min="1" max="8" value="4" />
-              </label>
-              <button class="btn btn-primary" data-action="generate-variants" data-layer-id="${layer.id}">
-                Generate Variants
-              </button>
+            <div class="folder-actions">
+              <button class="btn btn-danger" data-action="remove-layer" data-layer-id="${layer.id}">Remove Layer</button>
             </div>
+          </summary>
 
-            <div class="variant-grid">
-              ${
-                variants.length
-                  ? variants
-                      .map(
-                        (variant) => `
-                          <article class="variant-card">
-                            <img src="${variant.imageUrl}" alt="${escapeHtml(variant.name)}" />
-                            <div class="variant-meta">
-                              <div class="variant-name">${escapeHtml(variant.name)}</div>
-                              <div class="variant-notes">${escapeHtml(variant.notes || "")}</div>
+          <div class="folder-body">
+            ${
+              variants.length
+                ? variants
+                    .map(
+                      (variant) => `
+                        <article class="variant-item">
+                          <img src="${variant.imageUrl}" alt="${escapeHtml(variant.name)}" />
+                          <div class="variant-meta">
+                            <div class="variant-name">${escapeHtml(variant.name)}</div>
+                            <div class="variant-notes">${escapeHtml(variant.notes || "")}</div>
+                            <div class="variant-actions">
                               <button
-                                class="btn ${variant.id === selectedId ? "btn-primary" : "btn-ghost"}"
+                                class="btn ${variant.id === layer.selectedVariantId ? "btn-primary" : "btn-ghost"}"
                                 data-action="select-variant"
                                 data-layer-id="${layer.id}"
                                 data-variant-id="${variant.id}"
                               >
-                                ${variant.id === selectedId ? "Selected" : "Use In Stack"}
+                                ${variant.id === layer.selectedVariantId ? "Check Marked" : "Check Mark"}
                               </button>
+                              <button
+                                class="btn btn-danger"
+                                data-action="remove-variant"
+                                data-layer-id="${layer.id}"
+                                data-variant-id="${variant.id}"
+                              >
+                                Remove
+                              </button>
+                              ${
+                                variant.id === layer.selectedVariantId
+                                  ? '<span class="selected-chip">Live on preview</span>'
+                                  : ""
+                              }
                             </div>
-                          </article>
-                        `
-                      )
-                      .join("")
-                  : `<div class="empty-state variant-card">No variants yet for ${escapeHtml(layer.name)}.</div>`
-              }
-            </div>
+                          </div>
+                        </article>
+                      `
+                    )
+                    .join("")
+                : `<div class="empty-state">No images in this layer folder yet.</div>`
+            }
           </div>
-        </article>
+        </details>
       `;
     })
     .join("");
@@ -446,103 +356,110 @@ function renderLayers() {
   bindLayerActions();
 }
 
-function renderMemory() {
-  elements.memorySummary.textContent =
-    state.memory?.contextSummary ||
-    "Save notes and approvals here. The AI will condense them into a reusable memory for future generations.";
-
-  if (state.memory?.styleRules?.length) {
-    elements.memoryRules.className = "memory-rules";
-    elements.memoryRules.innerHTML = state.memory.styleRules
-      .map((rule) => `<article class="memory-card"><strong>${escapeHtml(rule)}</strong></article>`)
-      .join("");
-  } else {
-    elements.memoryRules.className = "memory-rules empty-state";
-    elements.memoryRules.textContent = "No active style rules yet.";
-  }
-
-  if (state.memory?.changelog?.length) {
-    elements.memoryLog.className = "memory-log";
-    elements.memoryLog.innerHTML = state.memory.changelog
-      .slice(0, 8)
-      .map(
-        (entry) => `
-          <article class="memory-card">
-            <span class="memory-type">${escapeHtml(entry.type || "note")}</span>
-            <div class="variant-name">${escapeHtml(entry.title || "Studio note")}</div>
-            <div class="variant-notes">${escapeHtml(entry.detail || "")}</div>
-          </article>
-        `
-      )
-      .join("");
-  } else {
-    elements.memoryLog.className = "memory-log empty-state";
-    elements.memoryLog.textContent = "No changelog entries yet.";
-  }
-}
-
 function bindLayerActions() {
-  elements.layersPanel.querySelectorAll("[data-action='generate-variants']").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const { layerId } = button.dataset;
-      const countInput = document.getElementById(`count-${layerId}`);
-      const count = Number(countInput?.value || 4);
-
-      await withBusy(async () => {
-        const response = await api(`/api/projects/${state.project.id}/layers/${layerId}/variants`, {
-          method: "POST",
-          body: { count }
-        });
-        state.project = response.project;
-        state.memory = response.memory || state.memory;
-        render();
-        showToast("New layer variants generated.");
-      });
-    });
-  });
-
   elements.layersPanel.querySelectorAll("[data-action='select-variant']").forEach((button) => {
     button.addEventListener("click", async () => {
-      const { layerId, variantId } = button.dataset;
       await withBusy(async () => {
-        const response = await api(`/api/projects/${state.project.id}/layers/${layerId}/select`, {
-          method: "POST",
-          body: { variantId }
+        const response = await api(
+          `/api/projects/${state.project.id}/layers/${button.dataset.layerId}/select`,
+          {
+            method: "POST",
+            body: { variantId: button.dataset.variantId }
+          }
+        );
+        state.project = response.project;
+        render();
+      });
+    });
+  });
+
+  elements.layersPanel.querySelectorAll("[data-action='remove-variant']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await withBusy(async () => {
+        const response = await api(
+          `/api/projects/${state.project.id}/layers/${button.dataset.layerId}/variants/${button.dataset.variantId}`,
+          {
+            method: "DELETE"
+          }
+        );
+        state.project = response.project;
+        render();
+        showToast("Layer image removed.");
+      });
+    });
+  });
+
+  elements.layersPanel.querySelectorAll("[data-action='remove-layer']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await withBusy(async () => {
+        const response = await api(`/api/projects/${state.project.id}/layers/${button.dataset.layerId}`, {
+          method: "DELETE"
         });
         state.project = response.project;
-        state.memory = response.memory || state.memory;
         render();
+        showToast("Layer removed.");
       });
     });
   });
 }
 
-async function submitMemoryNote(mode) {
-  if (!state.project) {
-    showToast("Save a project first.", true);
-    return;
-  }
-
-  const text = elements.changelogInput.value.trim();
-  if (!text) {
-    showToast("Write a note first.", true);
-    return;
-  }
-
-  await withBusy(async () => {
-    const path = mode === "approval" ? "approve" : "changelog";
-    const response = await api(`/api/projects/${state.project.id}/memory/${path}`, {
-      method: "POST",
-      body:
-        mode === "approval"
-          ? { title: "Locked style decision", detail: text }
-          : { type: "note", title: "Studio note", detail: text }
+function bindChatActions() {
+  elements.chatLog.querySelectorAll("[data-action='commit-draft']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await withBusy(async () => {
+        const response = await api(`/api/projects/${state.project.id}/drafts/${button.dataset.draftId}/commit`, {
+          method: "POST",
+          body: { layerName: button.dataset.layerName || "" }
+        });
+        state.project = response.project;
+        render();
+        showToast(`Draft added to ${response.layer?.name || "layer"}.`);
+      });
     });
-    state.memory = response.memory;
-    elements.changelogInput.value = "";
-    render();
-    showToast(mode === "approval" ? "Decision locked into memory." : "Studio note added.");
   });
+}
+
+function readCanvas() {
+  return {
+    width: Number(elements.canvasWidthInput.value || 1024),
+    height: Number(elements.canvasHeightInput.value || 1024),
+    preset: "1024x1024"
+  };
+}
+
+function readCanvasFromState() {
+  return state.project?.canvas || readCanvas();
+}
+
+function hydrateCanvasFromProject() {
+  elements.canvasWidthInput.value = String(state.project?.canvas?.width || 1024);
+  elements.canvasHeightInput.value = String(state.project?.canvas?.height || 1024);
+}
+
+function getSelectedPreview() {
+  const previews = state.project?.previewHistory || [];
+  if (!previews.length) {
+    return null;
+  }
+
+  return previews.find((item) => item.id === state.project.selectedPreviewId) || previews[0];
+}
+
+function resolvePromptForSubmit(options = {}) {
+  const typedPrompt = elements.promptInput.value.trim();
+  if (typedPrompt) {
+    return typedPrompt;
+  }
+
+  if (!options.rerunLatest) {
+    return "";
+  }
+
+  const latestUserMessage = [...(state.project?.chatHistory || [])]
+    .reverse()
+    .find((message) => message.role === "user" && String(message.text || "").trim());
+
+  return String(latestUserMessage?.text || "").trim();
 }
 
 async function withBusy(work) {
@@ -564,15 +481,6 @@ function syncBusyState() {
   });
 }
 
-function getSelectedPreview() {
-  const previews = state.project?.previewHistory || [];
-  if (!previews.length) {
-    return null;
-  }
-
-  return previews.find((preview) => preview.id === state.project?.selectedPreviewId) || previews[0];
-}
-
 async function api(url, options = {}) {
   const response = await fetch(url, {
     method: options.method || "GET",
@@ -592,47 +500,19 @@ async function api(url, options = {}) {
 function showToast(message, isError = false) {
   elements.toast.textContent = message;
   elements.toast.className = "toast";
-  elements.toast.style.borderColor = isError ? "rgba(255,120,120,0.4)" : "rgba(124,247,197,0.35)";
+  elements.toast.style.borderColor = isError ? "rgba(255,120,120,0.4)" : "rgba(15,123,108,0.45)";
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => {
     elements.toast.className = "toast hidden";
-  }, 3200);
+  }, 3000);
 }
 
-function formatDate(value) {
-  return new Date(value).toLocaleString([], {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit"
-  });
+function getAspectRatio(canvas) {
+  return `${Number(canvas?.width || 1024)} / ${Number(canvas?.height || 1024)}`;
 }
 
-function getStageAspectRatio(size) {
-  if (!size) {
-    return "1 / 1";
-  }
-
-  if (size.width && size.height) {
-    return `${size.width} / ${size.height}`;
-  }
-
-  if (size === "1024x1536") {
-    return "2 / 3";
-  }
-
-  if (size === "1536x1024") {
-    return "3 / 2";
-  }
-
-  return "1 / 1";
-}
-
-function slugify(value) {
-  return String(value || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "");
+function formatCanvas(canvas) {
+  return `${Number(canvas?.width || 1024)} x ${Number(canvas?.height || 1024)}`;
 }
 
 function escapeHtml(value) {
@@ -642,20 +522,4 @@ function escapeHtml(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
-}
-
-function blankProjectShape() {
-  return {
-    title: "",
-    artDirection: "",
-    collectionGoal: "",
-    canvas: { preset: "1024x1024", width: 1024, height: 1024, generationSize: "1024x1024" },
-    layers: []
-  };
-}
-
-function formatCanvasBadge(canvas) {
-  const width = Number(canvas?.width || 1024);
-  const height = Number(canvas?.height || 1024);
-  return `${width} x ${height}`;
 }

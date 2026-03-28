@@ -38,6 +38,8 @@ export function createProjectService({ projectsDir }) {
       collectionGoal: cleanText(input.collectionGoal),
       canvas: normalizeCanvas(input.canvas),
       layers,
+      chatHistory: [],
+      draftHistory: [],
       previewHistory: [],
       selectedPreviewId: null,
       previewPrompt: "",
@@ -56,6 +58,8 @@ export function createProjectService({ projectsDir }) {
       collectionGoal:
         input.collectionGoal === undefined ? existing.collectionGoal : cleanText(input.collectionGoal),
       canvas: input.canvas ? normalizeCanvas(input.canvas) : existing.canvas,
+      chatHistory: Array.isArray(existing.chatHistory) ? existing.chatHistory : [],
+      draftHistory: Array.isArray(existing.draftHistory) ? existing.draftHistory : [],
       updatedAt: new Date().toISOString()
     };
 

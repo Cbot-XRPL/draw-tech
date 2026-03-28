@@ -1,15 +1,59 @@
-import { cleanSlug, cleanText } from "./utils.js";
+import { cleanSlug, cleanText, safeJsonParse } from "./utils.js";
 
 export function createOpenAIService() {
   return {
+    routeUserPrompt,
     createPreviewPlan,
     createLayerVariantPlan,
     generateImageAsset,
-    refreshStudioMemory
+    refreshStudioMemory,
+    refreshStudioBrain
   };
 }
 
-async function createPreviewPlan(apiKey, project, memory) {
+async function routeUserPrompt(apiKey, project, memory, brain, toolManifest, promptText, attachments = []) {
+  const prompt = [
+    "You route a user's NFT-building request inside a layer-based art app.",
+    "Return JSON only.",
+    "Keys: actionType, assistantReply, title, targetLayerName, variantNameHint, variantDirection, removalTarget, canvasWidth, canvasHeight.",
+    "Valid actionType values: preview, draft_variant, commit_draft, remove_variant, remove_layer, update_canvas, noop.",
+    "Use preview when the user is describing a new scene, new collection direction, or wants to see a new overall image.",
+    "Use draft_variant when the user asks to draw a trait, object, or isolated asset for review before it goes into a layer folder.",
+    "Use commit_draft when the user is approving a recent draft and wants it added to a folder or layer.",
+    "Use remove_variant or remove_layer only when the user clearly asks to delete.",
+    "assistantReply should be one short sentence for the visible chat log.",
+    "If targetLayerName is obvious, fill it in with a human-friendly layer name.",
+    "variantDirection should capture the requested visual change in a short art-director style phrase.",
+    "If the user is only changing the canvas, use update_canvas.",
+    "Do not include markdown."
+  ].join("\n");
+
+  const payload = {
+    promptText,
+    project: buildProjectPayload(project),
+    studio: buildStudioPayload(memory, brain, toolManifest),
+    references: buildAttachmentPayload(attachments)
+  };
+
+  const response = await callOpenAIJson(apiKey, {
+    model: "gpt-5.4",
+    input: buildVisionInput(prompt, payload, attachments)
+  });
+
+  return {
+    actionType: cleanText(response?.actionType).toLowerCase() || "preview",
+    assistantReply: cleanText(response?.assistantReply),
+    title: cleanText(response?.title),
+    targetLayerName: cleanText(response?.targetLayerName),
+    variantNameHint: cleanText(response?.variantNameHint),
+    variantDirection: cleanText(response?.variantDirection),
+    removalTarget: cleanText(response?.removalTarget),
+    canvasWidth: Number(response?.canvasWidth || 0),
+    canvasHeight: Number(response?.canvasHeight || 0)
+  };
+}
+
+async function createPreviewPlan(apiKey, project, memory, brain, toolManifest, attachments = []) {
   const prompt = [
     "You are helping build a layered NFT collection.",
     "Return JSON only.",
@@ -20,42 +64,27 @@ async function createPreviewPlan(apiKey, project, memory) {
     "layers: array of objects with keys id, name, description, placementNotes, variantIdeas",
     "Each variantIdeas value should be an array of 3 short strings.",
     "Keep prompts highly visual and consistent across a collection.",
+    "If the incoming layer list is empty or weak, infer a sensible layer stack from the prompt and project direction.",
     "Assume later each layer will be generated on a transparent background and stacked with the others.",
+    "Respect cross-project lessons, but keep this collection original instead of repetitive.",
     "Do not include markdown fences."
   ].join("\n");
 
   const payload = {
-    title: project.title,
-    artDirection: project.artDirection,
-    collectionGoal: project.collectionGoal,
-    canvas: project.canvas,
-    studioMemory: buildMemoryPayload(memory),
-    layers: project.layers.map((layer) => ({
-      id: layer.id,
-      name: layer.name,
-      currentDescription: layer.description,
-      currentPlacementNotes: layer.placementNotes
-    }))
+    project: buildProjectPayload(project),
+    studio: buildStudioPayload(memory, brain, toolManifest),
+    references: buildAttachmentPayload(attachments)
   };
 
   const response = await callOpenAIJson(apiKey, {
     model: "gpt-5.4",
-    input: [
-      {
-        role: "system",
-        content: [{ type: "input_text", text: prompt }]
-      },
-      {
-        role: "user",
-        content: [{ type: "input_text", text: JSON.stringify(payload) }]
-      }
-    ]
+    input: buildVisionInput(prompt, payload, attachments)
   });
 
   return validatePreviewPlan(response);
 }
 
-async function createLayerVariantPlan(apiKey, project, layer, count, memory) {
+async function createLayerVariantPlan(apiKey, project, layer, count, memory, brain, toolManifest, attachments = []) {
   const prompt = [
     "You are generating transparent PNG NFT layers for a single collection.",
     "Return JSON only.",
@@ -64,18 +93,13 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory) {
     "Each item must have name, notes, prompt.",
     "Each prompt must describe exactly one isolated visual asset for the requested layer only.",
     "Every prompt must explicitly require a transparent background, no extra objects, no scene, no border, no text, and consistent style.",
-    "Keep the prompts stack-friendly so they align with other layers in a layered NFT."
+    "Keep the prompts stack-friendly so they align with other layers in a layered NFT.",
+    "Make each new variant meaningfully different from earlier ones instead of tiny color drift."
   ].join("\n");
 
   const payload = {
-    project: {
-      title: project.title,
-      artDirection: project.artDirection,
-      collectionGoal: project.collectionGoal,
-      styleGuide: project.styleGuide,
-      canvas: project.canvas
-    },
-    studioMemory: buildMemoryPayload(memory),
+    project: buildProjectPayload(project),
+    studio: buildStudioPayload(memory, brain, toolManifest),
     allLayers: project.layers.map((item) => ({
       id: item.id,
       name: item.name,
@@ -87,23 +111,16 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory) {
       name: layer.name,
       description: layer.description,
       placementNotes: layer.placementNotes,
-      variantIdeas: layer.variantIdeas
+      variantIdeas: layer.variantIdeas,
+      currentVariantNames: Array.isArray(layer.variants) ? layer.variants.map((item) => cleanText(item.name)) : []
     },
+    references: buildAttachmentPayload(attachments),
     count
   };
 
   const response = await callOpenAIJson(apiKey, {
     model: "gpt-5.4",
-    input: [
-      {
-        role: "system",
-        content: [{ type: "input_text", text: prompt }]
-      },
-      {
-        role: "user",
-        content: [{ type: "input_text", text: JSON.stringify(payload) }]
-      }
-    ]
+    input: buildVisionInput(prompt, payload, attachments)
   });
 
   const variants = Array.isArray(response?.variants) ? response.variants : [];
@@ -120,48 +137,29 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory) {
   };
 }
 
-async function refreshStudioMemory(apiKey, project, memory) {
+async function refreshStudioMemory(apiKey, project, memory, brain, toolManifest) {
   const prompt = [
-    "You maintain long-running creative memory for an NFT project.",
+    "You maintain long-running creative memory for one NFT project.",
     "Return JSON only.",
     "The JSON must include contextSummary, styleRules, lockedDecisions.",
     "contextSummary must be a concise paragraph capturing the current style and production direction.",
     "styleRules must be an array of short imperative rules.",
     "lockedDecisions must be an array of objects with title and detail.",
     "Only preserve the strongest still-relevant rules and approvals.",
+    "Use the global studio brain only as support, not as a reason to erase this project's identity.",
     "Do not output markdown."
   ].join("\n");
 
   const payload = {
-    project: {
-      title: project.title,
-      artDirection: project.artDirection,
-      collectionGoal: project.collectionGoal,
-      styleGuide: project.styleGuide,
-      canvas: project.canvas
-    },
-    memory: buildMemoryPayload(memory),
-    latestLayers: project.layers.map((layer) => ({
-      name: layer.name,
-      description: layer.description,
-      placementNotes: layer.placementNotes,
-      variantIdeas: layer.variantIdeas || [],
-      variantCount: Array.isArray(layer.variants) ? layer.variants.length : 0
-    }))
+    project: buildProjectPayload(project),
+    projectMemory: buildMemoryPayload(memory),
+    studioBrain: buildBrainPayload(brain),
+    toolManifest: buildToolManifestPayload(toolManifest)
   };
 
   const response = await callOpenAIJson(apiKey, {
     model: "gpt-5.4",
-    input: [
-      {
-        role: "system",
-        content: [{ type: "input_text", text: prompt }]
-      },
-      {
-        role: "user",
-        content: [{ type: "input_text", text: JSON.stringify(payload) }]
-      }
-    ]
+    input: buildVisionInput(prompt, payload, [])
   });
 
   const lockedDecisions = Array.isArray(response?.lockedDecisions) ? response.lockedDecisions : [];
@@ -177,6 +175,59 @@ async function refreshStudioMemory(apiKey, project, memory) {
       }))
       .filter((item) => item.title || item.detail)
       .slice(0, 12)
+  };
+}
+
+async function refreshStudioBrain(apiKey, project, memory, brain, toolManifest, event) {
+  const prompt = [
+    "You maintain a hidden cross-project studio brain for an NFT art tool.",
+    "Return JSON only.",
+    "The JSON must include crossProjectSummary, qualityRules, drawingLessons.",
+    "crossProjectSummary must be one short paragraph.",
+    "qualityRules must be an array of short imperative rules.",
+    "drawingLessons must be an array of objects with title, detail, tags.",
+    "Keep only durable lessons that improve future drawing and layer production.",
+    "Prefer lessons about composition, consistency, stack safety, silhouette clarity, and useful prompt phrasing.",
+    "If an event shows a near-duplicate or weak layer outcome, convert that into a practical lesson.",
+    "Do not output markdown."
+  ].join("\n");
+
+  const payload = {
+    event: {
+      type: cleanText(event?.type),
+      prompt: cleanText(event?.prompt),
+      layerName: cleanText(event?.layerName),
+      summary: cleanText(event?.summary),
+      analysis: event?.analysis || null
+    },
+    project: buildProjectPayload(project),
+    projectMemory: buildMemoryPayload(memory),
+    studioBrain: buildBrainPayload(brain),
+    toolManifest: buildToolManifestPayload(toolManifest)
+  };
+
+  const response = await callOpenAIJson(apiKey, {
+    model: "gpt-5.4",
+    input: buildVisionInput(prompt, payload, [])
+  });
+
+  return {
+    crossProjectSummary: cleanText(response?.crossProjectSummary),
+    qualityRules: Array.isArray(response?.qualityRules)
+      ? response.qualityRules.map((item) => cleanText(item)).filter(Boolean).slice(0, 18)
+      : [],
+    drawingLessons: Array.isArray(response?.drawingLessons)
+      ? response.drawingLessons
+          .map((item) => ({
+            title: cleanText(item?.title),
+            detail: cleanText(item?.detail),
+            tags: Array.isArray(item?.tags)
+              ? item.tags.map((tag) => cleanText(tag)).filter(Boolean).slice(0, 8)
+              : []
+          }))
+          .filter((item) => item.title || item.detail)
+          .slice(0, 12)
+      : []
   };
 }
 
@@ -214,6 +265,39 @@ function validatePreviewPlan(plan) {
   };
 }
 
+function buildProjectPayload(project) {
+  return {
+    title: project.title,
+    artDirection: project.artDirection,
+    collectionGoal: project.collectionGoal,
+    styleGuide: project.styleGuide,
+    canvas: project.canvas,
+    draftHistory: (project.draftHistory || []).slice(0, 8).map((draft) => ({
+      id: draft.id,
+      name: draft.name,
+      prompt: draft.prompt,
+      status: draft.status,
+      targetLayerName: draft.targetLayerName
+    })),
+    layers: project.layers.map((layer) => ({
+      id: layer.id,
+      name: layer.name,
+      description: layer.description,
+      placementNotes: layer.placementNotes,
+      variantIdeas: layer.variantIdeas,
+      variantCount: Array.isArray(layer.variants) ? layer.variants.length : 0
+    }))
+  };
+}
+
+function buildStudioPayload(memory, brain, toolManifest) {
+  return {
+    projectMemory: buildMemoryPayload(memory),
+    studioBrain: buildBrainPayload(brain),
+    toolManifest: buildToolManifestPayload(toolManifest)
+  };
+}
+
 function buildMemoryPayload(memory) {
   return memory
     ? {
@@ -236,6 +320,79 @@ function buildMemoryPayload(memory) {
           : []
       }
     : null;
+}
+
+function buildBrainPayload(brain) {
+  return brain
+    ? {
+        systemPrompt: cleanText(brain.systemPrompt),
+        crossProjectSummary: cleanText(brain.crossProjectSummary),
+        qualityRules: Array.isArray(brain.qualityRules) ? brain.qualityRules : [],
+        drawingLessons: Array.isArray(brain.drawingLessons)
+          ? brain.drawingLessons.slice(0, 16).map((item) => ({
+              title: cleanText(item?.title),
+              detail: cleanText(item?.detail),
+              tags: Array.isArray(item?.tags) ? item.tags : []
+            }))
+          : [],
+        recentSessionNotes: Array.isArray(brain.sessionNotes)
+          ? brain.sessionNotes.slice(0, 8).map((item) => ({
+              type: cleanText(item?.type),
+              layerName: cleanText(item?.layerName),
+              summary: cleanText(item?.summary),
+              analysis: item?.analysis || null
+            }))
+          : []
+      }
+    : null;
+}
+
+function buildToolManifestPayload(toolManifest) {
+  return toolManifest
+    ? {
+        name: cleanText(toolManifest.name),
+        systemGuidance: cleanText(toolManifest.systemGuidance),
+        packages: Array.isArray(toolManifest.packages) ? toolManifest.packages : [],
+        capabilities: Array.isArray(toolManifest.capabilities) ? toolManifest.capabilities : []
+      }
+    : null;
+}
+
+function buildAttachmentPayload(attachments) {
+  return Array.isArray(attachments)
+    ? attachments.slice(0, 6).map((attachment) => ({
+        id: cleanText(attachment?.id),
+        name: cleanText(attachment?.name),
+        mimeType: cleanText(attachment?.mimeType),
+        width: Number(attachment?.width || 0),
+        height: Number(attachment?.height || 0)
+      }))
+    : [];
+}
+
+function buildVisionInput(systemPrompt, payload, attachments) {
+  const userContent = [{ type: "input_text", text: JSON.stringify(payload) }];
+
+  for (const attachment of attachments) {
+    if (attachment?.dataUrl) {
+      userContent.push({
+        type: "input_image",
+        image_url: attachment.dataUrl,
+        detail: "high"
+      });
+    }
+  }
+
+  return [
+    {
+      role: "system",
+      content: [{ type: "input_text", text: systemPrompt }]
+    },
+    {
+      role: "user",
+      content: userContent
+    }
+  ];
 }
 
 async function callOpenAIJson(apiKey, body) {
@@ -312,22 +469,4 @@ function extractResponseText(data) {
   }
 
   return parts.join("\n").trim();
-}
-
-function safeJsonParse(text) {
-  const cleaned = String(text || "")
-    .trim()
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "");
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const match = cleaned.match(/\{[\s\S]*\}$/);
-    if (match) {
-      return JSON.parse(match[0]);
-    }
-    throw new Error("The model returned invalid JSON.");
-  }
 }

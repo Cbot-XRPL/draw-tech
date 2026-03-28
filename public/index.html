@@ -7,160 +7,96 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Instrument+Serif:ital@0;1&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="page-shell">
-      <aside class="panel panel-side">
-        <div class="brand-lockup">
-          <p class="eyebrow">Layered NFT Builder</p>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Prompt First NFT Builder</p>
           <h1>Draw Tech</h1>
-          <p class="lede">
-            Build a collection from one broad concept preview into reusable layer variants you can
-            stack, swap, and test.
-          </p>
         </div>
 
-        <section class="card stack-sm">
-          <div class="card-head">
-            <h2>API Access</h2>
-            <span id="keyStatus" class="pill pill-warn">No key yet</span>
-          </div>
-          <label class="field">
-            <span>Temporary OpenAI key</span>
+        <div class="topbar-actions">
+          <label class="mini-field">
+            <span>API key</span>
             <input id="apiKeyInput" type="password" placeholder="sk-..." />
           </label>
-          <button id="saveKeyBtn" class="btn btn-primary">Use This Key In Session</button>
-          <p class="hint">You can also put `OPENAI_API_KEY` in `.env` for local startup.</p>
-        </section>
+          <button id="saveKeyBtn" class="btn btn-primary">Use Key</button>
+          <span id="keyStatus" class="badge badge-warn">No key</span>
+          <button id="downloadHashlipsBtn" class="btn btn-ghost">Download All Layers</button>
+        </div>
+      </header>
 
-        <section class="card stack-sm">
-          <div class="card-head">
-            <h2>Collection Brief</h2>
-            <span id="projectBadge" class="pill">New project</span>
-          </div>
-          <label class="field">
-            <span>Collection name</span>
-            <input id="titleInput" type="text" placeholder="Neon Marshals" />
-          </label>
-          <label class="field">
-            <span>Art direction</span>
-            <textarea
-              id="directionInput"
-              rows="4"
-              placeholder="Describe the world, style, materials, mood, camera angle, and what makes this collection feel special."
-            ></textarea>
-          </label>
-          <label class="field">
-            <span>Collection goal</span>
-            <textarea
-              id="goalInput"
-              rows="3"
-              placeholder="Example: clean collectible characters with bold accessories and readable silhouettes."
-            ></textarea>
-          </label>
-          <label class="field">
-            <span>Canvas preset</span>
-            <select id="canvasPresetInput">
-              <option value="1024x1024">Square</option>
-              <option value="1024x1536">Portrait</option>
-              <option value="1536x1024">Landscape</option>
-            </select>
-          </label>
-          <div class="canvas-grid">
-            <label class="field">
+      <section class="prompt-card">
+        <div class="prompt-copy">
+          <h2>Type what you want.</h2>
+          <p>Ask for a new preview, a new layer image, or a tweak like "make me another blue background layer".</p>
+        </div>
+
+        <div class="prompt-controls">
+          <div class="canvas-inline">
+            <label class="mini-field">
               <span>Width</span>
               <input id="canvasWidthInput" type="number" min="256" max="4096" step="1" value="1024" />
             </label>
-            <label class="field">
+            <label class="mini-field">
               <span>Height</span>
               <input id="canvasHeightInput" type="number" min="256" max="4096" step="1" value="1024" />
             </label>
           </div>
-          <p class="hint">
-            You can pick your final NFT canvas size here. Image generation still uses the closest
-            supported ratio, then Draw Tech resizes the PNGs to your exact width and height.
-          </p>
-          <label class="field">
-            <span>Layer list</span>
-            <textarea
-              id="layersInput"
-              rows="7"
-              placeholder="Background&#10;Body&#10;Eyes&#10;Headwear&#10;Accessory"
-            ></textarea>
-          </label>
-          <div class="button-row">
-            <button id="saveProjectBtn" class="btn btn-primary">Save Project</button>
-            <button id="newProjectBtn" class="btn btn-ghost">Reset Form</button>
-          </div>
-        </section>
 
-        <section class="card stack-sm">
-          <div class="card-head">
-            <h2>Workflow</h2>
-            <span class="pill">1 to many</span>
+          <div class="attach-row">
+            <input id="imageUploadInput" type="file" accept="image/*" multiple class="hidden-file" />
+            <button id="attachImagesBtn" class="btn btn-ghost" type="button">Attach Images</button>
+            <div id="attachmentPreviewList" class="attachment-preview-list empty-inline">
+              No image refs attached
+            </div>
           </div>
-          <button id="generatePreviewBtn" class="btn btn-primary">Generate Test NFT</button>
-          <p class="hint">
-            First we create a broad collection preview, then you can expand each layer into many
-            swappable variants.
-          </p>
-        </section>
 
-        <section class="card stack-sm">
-          <div class="card-head">
-            <h2>Studio Brain</h2>
-            <span class="pill">Persistent</span>
-          </div>
-          <label class="field">
-            <span>Long-term system rules</span>
+          <div class="prompt-row">
             <textarea
-              id="memorySystemInput"
-              rows="4"
-              placeholder="Example: keep silhouettes clean, keep the same camera angle, avoid muddy textures, preserve collectible readability."
-            ></textarea>
-          </label>
-          <label class="field">
-            <span>Current working note</span>
-            <textarea
-              id="memoryGuidanceInput"
+              id="promptInput"
               rows="3"
-              placeholder="Example: push this set toward glossy cyber masks with fewer tiny details."
+              placeholder="Example: Make me a cyber frog NFT preview with a moody neon city and strong collectible shapes."
             ></textarea>
-          </label>
-          <div class="button-row">
-            <button id="saveMemoryBtn" class="btn btn-primary">Save Brain</button>
-            <button id="refreshMemoryBtn" class="btn btn-ghost">Refresh AI Memory</button>
+            <button id="sendPromptBtn" class="btn btn-primary btn-large">Generate</button>
           </div>
-          <label class="field">
-            <span>Log studio note</span>
-            <textarea
-              id="changelogInput"
-              rows="3"
-              placeholder="Example: approved thick black eye outline and brighter mint glow."
-            ></textarea>
-          </label>
-          <div class="button-row">
-            <button id="logNoteBtn" class="btn btn-ghost">Add Note</button>
-            <button id="lockDecisionBtn" class="btn btn-primary">Lock Decision</button>
-          </div>
-        </section>
-      </aside>
+        </div>
+      </section>
 
-      <main class="workspace">
-        <section class="hero card">
-          <div class="hero-copy">
-            <p class="eyebrow">Live Composite</p>
-            <h2>Swap layers on the fly while the collection grows.</h2>
-            <p id="summaryText" class="lede-small">
-              Save a project, generate a theme preview, then build out each layer variant.
-            </p>
-            <div class="hero-actions">
-              <button id="downloadHashlipsBtn" class="btn btn-ghost">Download HashLips Layers</button>
-              <span id="canvasBadge" class="pill">1024 x 1024</span>
+      <section class="main-grid">
+        <article class="panel preview-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Preview</p>
+              <h2 id="projectTitle">New Session</h2>
+            </div>
+            <div class="preview-head-actions">
+              <button id="refreshPreviewBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Run prompt again">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path
+                    d="M20 11a8 8 0 1 0 2 5.29"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="1.8"
+                  />
+                  <path
+                    d="M20 4v7h-7"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    stroke-width="1.8"
+                  />
+                </svg>
+              </button>
+              <span id="canvasBadge" class="badge">1024 x 1024</span>
             </div>
           </div>
 
@@ -172,45 +108,36 @@
               <div id="stageEmpty" class="stage-empty">No preview yet</div>
             </div>
           </div>
-        </section>
+        </article>
 
-        <section class="workspace-grid">
-          <section class="card stack-sm">
-            <div class="card-head">
-              <h2>Preview History</h2>
-              <span id="previewCount" class="pill">0</span>
+        <article class="panel chat-panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Chat Log</p>
+              <h2>Build Notes</h2>
             </div>
-            <div id="previewHistory" class="preview-history empty-state">
-              Generate your first test NFT to start the collection.
-            </div>
-          </section>
-
-          <section class="card stack-sm">
-            <div class="card-head">
-              <h2>Layer Studio</h2>
-              <span id="layerCount" class="pill">0</span>
-            </div>
-            <div id="layersPanel" class="layers-panel empty-state">
-              Layer cards will show up here after you save a project.
-            </div>
-          </section>
-        </section>
-
-        <section class="card stack-sm">
-          <div class="card-head">
-            <h2>Memory State</h2>
-            <span class="pill">AI summary</span>
           </div>
-          <p id="memorySummary" class="lede-small">
-            Save a project to start building a persistent studio memory.
-          </p>
-          <div id="memoryRules" class="memory-rules empty-state">No active style rules yet.</div>
-          <div id="memoryLog" class="memory-log empty-state">No changelog entries yet.</div>
-        </section>
-      </main>
-    </div>
+          <div id="chatLog" class="chat-log empty-state">
+            Send a prompt to start the session.
+          </div>
+        </article>
+      </section>
 
-    <div id="toast" class="toast hidden"></div>
-    <script type="module" src="/app.js"></script>
+      <section class="panel layers-panel-shell">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Layer Breakout</p>
+            <h2>Folders</h2>
+          </div>
+          <span id="layerCount" class="badge">0 layers</span>
+        </div>
+        <div id="layersPanel" class="layer-folder-list empty-state">
+          Layer folders will appear here after the first prompt.
+        </div>
+      </section>
+
+      <div id="toast" class="toast hidden"></div>
+      <script type="module" src="/app.js"></script>
+    </div>
   </body>
 </html>
