@@ -1,0 +1,16 @@
+{
+  "name": "draw-tech",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "NFT layer builder with an Express backend and OpenAI-powered generation flows.",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "archiver": "^7.0.1",
+    "express": "^5.1.0",
+    "sharp": "^0.34.2"
+  }
+}
