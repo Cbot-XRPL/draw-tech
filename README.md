@@ -31,6 +31,8 @@ Draw Tech is a local NFT layer builder with a simple Express backend and a brows
 4. Run `npm run dev` for auto-restart while building, or `npm start` for a normal run
 5. Open `http://localhost:3000`
 
+In dev mode, `nodemon` only watches `src`, `public`, and `package.json`, so project saves in `data/` do not restart the server during generation.
+
 On startup the console prints:
 
 - `http://localhost:3000`

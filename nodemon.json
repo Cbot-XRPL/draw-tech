@@ -1,0 +1,5 @@
+{
+  "watch": ["src", "public", "package.json"],
+  "ignore": ["data/**", "node_modules/**"],
+  "ext": "js,json,html,css"
+}

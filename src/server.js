@@ -38,6 +38,17 @@ const app = express();
 const runtimeState = {
   sessionApiKey: ""
 };
+
+process.on("unhandledRejection", (error) => {
+  console.error("[draw-tech] Unhandled rejection");
+  console.error(error);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[draw-tech] Uncaught exception");
+  console.error(error);
+});
+
 const upload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, callback) => callback(null, uploadsDir),
@@ -643,6 +654,13 @@ app.delete("/api/projects/:projectId/layers/:layerId/variants/:variantId", async
 
 app.use((error, _req, res, _next) => {
   const status = Number(error.status || 500);
+  console.error("[draw-tech] Request failed", {
+    status,
+    message: error.message
+  });
+  if (error.stack) {
+    console.error(error.stack);
+  }
   res.status(status).json({
     error: error.message || "Unexpected server error."
   });
