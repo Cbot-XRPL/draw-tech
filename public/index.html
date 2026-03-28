@@ -21,11 +21,13 @@
         </div>
 
         <div class="topbar-actions">
-          <label class="mini-field">
-            <span>API key</span>
-            <input id="apiKeyInput" type="password" placeholder="sk-..." />
-          </label>
-          <button id="saveKeyBtn" class="btn btn-primary">Use Key</button>
+          <div id="apiKeyControls" class="topbar-key-controls">
+            <label class="mini-field">
+              <span>API key</span>
+              <input id="apiKeyInput" type="password" placeholder="sk-..." />
+            </label>
+            <button id="saveKeyBtn" class="btn btn-primary">Use Key</button>
+          </div>
           <span id="keyStatus" class="badge badge-warn">No key</span>
           <button id="downloadHashlipsBtn" class="btn btn-ghost">Download All Layers</button>
         </div>

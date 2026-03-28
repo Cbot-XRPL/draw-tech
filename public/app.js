@@ -6,6 +6,7 @@ const state = {
 };
 
 const elements = {
+  apiKeyControls: document.getElementById("apiKeyControls"),
   apiKeyInput: document.getElementById("apiKeyInput"),
   saveKeyBtn: document.getElementById("saveKeyBtn"),
   keyStatus: document.getElementById("keyStatus"),
@@ -145,8 +146,11 @@ async function submitPrompt(options = {}) {
 }
 
 function render() {
-  const hasKey = state.config?.hasEnvKey || state.config?.hasSessionKey;
-  elements.keyStatus.textContent = hasKey ? "Key ready" : "No key";
+  const hasEnvKey = Boolean(state.config?.hasEnvKey);
+  const hasSessionKey = Boolean(state.config?.hasSessionKey);
+  const hasKey = hasEnvKey || hasSessionKey;
+  elements.apiKeyControls.classList.toggle("hidden", hasEnvKey);
+  elements.keyStatus.textContent = hasEnvKey ? "Env key ready" : hasSessionKey ? "Key ready" : "No key";
   elements.keyStatus.className = `badge ${hasKey ? "" : "badge-warn"}`.trim();
 
   elements.projectTitle.textContent = state.project?.title || "New Session";

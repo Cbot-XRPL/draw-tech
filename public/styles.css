@@ -59,6 +59,7 @@ textarea {
 
 .topbar,
 .topbar-actions,
+.topbar-key-controls,
 .panel-head,
 .preview-head-actions,
 .prompt-row,
@@ -74,10 +75,12 @@ textarea {
 .topbar {
   justify-content: space-between;
   align-items: flex-start;
-  position: sticky;
-  top: 0;
-  z-index: 5;
-  backdrop-filter: blur(12px);
+}
+
+.topbar-key-controls {
+  display: flex;
+  gap: 12px;
+  align-items: end;
 }
 
 .topbar-actions {
@@ -564,10 +567,41 @@ textarea:focus {
 
 @media (max-width: 1100px) {
   .topbar,
+  .topbar-actions,
+  .topbar-key-controls,
   .main-grid,
   .prompt-row,
   .canvas-inline {
     flex-direction: column;
+  }
+
+  .topbar,
+  .topbar-actions,
+  .prompt-card,
+  .prompt-copy,
+  .prompt-controls {
+    align-items: center;
+  }
+
+  .topbar-actions,
+  .topbar-key-controls,
+  .mini-field,
+  .prompt-row,
+  .canvas-inline,
+  .attach-row {
+    width: 100%;
+  }
+
+  .topbar-actions,
+  .topbar-key-controls,
+  .attach-row {
+    justify-content: center;
+  }
+
+  .prompt-copy,
+  .panel-head,
+  .stage-wrap {
+    text-align: center;
   }
 
   .main-grid {
@@ -580,6 +614,45 @@ textarea:focus {
 }
 
 @media (max-width: 720px) {
+  .app-shell {
+    padding: 14px 14px 28px;
+  }
+
+  .topbar,
+  .prompt-card,
+  .panel {
+    padding: 16px;
+  }
+
+  .topbar-actions,
+  .topbar-key-controls {
+    align-items: stretch;
+  }
+
+  .topbar-actions .btn,
+  .topbar-key-controls .btn,
+  .mini-field,
+  .attach-row .btn,
+  .preview-head-actions {
+    width: 100%;
+  }
+
+  .preview-head-actions {
+    margin-left: 0;
+    justify-content: center;
+  }
+
+  .panel-head {
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .attachment-preview-list,
+  .folder-actions,
+  .variant-actions {
+    justify-content: center;
+  }
+
   .generated-card,
   .variant-item {
     grid-template-columns: 1fr;

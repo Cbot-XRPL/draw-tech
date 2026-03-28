@@ -258,6 +258,34 @@ app.post("/api/chat", async (req, res, next) => {
       project = draftResult.project;
       memory = draftResult.memory;
       assistantGenerated = toAssistantGeneratedImage(draftResult.draft);
+    } else if (action === "feedback") {
+      const feedbackMode = detectFeedbackMode(promptText);
+      if (!route.assistantReply) {
+        assistantReply =
+          feedbackMode === "feedback-correction"
+            ? "I logged that correction and will steer future generations around it."
+            : "I logged that preference and will carry it into future generations.";
+      }
+      memory = await studioMemoryService.appendChangelog(project, {
+        type: feedbackMode,
+        title: buildFeedbackTitle(promptText, feedbackMode),
+        detail: promptText
+      });
+
+      if (shouldLockFeedback(promptText, feedbackMode)) {
+        memory = await studioMemoryService.addLockedDecision(project, {
+          title: buildLockedDecisionTitle(promptText),
+          detail: promptText
+        });
+      }
+
+      memory = await refreshMemoryIfPossible(project, memory, apiKey);
+      await refreshBrainIfPossible(project, memory, apiKey, {
+        type: "feedback",
+        prompt: promptText,
+        layerName: route.targetLayerName || guessLayerNameFromPrompt(promptText),
+        summary: promptText
+      });
     } else if (action === "commit_draft") {
       const latestDraft = getLatestOpenDraft(project);
       if (!latestDraft) {
@@ -1111,6 +1139,54 @@ function guessLayerNameFromPrompt(promptText) {
   }
 
   return match === "clothes" ? "Clothing" : match === "headwear" ? "Hat" : match.charAt(0).toUpperCase() + match.slice(1);
+}
+
+function detectFeedbackMode(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  if (/(don't|do not|stop|avoid|too much|too many|hate|dislike|wrong|bad|off)/.test(lowered)) {
+    return "feedback-correction";
+  }
+
+  if (/(love|like|great|perfect|amazing|nice|good|keep|remember|prestack|pre-stack)/.test(lowered)) {
+    return "feedback-approval";
+  }
+
+  return "feedback-note";
+}
+
+function shouldLockFeedback(promptText, feedbackMode) {
+  const lowered = cleanText(promptText).toLowerCase();
+  if (feedbackMode !== "feedback-approval") {
+    return false;
+  }
+
+  return /(love|perfect|keep|remember|always|really like|prestack|pre-stack)/.test(lowered);
+}
+
+function buildFeedbackTitle(promptText, feedbackMode) {
+  const layerName = guessLayerNameFromPrompt(promptText);
+  if (feedbackMode === "feedback-correction") {
+    return layerName ? `Correction for ${layerName}` : "Creative correction";
+  }
+
+  if (feedbackMode === "feedback-approval") {
+    return layerName ? `Approved direction for ${layerName}` : "Approved creative direction";
+  }
+
+  return "Creative feedback note";
+}
+
+function buildLockedDecisionTitle(promptText) {
+  const layerName = guessLayerNameFromPrompt(promptText);
+  if (layerName) {
+    return `Keep this behavior for ${layerName}`;
+  }
+
+  if (/prestack|pre-stack/i.test(promptText)) {
+    return "Keep the pre-stacked layer behavior";
+  }
+
+  return "Remember this approved creative behavior";
 }
 
 function buildHashLipsLayerFolders(project) {
