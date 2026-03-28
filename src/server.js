@@ -39,6 +39,33 @@ const runtimeState = {
   sessionApiKey: ""
 };
 
+const DURABLE_STUDIO_QUALITY_RULES = [
+  "When the preview is shown in the app, prefer one backend-composited preview image over multiple competing client-side render paths.",
+  "A layer should only appear on preview when its checkbox-style toggle is actively selected.",
+  "When simplifying the preview UI, keep frontend DOM ids and frontend render code in sync so stale references do not break painting."
+];
+
+const DURABLE_STUDIO_LESSONS = [
+  {
+    title: "Keep preview rendering single-path",
+    detail:
+      "When the app preview fails or shows only a stray pixel, collapse to one preview image fed by the server composite instead of mixing canvas, stacked img tags, and stale DOM hooks.",
+    tags: ["preview", "rendering", "frontend", "composite"]
+  },
+  {
+    title: "Treat layer visibility as a real toggle",
+    detail:
+      "Checked means the layer is on preview, unchecked means it is off. The preview should follow that state exactly so users can test stack combinations freely.",
+    tags: ["preview", "layers", "selection", "ux"]
+  },
+  {
+    title: "Match chat-selected assets to the intended subject",
+    detail:
+      "When committing from chat history into a folder, prefer the actual subject named by the user instead of matching accessory notes that merely mention that subject.",
+    tags: ["chat", "routing", "asset-selection", "layers"]
+  }
+];
+
 process.on("unhandledRejection", (error) => {
   console.error("[draw-tech] Unhandled rejection");
   console.error(error);
@@ -216,6 +243,10 @@ app.post("/api/chat", async (req, res, next) => {
     let assistantReply = route.assistantReply || "Working on that now.";
     let action = route.actionType;
     let assistantGenerated = null;
+    const forcedLayerEdit = detectLayerEditRequest(project, promptText, route);
+    if (forcedLayerEdit) {
+      action = "edit_layer_variant";
+    }
 
     if (action === "remove_layer") {
       const layer = findLayer(project, route.targetLayerName || route.removalTarget);
@@ -258,6 +289,26 @@ app.post("/api/chat", async (req, res, next) => {
       project = draftResult.project;
       memory = draftResult.memory;
       assistantGenerated = toAssistantGeneratedImage(draftResult.draft);
+    } else if (action === "edit_layer_variant") {
+      const editTarget =
+        forcedLayerEdit || detectLayerEditRequest(project, promptText, route);
+      if (!editTarget) {
+        assistantReply = "I could not figure out which layer image to revise.";
+      } else {
+        const editResult = await reviseLayerVariantForProject(project, apiKey, {
+          layer: editTarget.layer,
+          promptText,
+          removalTarget: editTarget.removalTarget,
+          extraDirection: route.variantDirection,
+          attachments: contextualAttachments
+        });
+        project = editResult.project;
+        memory = editResult.memory;
+        assistantGenerated = toAssistantGeneratedImage(editResult.variant);
+        assistantReply =
+          route.assistantReply ||
+          `I revised ${editResult.layer.name} so ${editTarget.removalTarget || "that feature"} is no longer baked into the base layer.`;
+      }
     } else if (action === "feedback") {
       const feedbackMode = detectFeedbackMode(promptText);
       if (!route.assistantReply) {
@@ -744,6 +795,10 @@ async function ensureDirectories() {
   await fs.mkdir(generatedDir, { recursive: true });
   await studioMemoryService.ensureDirectories();
   await studioBrainService.ensureDirectories();
+  await studioBrainService.reinforceBrain({
+    qualityRules: DURABLE_STUDIO_QUALITY_RULES,
+    drawingLessons: DURABLE_STUDIO_LESSONS
+  });
   await fs.mkdir(uploadsDir, { recursive: true });
 }
 
@@ -975,6 +1030,95 @@ async function generateDraftForProject(project, apiKey, options = {}) {
   return { project, memory, draft };
 }
 
+async function reviseLayerVariantForProject(project, apiKey, options = {}) {
+  const layer = options.layer;
+  if (!layer) {
+    const error = new Error("Layer not found for revision.");
+    error.status = 404;
+    throw error;
+  }
+
+  const sourceVariant = findSourceVariantForLayerEdit(layer, options.promptText);
+  if (!sourceVariant?.imageUrl) {
+    const error = new Error("No layer image was available to revise.");
+    error.status = 404;
+    throw error;
+  }
+
+  const removalTarget = cleanText(options.removalTarget);
+  const editPrompt = buildLayerRevisionPrompt(project, layer, sourceVariant, {
+    promptText: options.promptText,
+    removalTarget,
+    extraDirection: options.extraDirection
+  });
+
+  const imageAsset = await openaiService.generateImageAsset({
+    apiKey,
+    prompt: editPrompt,
+    size: project.canvas.generationSize,
+    background: "transparent"
+  });
+
+  const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
+  await fs.mkdir(variantFolder, { recursive: true });
+
+  const variantId = createId("variant");
+  const filename = `${variantId}.png`;
+  const absolutePath = path.join(variantFolder, filename);
+  await fs.writeFile(absolutePath, await resizePng(imageAsset.buffer, project.canvas));
+  const variantBuffer = await fs.readFile(absolutePath);
+  const analysis = await inspectVariantAgainstLayer(layer, variantBuffer);
+
+  const revisedVariant = {
+    id: variantId,
+    type: "variant",
+    name: buildRevisedVariantName(layer, sourceVariant, removalTarget),
+    notes: buildRevisedVariantNotes(sourceVariant, removalTarget),
+    prompt: editPrompt,
+    imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
+    targetLayerName: layer.name,
+    status: "committed",
+    analysis,
+    createdAt: new Date().toISOString()
+  };
+
+  layer.variants = Array.isArray(layer.variants) ? layer.variants : [];
+  const sourceIndex = layer.variants.findIndex((item) => item.id === sourceVariant.id);
+  if (sourceIndex >= 0) {
+    layer.variants[sourceIndex] = revisedVariant;
+  } else {
+    layer.variants.push(revisedVariant);
+  }
+  layer.selectedVariantId = revisedVariant.id;
+
+  project.updatedAt = new Date().toISOString();
+  await projectService.writeProject(project);
+
+  let memory = await studioMemoryService.appendChangelog(project, {
+    type: "edit-layer-variant",
+    title: `Revised ${layer.name}`,
+    detail: removalTarget
+      ? `Removed ${removalTarget} from ${layer.name} and replaced the previous selected asset.`
+      : `Revised ${layer.name} based on the latest edit request.`
+  });
+  memory = await refreshMemoryIfPossible(project, memory, apiKey);
+  await refreshBrainIfPossible(project, memory, apiKey, {
+    type: "edit-layer-variant",
+    prompt: options.promptText,
+    layerName: layer.name,
+    summary: revisedVariant.notes,
+    analysis
+  });
+
+  return {
+    project,
+    memory,
+    layer,
+    sourceVariant,
+    variant: revisedVariant
+  };
+}
+
 async function commitDraftToLayer(project, draftId, targetLayerName) {
   project.draftHistory = Array.isArray(project.draftHistory) ? project.draftHistory : [];
   const draft = project.draftHistory.find((item) => item.id === draftId);
@@ -1096,6 +1240,28 @@ function ensureLayer(project, layerName) {
   return layer;
 }
 
+function detectLayerEditRequest(project, promptText, route = {}) {
+  const lowered = cleanText(promptText).toLowerCase();
+  if (!/(remove|without|take off|take the|strip|erase)/.test(lowered)) {
+    return null;
+  }
+
+  const layer =
+    findLayer(project, route.targetLayerName) ||
+    findLayer(project, extractLayerLookupFromPrompt(promptText)) ||
+    findLayer(project, guessLayerNameFromPrompt(promptText));
+
+  const removalTarget = cleanText(route.removalTarget) || extractRemovalTargetFromPrompt(promptText);
+  if (!layer || !removalTarget) {
+    return null;
+  }
+
+  return {
+    layer,
+    removalTarget
+  };
+}
+
 function findLayer(project, lookup) {
   const token = slugify(lookup || "");
   if (!token) {
@@ -1123,6 +1289,101 @@ function removeVariantFromLayer(layer, lookup) {
 
   layer.variants = layer.variants.filter((item) => item.id !== variant.id);
   return variant;
+}
+
+function findSourceVariantForLayerEdit(layer, promptText) {
+  const variants = Array.isArray(layer?.variants) ? layer.variants : [];
+  if (!variants.length) {
+    return null;
+  }
+
+  const token = slugify(extractRemovalTargetFromPrompt(promptText));
+  if (token) {
+    const matched = variants.find((item) => slugify(item.name).includes(token));
+    if (matched) {
+      return matched;
+    }
+  }
+
+  return variants.find((item) => item.id === layer.selectedVariantId) || variants[0] || null;
+}
+
+function buildLayerRevisionPrompt(project, layer, sourceVariant, options = {}) {
+  const removalTarget = cleanText(options.removalTarget);
+  const extraDirection = cleanText(options.extraDirection);
+  const sourcePrompt = cleanText(sourceVariant?.prompt);
+  const sourceNotes = cleanText(sourceVariant?.notes);
+
+  return [
+    `Create a revised ${layer.name} NFT layer asset for the collection ${project.title}.`,
+    sourcePrompt ? `Stay visually consistent with this existing layer prompt: ${sourcePrompt}.` : "",
+    sourceNotes ? `Preserve these approved notes from the current asset: ${sourceNotes}.` : "",
+    `Keep the same pose, framing, alignment, proportions, facial expression, line quality, and overall style so it still stacks cleanly with the rest of the collection.`,
+    removalTarget
+      ? `Remove ${removalTarget} completely from this ${layer.name} asset so that feature is not baked into the layer anymore.`
+      : `Revise the current ${layer.name} asset according to the latest request without changing the core pose or style.`,
+    `Anything that belongs on a separate trait layer must stay off this ${layer.name} asset.`,
+    extraDirection,
+    "Output one isolated layer asset only.",
+    "Transparent background. No mockup, no scene, no text, no watermark.",
+    "Centered composition, stack-safe proportions, crisp edges, PNG-ready."
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function buildRevisedVariantName(layer, sourceVariant, removalTarget) {
+  if (removalTarget) {
+    return `${layer.name} Without ${titleCaseWords(removalTarget)}`;
+  }
+
+  return cleanText(sourceVariant?.name) ? `${sourceVariant.name} Revised` : `${layer.name} Revised`;
+}
+
+function buildRevisedVariantNotes(sourceVariant, removalTarget) {
+  const base = cleanText(sourceVariant?.notes);
+  if (removalTarget) {
+    return [base, `Revised to remove ${removalTarget} from the layer asset.`].filter(Boolean).join(" ");
+  }
+
+  return [base, "Revised version of the current layer asset."].filter(Boolean).join(" ");
+}
+
+function extractLayerLookupFromPrompt(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const match = lowered.match(/from\s+the\s+(.+?)\s+layer/);
+  if (match?.[1]) {
+    return match[1];
+  }
+
+  const fallback = lowered.match(/(?:from|on)\s+(.+?)\s+layer/);
+  return fallback?.[1] || "";
+}
+
+function extractRemovalTargetFromPrompt(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const patterns = [
+    /remove\s+(?:the\s+)?(.+?)\s+from\s+(?:the\s+)?(?:.+?)\s+layer/,
+    /take\s+(?:the\s+)?(.+?)\s+off\s+(?:the\s+)?(?:.+?)\s+layer/,
+    /without\s+(?:the\s+)?(.+?)(?:\s|$)/
+  ];
+
+  for (const pattern of patterns) {
+    const match = lowered.match(pattern);
+    if (match?.[1]) {
+      return cleanText(match[1]).replace(/^(the|a|an)\s+/i, "");
+    }
+  }
+
+  return "";
+}
+
+function titleCaseWords(value) {
+  return cleanText(value)
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
 }
 
 async function resolveAttachments(ids) {

@@ -29,10 +29,8 @@ const elements = {
   projectTitle: document.getElementById("projectTitle"),
   canvasBadge: document.getElementById("canvasBadge"),
   stage: document.getElementById("stage"),
-  previewCanvas: document.getElementById("previewCanvas"),
   previewImage: document.getElementById("previewImage"),
   stageEmpty: document.getElementById("stageEmpty"),
-  layerStack: document.getElementById("layerStack"),
   chatLog: document.getElementById("chatLog"),
   layersPanel: document.getElementById("layersPanel"),
   layerCount: document.getElementById("layerCount"),
@@ -42,6 +40,7 @@ const elements = {
 elements.previewImage.addEventListener("load", () => {
   state.previewAsset.loaded = true;
   state.previewAsset.failed = false;
+  elements.previewImage.style.display = "block";
   elements.previewImage.classList.remove("hidden");
   syncPreviewStatus();
 });
@@ -49,6 +48,7 @@ elements.previewImage.addEventListener("load", () => {
 elements.previewImage.addEventListener("error", () => {
   state.previewAsset.loaded = false;
   state.previewAsset.failed = true;
+  elements.previewImage.style.display = "none";
   elements.previewImage.classList.add("hidden");
   syncPreviewStatus();
 });
@@ -193,26 +193,25 @@ function renderPreview() {
   const previewUrl =
     state.project?.id && stackSources.length
       ? `/api/projects/${state.project.id}/preview/render?v=${encodeURIComponent(
-          state.project.updatedAt || renderToken || Date.now()
+          renderToken || state.project.updatedAt || Date.now()
         )}`
       : "";
 
   elements.stage.style.aspectRatio = getAspectRatio(readCanvasFromState());
-  elements.stage.style.background = "#e8e8e8";
-  elements.stage.style.position = "relative";
-  elements.stage.style.overflow = "hidden";
-  elements.previewCanvas.style.display = "none";
-  elements.layerStack.style.display = "none";
+  elements.previewImage.decoding = "sync";
+  elements.previewImage.loading = "eager";
+  elements.previewImage.style.display = "none";
 
   if (previewUrl) {
-    state.previewAsset.requestKey = renderToken;
-    if (elements.previewImage.dataset.requestKey !== renderToken) {
+    state.previewAsset.requestKey = previewUrl;
+    state.previewAsset.failed = false;
+    if (elements.previewImage.dataset.requestKey !== previewUrl) {
       state.previewAsset.loaded = false;
-      state.previewAsset.failed = false;
-      elements.previewImage.dataset.requestKey = renderToken;
-      elements.previewImage.classList.add("hidden");
+      elements.previewImage.dataset.requestKey = previewUrl;
+      elements.previewImage.removeAttribute("src");
       elements.previewImage.src = previewUrl;
     } else if (state.previewAsset.loaded && !state.previewAsset.failed) {
+      elements.previewImage.style.display = "block";
       elements.previewImage.classList.remove("hidden");
     }
   } else {
@@ -222,6 +221,7 @@ function renderPreview() {
     elements.previewImage.dataset.requestKey = "";
     elements.previewImage.removeAttribute("src");
     elements.previewImage.classList.add("hidden");
+    elements.previewImage.style.display = "none";
   }
 
   syncPreviewStatus();

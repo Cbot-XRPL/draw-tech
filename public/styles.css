@@ -372,61 +372,21 @@ textarea:focus {
   overflow: hidden;
   border-radius: 26px;
   border: 1px solid var(--line);
-  background: #e8e8e8;
-}
-
-.stage-grid {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
   background:
-    linear-gradient(45deg, rgba(0, 0, 0, 0.045) 25%, transparent 25%, transparent 75%, rgba(0, 0, 0, 0.045) 75%),
-    linear-gradient(45deg, rgba(0, 0, 0, 0.045) 25%, transparent 25%, transparent 75%, rgba(0, 0, 0, 0.045) 75%);
+    linear-gradient(45deg, rgba(255, 255, 255, 0.032) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.032) 75%),
+    linear-gradient(45deg, rgba(255, 255, 255, 0.032) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.032) 75%),
+    #090909;
   background-size: 28px 28px;
   background-position: 0 0, 14px 14px;
 }
 
-.stage-image,
-.stack-layer,
-.preview-canvas {
-  position: absolute;
-  inset: 0;
+.preview-stage-image {
+  display: block;
   width: 100%;
   height: 100%;
-}
-
-.stage-image,
-.stack-layer {
   object-fit: contain;
-}
-
-.stage-image {
+  position: relative;
   z-index: 1;
-}
-
-.preview-canvas {
-  z-index: 1;
-  display: block;
-}
-
-.stack-base-preview {
-  z-index: 1;
-}
-
-.layer-stack {
-  position: absolute;
-  inset: 0;
-  z-index: 2;
-  pointer-events: none;
-}
-
-.stack-layer {
-  z-index: 2;
-}
-
-.stage-preview {
-  opacity: 1;
-  filter: none;
 }
 
 .stage-empty {

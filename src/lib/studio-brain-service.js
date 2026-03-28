@@ -9,7 +9,8 @@ export function createStudioBrainService({ brainDir, toolManifestPath }) {
     writeBrain,
     getToolManifest,
     recordSessionEvent,
-    mergeAiReflection
+    mergeAiReflection,
+    reinforceBrain
   };
 
   async function ensureDirectories() {
@@ -74,6 +75,19 @@ export function createStudioBrainService({ brainDir, toolManifestPath }) {
       crossProjectSummary: cleanText(reflection?.crossProjectSummary) || brain.crossProjectSummary,
       qualityRules: mergeStringLists(brain.qualityRules, reflection?.qualityRules, 18),
       drawingLessons: mergeLessons(brain.drawingLessons, reflection?.drawingLessons),
+      updatedAt: new Date().toISOString()
+    });
+
+    await writeBrain(merged);
+    return merged;
+  }
+
+  async function reinforceBrain(reinforcement) {
+    const brain = await getBrain();
+    const merged = normalizeBrain({
+      ...brain,
+      qualityRules: mergeStringLists(brain.qualityRules, reinforcement?.qualityRules, 18),
+      drawingLessons: mergeLessons(brain.drawingLessons, reinforcement?.drawingLessons),
       updatedAt: new Date().toISOString()
     });
 
