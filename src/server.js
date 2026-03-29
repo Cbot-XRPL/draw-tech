@@ -946,18 +946,30 @@ app.post("/api/projects/:projectId/layers/:layerId/transform", async (req, res, 
       return;
     }
 
-    const currentTransform = getLayerPlacementTransform(layer, variant);
+    const requestedScope = cleanText(req.body?.scope).toLowerCase();
+    const useVariantTransform = requestedScope === "variant" || isVariantUsingCustomTransform(variant);
+    const currentTransform = useVariantTransform
+      ? getVariantPlacementTransform(layer, variant)
+      : getLayerPlacementTransform(layer, variant);
     const nextTransform = mergeLayerTransform(currentTransform, patch);
-    applyLayerPlacementTransform(layer, nextTransform);
+    applyPlacementTransformForVariant(layer, variant, nextTransform, useVariantTransform ? "custom" : "sync");
     layer.selectedVariantId = variant.id;
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
     const memory = await studioMemoryService.appendChangelog(project, {
-      type: "manual-transform-layer",
-      title: `Dragged ${layer.name}`,
-      detail: `Set ${variant.name} to x ${nextTransform.x}, y ${nextTransform.y}, scale ${nextTransform.scale}.`
+      type: useVariantTransform ? "manual-transform-variant" : "manual-transform-layer",
+      title: useVariantTransform ? `Dragged ${variant.name}` : `Dragged ${layer.name}`,
+      detail: useVariantTransform
+        ? `Set custom placement for ${variant.name} to x ${nextTransform.x}, y ${nextTransform.y}, scale ${nextTransform.scale}.`
+        : `Set ${variant.name} to x ${nextTransform.x}, y ${nextTransform.y}, scale ${nextTransform.scale}.`
     });
-    res.json({ project, memory, layer, variant });
+    res.json({
+      project,
+      memory,
+      layer,
+      variant,
+      transformScope: useVariantTransform ? "variant" : "layer"
+    });
   } catch (error) {
     next(error);
   }
@@ -1059,6 +1071,60 @@ app.post("/api/projects/:projectId/drafts/:draftId/commit", async (req, res, nex
   }
 });
 
+app.post("/api/projects/:projectId/layers/:layerId/variants/:variantId/placement-mode", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const layer = project.layers.find((item) => item.id === req.params.layerId);
+    if (!layer) {
+      res.status(404).json({ error: "Layer not found." });
+      return;
+    }
+
+    const variant = (Array.isArray(layer.variants) ? layer.variants : []).find(
+      (item) => item.id === req.params.variantId
+    );
+    if (!variant) {
+      res.status(404).json({ error: "Layer image not found." });
+      return;
+    }
+
+    const requestedMode = cleanText(req.body?.mode).toLowerCase();
+    const nextMode =
+      requestedMode === "custom" || requestedMode === "sync"
+        ? requestedMode
+        : isVariantUsingCustomTransform(variant)
+          ? "sync"
+          : "custom";
+
+    let detail = "";
+    if (nextMode === "custom") {
+      const frozenTransform = getVariantPlacementTransform(layer, variant);
+      applyVariantPlacementTransform(layer, variant, frozenTransform);
+      detail = `Broke ${variant.name} out of ${layer.name} sync so it can keep its own placement.`;
+    } else {
+      const syncedTransform = resyncVariantPlacementTransform(layer, variant);
+      detail = `Resynced ${variant.name} back to ${layer.name} at x ${syncedTransform.x}, y ${syncedTransform.y}, scale ${syncedTransform.scale}.`;
+    }
+
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    const memory = await studioMemoryService.appendChangelog(project, {
+      type: nextMode === "custom" ? "break-layer-sync" : "resync-layer-sync",
+      title: nextMode === "custom" ? `Customised ${variant.name}` : `Resynced ${variant.name}`,
+      detail
+    });
+    res.json({
+      project,
+      memory,
+      layer,
+      variant,
+      mode: nextMode
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/projects/:projectId/layers/:layerId/variants/:variantId/move", async (req, res, next) => {
   try {
     const project = await projectService.readProject(req.params.projectId);
@@ -1110,6 +1176,7 @@ app.post("/api/projects/:projectId/layers/:layerId/variants/:variantId/move", as
 
     let movedVariant = existingVariant;
     if (!movedVariant) {
+      variant.transformMode = "sync";
       variant.transform = getLayerPlacementTransform(targetLayer, variant);
       targetLayer.variants.push(variant);
       movedVariant = variant;
@@ -1287,7 +1354,7 @@ function buildFitDebugData(project) {
     const variants = Array.isArray(layer.variants) ? layer.variants : [];
     const selectedVariant = variants.find((item) => item.id === layer.selectedVariantId) || null;
     const fitProfile = getLayerFitProfile(layer.name);
-    const transform = getLayerPlacementTransform(layer, selectedVariant);
+    const transform = getVariantPlacementTransform(layer, selectedVariant);
 
     return {
       id: layer.id,
@@ -1295,6 +1362,7 @@ function buildFitDebugData(project) {
       isBaseLayer: isPrimaryBaseLayerName(layer.name),
       selected: Boolean(selectedVariant),
       selectedVariantId: selectedVariant?.id || null,
+      selectedVariantTransformMode: normalizeVariantTransformMode(selectedVariant?.transformMode),
       selectedVariant: selectedVariant
         ? {
             id: selectedVariant.id,
@@ -1465,6 +1533,7 @@ async function generateLayerVariantsForProject(project, layerId, count, apiKey, 
       prompt: item.prompt,
       imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
       analysis,
+      transformMode: "sync",
       transform: layerTransform,
       createdAt: new Date().toISOString()
     });
@@ -1658,7 +1727,11 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
     throw error;
   }
 
-  const layerTransform = getLayerPlacementTransform(layer, sourceVariant);
+  const revisedTransformMode = normalizeVariantTransformMode(sourceVariant?.transformMode);
+  const revisedTransform =
+    revisedTransformMode === "custom"
+      ? getVariantPlacementTransform(layer, sourceVariant)
+      : getLayerPlacementTransform(layer, sourceVariant);
   const revisedVariant = {
     id: variantId,
     type: "variant",
@@ -1669,7 +1742,8 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
     targetLayerName: layer.name,
     status: "committed",
     analysis,
-    transform: layerTransform,
+    transformMode: revisedTransformMode,
+    transform: revisedTransform,
     createdAt: new Date().toISOString()
   };
 
@@ -1683,7 +1757,7 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
     layer.variants.push(revisedVariant);
   }
   layer.selectedVariantId = revisedVariant.id;
-  applyLayerPlacementTransform(layer, layerTransform);
+  applyPlacementTransformForVariant(layer, revisedVariant, revisedTransform, revisedTransformMode);
   if (isPrimaryBaseLayerName(layer.name)) {
     project.selectedPreviewId = null;
   }
@@ -1724,21 +1798,26 @@ async function updateLayerVariantTransform(project, layer, options = {}) {
     throw error;
   }
 
-  const currentTransform = getLayerPlacementTransform(layer, variant);
+  const useVariantTransform = isVariantUsingCustomTransform(variant);
+  const currentTransform = useVariantTransform
+    ? getVariantPlacementTransform(layer, variant)
+    : getLayerPlacementTransform(layer, variant);
   const nextTransform = mergeLayerTransform(
     currentTransform,
     inferTransformPatchFromPrompt(layer, options.promptText, currentTransform)
   );
 
-  applyLayerPlacementTransform(layer, nextTransform);
+  applyPlacementTransformForVariant(layer, variant, nextTransform, useVariantTransform ? "custom" : "sync");
   layer.selectedVariantId = variant.id;
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
 
   let memory = await studioMemoryService.appendChangelog(project, {
-    type: "transform-layer-variant",
-    title: `Updated ${layer.name} placement`,
-    detail: `Moved ${variant.name} to x ${nextTransform.x}, y ${nextTransform.y}, scale ${nextTransform.scale}.`
+    type: useVariantTransform ? "transform-custom-variant" : "transform-layer-variant",
+    title: useVariantTransform ? `Updated ${variant.name} placement` : `Updated ${layer.name} placement`,
+    detail: useVariantTransform
+      ? `Moved ${variant.name} independently to x ${nextTransform.x}, y ${nextTransform.y}, scale ${nextTransform.scale}.`
+      : `Moved ${variant.name} to x ${nextTransform.x}, y ${nextTransform.y}, scale ${nextTransform.scale}.`
   });
   memory = await refreshMemoryIfPossible(project, memory);
 
@@ -1769,6 +1848,7 @@ async function restoreLayerVariantFromHistory(project, layer, promptText = "") {
 
   let variant = existingVariant;
   if (!variant) {
+    const variantTransformMode = normalizeVariantTransformMode(source?.transformMode);
     variant = {
       id: createId("variant"),
       name: cleanText(source.name) || `${layer.name} Restored`,
@@ -1776,13 +1856,22 @@ async function restoreLayerVariantFromHistory(project, layer, promptText = "") {
       prompt: cleanText(source.prompt),
       imageUrl: source.imageUrl,
       analysis: source.analysis || null,
-      transform: getLayerPlacementTransform(layer, source),
+      transformMode: variantTransformMode,
+      transform:
+        variantTransformMode === "custom"
+          ? getVariantPlacementTransform(layer, source)
+          : getLayerPlacementTransform(layer, source),
       createdAt: new Date().toISOString()
     };
     layer.variants.unshift(variant);
   }
 
-  applyLayerPlacementTransform(layer, getLayerPlacementTransform(layer, variant));
+  const variantTransformMode = normalizeVariantTransformMode(variant?.transformMode);
+  const variantTransform =
+    variantTransformMode === "custom"
+      ? getVariantPlacementTransform(layer, variant)
+      : getLayerPlacementTransform(layer, variant);
+  applyPlacementTransformForVariant(layer, variant, variantTransform, variantTransformMode);
   layer.selectedVariantId = variant.id;
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
@@ -1911,7 +2000,14 @@ async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
     null;
 
   if (existingVariant) {
-    applyLayerPlacementTransform(layer, getLayerPlacementTransform(layer, existingVariant));
+    applyPlacementTransformForVariant(
+      layer,
+      existingVariant,
+      isVariantUsingCustomTransform(existingVariant)
+        ? getVariantPlacementTransform(layer, existingVariant)
+        : getLayerPlacementTransform(layer, existingVariant),
+      existingVariant.transformMode
+    );
     layer.selectedVariantId = existingVariant.id;
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
@@ -1944,6 +2040,7 @@ async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
     prompt: cleanText(source.prompt),
     imageUrl: source.imageUrl,
     analysis: source.analysis || null,
+    transformMode: "sync",
     transform: layerTransform,
     createdAt: new Date().toISOString()
   };
@@ -2358,13 +2455,34 @@ function normalizeLayerTransform(transform) {
   };
 }
 
+function normalizeVariantTransformMode(mode) {
+  return cleanText(mode).toLowerCase() === "custom" ? "custom" : "sync";
+}
+
+function isVariantUsingCustomTransform(variant) {
+  return normalizeVariantTransformMode(variant?.transformMode) === "custom";
+}
+
 function getLayerPlacementTransform(layer, fallbackVariant = null) {
+  const selectedVariant = getSelectedLayerVariant(layer);
+  const fallbackTransform =
+    fallbackVariant && !isVariantUsingCustomTransform(fallbackVariant) ? fallbackVariant.transform : null;
+  const selectedTransform =
+    selectedVariant && !isVariantUsingCustomTransform(selectedVariant) ? selectedVariant.transform : null;
   return normalizeLayerTransform(
     layer?.transform ||
-      fallbackVariant?.transform ||
-      getSelectedLayerVariant(layer)?.transform ||
+      fallbackTransform ||
+      selectedTransform ||
       getDefaultTransformForLayer(layer?.name)
   );
+}
+
+function getVariantPlacementTransform(layer, variant = null) {
+  if (variant && isVariantUsingCustomTransform(variant)) {
+    return normalizeLayerTransform(variant.transform || getLayerPlacementTransform(layer, variant));
+  }
+
+  return getLayerPlacementTransform(layer, variant);
 }
 
 function applyLayerPlacementTransform(layer, transform) {
@@ -2376,11 +2494,41 @@ function applyLayerPlacementTransform(layer, transform) {
       if (!variant) {
         continue;
       }
+      if (isVariantUsingCustomTransform(variant)) {
+        continue;
+      }
+      variant.transformMode = "sync";
       variant.transform = nextTransform;
     }
   }
 
   return nextTransform;
+}
+
+function applyVariantPlacementTransform(layer, variant, transform) {
+  const nextTransform = normalizeLayerTransform(transform || getVariantPlacementTransform(layer, variant));
+  variant.transformMode = "custom";
+  variant.transform = nextTransform;
+  return nextTransform;
+}
+
+function resyncVariantPlacementTransform(layer, variant) {
+  const nextTransform = getLayerPlacementTransform(layer, variant);
+  variant.transformMode = "sync";
+  variant.transform = nextTransform;
+  return nextTransform;
+}
+
+function applyPlacementTransformForVariant(layer, variant, transform, mode = variant?.transformMode) {
+  if (variant && normalizeVariantTransformMode(mode) === "custom") {
+    return applyVariantPlacementTransform(layer, variant, transform);
+  }
+
+  if (variant) {
+    variant.transformMode = "sync";
+  }
+
+  return applyLayerPlacementTransform(layer, transform);
 }
 
 function mergeLayerTransform(current, patch) {
@@ -2541,6 +2689,7 @@ async function sanitizeAccessoryLayerToPureTrait(project, layer, options = {}) {
     null;
 
   if (!variant) {
+    const variantTransformMode = normalizeVariantTransformMode(source?.transformMode);
     variant = {
       id: cleanText(source.id) || createId("variant"),
       name: cleanText(source.name) || `${layer.name} Restored`,
@@ -2548,14 +2697,23 @@ async function sanitizeAccessoryLayerToPureTrait(project, layer, options = {}) {
       prompt: cleanText(source.prompt),
       imageUrl: source.imageUrl,
       analysis: source.analysis || null,
-      transform: getLayerPlacementTransform(layer, source),
+      transformMode: variantTransformMode,
+      transform:
+        variantTransformMode === "custom"
+          ? getVariantPlacementTransform(layer, source)
+          : getLayerPlacementTransform(layer, source),
       createdAt: source.createdAt || new Date().toISOString()
     };
     layer.variants.unshift(variant);
   }
 
   pruneContaminatedSelectedVariants(layer, variant.id);
-  applyLayerPlacementTransform(layer, getLayerPlacementTransform(layer, variant));
+  const variantTransformMode = normalizeVariantTransformMode(variant?.transformMode);
+  const variantTransform =
+    variantTransformMode === "custom"
+      ? getVariantPlacementTransform(layer, variant)
+      : getLayerPlacementTransform(layer, variant);
+  applyPlacementTransformForVariant(layer, variant, variantTransform, variantTransformMode);
   layer.selectedVariantId = variant.id;
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
@@ -2614,6 +2772,7 @@ async function regenerateAccessoryLayerAsPureTrait(project, apiKey, layer, optio
     targetLayerName: layer.name,
     status: "committed",
     analysis,
+    transformMode: "sync",
     transform: layerTransform,
     createdAt: new Date().toISOString()
   };
@@ -2622,7 +2781,7 @@ async function regenerateAccessoryLayerAsPureTrait(project, apiKey, layer, optio
     (item) => !isLikelyContaminatedAccessoryAnalysis(layer, item.analysis)
   );
   layer.variants = [variant, ...safeExistingVariants.filter((item) => item.id !== variant.id)];
-  applyLayerPlacementTransform(layer, layerTransform);
+  applyPlacementTransformForVariant(layer, variant, layerTransform, variant.transformMode);
   layer.selectedVariantId = variant.id;
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
@@ -2676,12 +2835,19 @@ async function rebuildHeadwearAsFrontTrait(project, layer, options = {}) {
   const variantBuffer = await fs.readFile(absolutePath);
   const analysis = await inspectVariantAgainstLayer(layer, variantBuffer);
 
+  const nextTransformMode = normalizeVariantTransformMode(selectedVariant?.transformMode || source?.transformMode);
   let transform =
     (await buildAnchorAwareLayerTransform(project, layer, {
       ...source,
       analysis: sourceAnalysis,
-      transform: getLayerPlacementTransform(layer, source)
-    })) || getLayerPlacementTransform(layer, source);
+      transform:
+        nextTransformMode === "custom"
+          ? getVariantPlacementTransform(layer, source)
+          : getLayerPlacementTransform(layer, source)
+    })) ||
+    (nextTransformMode === "custom"
+      ? getVariantPlacementTransform(layer, source)
+      : getLayerPlacementTransform(layer, source));
   transform = mergeLayerTransform(transform, inferTransformPatchFromPrompt(layer, options.promptText, transform));
   transform = normalizeLayerTransform({
     ...transform,
@@ -2698,6 +2864,7 @@ async function rebuildHeadwearAsFrontTrait(project, layer, options = {}) {
     targetLayerName: layer.name,
     status: "committed",
     analysis,
+    transformMode: nextTransformMode,
     transform,
     createdAt: new Date().toISOString()
   };
@@ -2710,7 +2877,7 @@ async function rebuildHeadwearAsFrontTrait(project, layer, options = {}) {
   } else {
     layer.variants.unshift(variant);
   }
-  applyLayerPlacementTransform(layer, transform);
+  applyPlacementTransformForVariant(layer, variant, transform, nextTransformMode);
   layer.selectedVariantId = variant.id;
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
@@ -2787,12 +2954,17 @@ async function applyDeterministicLayerVisualAdjustments(project, layer, options 
   const anchorAwareTransform = await buildAnchorAwareLayerTransform(project, layer, variant, options.promptText);
   const nextTransform =
     anchorAwareTransform ||
-    mergeLayerTransform(getLayerPlacementTransform(layer, variant), {
+    mergeLayerTransform(getVariantPlacementTransform(layer, variant), {
       depthMode: cleanText(fitProfile?.clipStrategy) === "headwear_wrap" ? "headwear_wrap" : "flat",
       backCutoff: coerceProfileNumber(fitProfile?.backCutoff, 0.66),
       frontStart: coerceProfileNumber(fitProfile?.frontStart, 0.62)
     });
-  applyLayerPlacementTransform(layer, nextTransform);
+  applyPlacementTransformForVariant(
+    layer,
+    variant,
+    nextTransform,
+    isVariantUsingCustomTransform(variant) ? "custom" : "sync"
+  );
   layer.selectedVariantId = variant.id;
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
@@ -2816,7 +2988,7 @@ async function buildAnchorAwareLayerTransform(project, layer, variant, promptTex
   const fitProfile = getLayerFitProfile(layer?.name);
   const profileId = cleanText(fitProfile?.id).toLowerCase();
   const loweredPrompt = cleanText(promptText).toLowerCase();
-  const currentTransform = getLayerPlacementTransform(layer, variant);
+  const currentTransform = getVariantPlacementTransform(layer, variant);
   if (!profileId) {
     return null;
   }
@@ -4061,7 +4233,7 @@ async function getPreviewCompositeSources(project) {
       });
       const latest = sources[sources.length - 1];
       if (latest) {
-        latest.transform = getLayerPlacementTransform(layer, variant);
+        latest.transform = getVariantPlacementTransform(layer, variant);
       }
     }
   }

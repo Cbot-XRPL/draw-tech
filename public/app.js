@@ -504,6 +504,10 @@ function renderFitDebug() {
             <span>${escapeHtml(layer.selectedVariant?.name || "none")}</span>
           </div>
           <div class="fit-debug-kv">
+            <span>Placement Mode</span>
+            <span>${escapeHtml(layer.selectedVariantTransformMode || "sync")}</span>
+          </div>
+          <div class="fit-debug-kv">
             <span>Image</span>
             <span>${escapeHtml(layer.selectedVariant?.imageUrl || "n/a")}</span>
           </div>
@@ -640,6 +644,15 @@ function renderLayers() {
                                 <span>${variant.id === layer.selectedVariantId ? "On Preview" : "Show On Preview"}</span>
                               </button>
                               <button
+                                class="btn btn-ghost btn-sync-toggle ${isVariantUsingCustomTransform(variant) ? "is-custom" : ""}"
+                                data-action="toggle-variant-placement-mode"
+                                data-layer-id="${layer.id}"
+                                data-variant-id="${variant.id}"
+                                data-mode="${isVariantUsingCustomTransform(variant) ? "sync" : "custom"}"
+                              >
+                                ${isVariantUsingCustomTransform(variant) ? "Resync" : "Break Sync"}
+                              </button>
+                              <button
                                 class="btn btn-danger"
                                 data-action="remove-variant"
                                 data-layer-id="${layer.id}"
@@ -650,6 +663,11 @@ function renderLayers() {
                               ${
                                 variant.id === layer.selectedVariantId
                                   ? '<span class="selected-chip">Checked into preview</span>'
+                                  : ""
+                              }
+                              ${
+                                isVariantUsingCustomTransform(variant)
+                                  ? '<span class="selected-chip selected-chip-custom">Custom transform</span>'
                                   : ""
                               }
                             </div>
@@ -843,6 +861,29 @@ function bindLayerActions() {
     });
   });
 
+  elements.layersPanel.querySelectorAll("[data-action='toggle-variant-placement-mode']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      await withBusy(async () => {
+        const response = await api(
+          `/api/projects/${state.project.id}/layers/${button.dataset.layerId}/variants/${button.dataset.variantId}/placement-mode`,
+          {
+            method: "POST",
+            body: {
+              mode: button.dataset.mode || "custom"
+            }
+          }
+        );
+        await applyProject(response.project);
+        render();
+        showToast(
+          response.mode === "custom"
+            ? "Trait broke out of folder sync. Drag and scale it independently now."
+            : "Trait resynced to the shared folder placement."
+        );
+      });
+    });
+  });
+
   elements.layersPanel.querySelectorAll("[data-action='remove-variant']").forEach((button) => {
     button.addEventListener("click", async () => {
       await withBusy(async () => {
@@ -922,6 +963,7 @@ function getSelectedLayerEntries() {
   return (state.project?.layers || [])
     .map((layer, layerIndex) => {
       const variant = layer.variants.find((item) => item.id === layer.selectedVariantId);
+      const usesCustomTransform = isVariantUsingCustomTransform(variant);
       return variant
         ? {
             ...variant,
@@ -929,7 +971,9 @@ function getSelectedLayerEntries() {
             layerName: layer.name,
             layerIndex,
             isBaseLayer: isPrimaryBaseLayerName(layer.name),
-            transform: normalizeClientTransform(layer.transform || variant.transform),
+            usesCustomTransform,
+            transformScope: usesCustomTransform ? "variant" : "layer",
+            transform: getVariantPlacementTransform(layer, variant),
             analysis: variant.analysis || null
           }
         : null;
@@ -1055,6 +1099,20 @@ function normalizeClientTransform(transform) {
   };
 }
 
+function normalizeVariantTransformMode(mode) {
+  return String(mode || "").toLowerCase() === "custom" ? "custom" : "sync";
+}
+
+function isVariantUsingCustomTransform(variant) {
+  return normalizeVariantTransformMode(variant?.transformMode) === "custom";
+}
+
+function getVariantPlacementTransform(layer, variant = null) {
+  return normalizeClientTransform(
+    isVariantUsingCustomTransform(variant) ? variant?.transform || layer?.transform : layer?.transform || variant?.transform
+  );
+}
+
 function clampClientNumber(value, fallback, min, max) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) {
@@ -1068,16 +1126,26 @@ function formatPercent(value) {
   return Number(value || 0).toFixed(4);
 }
 
-function createDragTransformKey(layerId) {
-  return `${String(layerId || "").trim()}`;
+function createDragTransformKey(layerIdOrEntry, variantId = "", scope = "layer") {
+  if (layerIdOrEntry && typeof layerIdOrEntry === "object") {
+    const entry = layerIdOrEntry;
+    return entry.transformScope === "variant"
+      ? `variant:${String(entry.layerId || "").trim()}:${String(entry.id || "").trim()}`
+      : `layer:${String(entry.layerId || "").trim()}`;
+  }
+
+  const normalizedLayerId = String(layerIdOrEntry || "").trim();
+  return scope === "variant"
+    ? `variant:${normalizedLayerId}:${String(variantId || "").trim()}`
+    : `layer:${normalizedLayerId}`;
 }
 
-function getPendingDragRecord(layerId) {
-  return state.pendingDragTransforms[createDragTransformKey(layerId)] || null;
+function getPendingDragRecord(layerIdOrEntry, variantId = "", scope = "layer") {
+  return state.pendingDragTransforms[createDragTransformKey(layerIdOrEntry, variantId, scope)] || null;
 }
 
-function getPendingDragTransform(layerId) {
-  return getPendingDragRecord(layerId)?.transform || null;
+function getPendingDragTransform(layerIdOrEntry, variantId = "", scope = "layer") {
+  return getPendingDragRecord(layerIdOrEntry, variantId, scope)?.transform || null;
 }
 
 function hasPendingDragTransforms() {
@@ -1093,7 +1161,7 @@ function getEntryDisplayTransform(entry) {
     return normalizeClientTransform(state.dragState.transform);
   }
 
-  return normalizeClientTransform(getPendingDragTransform(entry.layerId) || entry.transform);
+  return normalizeClientTransform(getPendingDragTransform(entry) || entry.transform);
 }
 
 function syncDragSelection(selectedEntries) {
@@ -1182,8 +1250,8 @@ function handleStageLayerPointerDown(event) {
     captureTarget,
     startClientX: event.clientX,
     startClientY: event.clientY,
-    startTransform: normalizeClientTransform(getPendingDragTransform(layerId) || entry.transform),
-    transform: normalizeClientTransform(getPendingDragTransform(layerId) || entry.transform),
+    startTransform: normalizeClientTransform(getPendingDragTransform(entry) || entry.transform),
+    transform: normalizeClientTransform(getPendingDragTransform(entry) || entry.transform),
     moved: false,
     saving: false
   };
@@ -1256,10 +1324,11 @@ function cancelStageDrag() {
 }
 
 function stageDraggedLayerTransform(dragState) {
-  const key = createDragTransformKey(dragState.layerId);
+  const key = createDragTransformKey(dragState.entry);
   state.pendingDragTransforms[key] = {
     layerId: dragState.layerId,
     variantId: dragState.variantId,
+    scope: dragState.entry.transformScope || "layer",
     transform: normalizeClientTransform(dragState.transform)
   };
   state.dragSelection = {
@@ -1268,7 +1337,11 @@ function stageDraggedLayerTransform(dragState) {
   };
   state.dragState = null;
   render();
-  showToast(`Move staged for ${dragState.entry.layerName}. Click Save Drag.`);
+  showToast(
+    dragState.entry.transformScope === "variant"
+      ? `Custom move staged for ${dragState.entry.name || dragState.entry.layerName}. Click Save Drag.`
+      : `Move staged for ${dragState.entry.layerName}. Click Save Drag.`
+  );
 }
 
 function adjustSelectedLayerScale(delta) {
@@ -1290,10 +1363,11 @@ function adjustSelectedLayerScale(delta) {
     scale: currentTransform.scale + delta
   });
 
-  const key = createDragTransformKey(activeEntry.layerId);
+  const key = createDragTransformKey(activeEntry);
   state.pendingDragTransforms[key] = {
     layerId: activeEntry.layerId,
     variantId: activeEntry.id,
+    scope: activeEntry.transformScope || "layer",
     transform: nextTransform
   };
   state.dragSelection = {
@@ -1359,10 +1433,11 @@ function nudgeSelectedLayer(deltaX, deltaY) {
     y: currentTransform.y + deltaY
   });
 
-  const key = createDragTransformKey(activeEntry.layerId);
+  const key = createDragTransformKey(activeEntry);
   state.pendingDragTransforms[key] = {
     layerId: activeEntry.layerId,
     variantId: activeEntry.id,
+    scope: activeEntry.transformScope || "layer",
     transform: nextTransform
   };
   state.dragSelection = {
@@ -1395,6 +1470,7 @@ async function savePendingDragTransforms() {
         method: "POST",
         body: {
           variantId: item.variantId,
+          scope: item.scope || "layer",
           transform: item.transform
         }
       });

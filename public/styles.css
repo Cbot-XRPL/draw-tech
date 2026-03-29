@@ -232,6 +232,12 @@ textarea:focus {
   border: 1px solid var(--line);
 }
 
+.btn-sync-toggle.is-custom {
+  border-color: rgba(81, 153, 255, 0.55);
+  background: rgba(81, 153, 255, 0.12);
+  color: #d8e6ff;
+}
+
 .btn-danger {
   background: rgba(255, 140, 122, 0.08);
   color: var(--danger);
@@ -899,6 +905,10 @@ textarea:focus {
   color: #ffffff;
   font-size: 0.84rem;
   font-weight: 700;
+}
+
+.selected-chip-custom {
+  color: #8ab6ff;
 }
 
 .empty-state {
