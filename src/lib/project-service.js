@@ -92,7 +92,8 @@ export function createProjectService({ projectsDir }) {
       placementNotes: cleanText(layer.placementNotes),
       variantIdeas: Array.isArray(layer.variantIdeas) ? layer.variantIdeas.map(cleanText).filter(Boolean) : [],
       variants: Array.isArray(layer.variants) ? layer.variants : [],
-      selectedVariantId: cleanText(layer.selectedVariantId) || null
+      selectedVariantId: cleanText(layer.selectedVariantId) || null,
+      transform: typeof layer === "object" && layer?.transform ? layer.transform : null
     };
   }
 
@@ -109,7 +110,8 @@ export function createProjectService({ projectsDir }) {
       placementNotes: cleanText(typeof layer === "object" ? layer?.placementNotes : ""),
       variantIdeas: Array.isArray(layer?.variantIdeas) ? layer.variantIdeas.map(cleanText).filter(Boolean) : [],
       variants: Array.isArray(layer?.variants) ? layer.variants : [],
-      selectedVariantId: cleanText(typeof layer === "object" ? layer?.selectedVariantId : "") || null
+      selectedVariantId: cleanText(typeof layer === "object" ? layer?.selectedVariantId : "") || null,
+      transform: typeof layer === "object" && layer?.transform ? layer.transform : null
     };
   }
 
@@ -195,7 +197,8 @@ export function createProjectService({ projectsDir }) {
         placementNotes: plannedLayer.placementNotes || current?.placementNotes || "",
         variantIdeas: plannedLayer.variantIdeas || [],
         variants: current?.variants || [],
-        selectedVariantId: current?.selectedVariantId || null
+        selectedVariantId: current?.selectedVariantId || null,
+        transform: current?.transform || null
       };
     });
   }

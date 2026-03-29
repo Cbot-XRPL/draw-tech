@@ -12,7 +12,7 @@ import { createProjectService } from "./lib/project-service.js";
 import { createAssetToolService } from "./lib/asset-tool-service.js";
 import { createStudioBrainService } from "./lib/studio-brain-service.js";
 import { createStudioMemoryService } from "./lib/studio-memory-service.js";
-import { clampVariantCount, cleanText, createId, loadEnvFile, sanitizeFileName, slugify } from "./lib/utils.js";
+import { clampVariantCount, cleanText, createId, loadEnvFile, safeJsonParse, sanitizeFileName, slugify } from "./lib/utils.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -33,6 +33,7 @@ const studioMemoryService = createStudioMemoryService({ memoryDir });
 const studioBrainService = createStudioBrainService({ brainDir, toolManifestPath });
 const openaiService = createOpenAIService();
 const assetToolService = createAssetToolService();
+const layerFitProfiles = loadLayerFitProfiles();
 
 const app = express();
 const runtimeState = {
@@ -42,7 +43,8 @@ const runtimeState = {
 const DURABLE_STUDIO_QUALITY_RULES = [
   "When the preview is shown in the app, prefer one backend-composited preview image over multiple competing client-side render paths.",
   "A layer should only appear on preview when its checkbox-style toggle is actively selected.",
-  "When simplifying the preview UI, keep frontend DOM ids and frontend render code in sync so stale references do not break painting."
+  "When simplifying the preview UI, keep frontend DOM ids and frontend render code in sync so stale references do not break painting.",
+  "When editing an existing layer image, preserve the source drawing and change only the requested feature unless the user explicitly asks for a redraw."
 ];
 
 const DURABLE_STUDIO_LESSONS = [
@@ -63,6 +65,12 @@ const DURABLE_STUDIO_LESSONS = [
     detail:
       "When committing from chat history into a folder, prefer the actual subject named by the user instead of matching accessory notes that merely mention that subject.",
     tags: ["chat", "routing", "asset-selection", "layers"]
+  },
+  {
+    title: "Edits should preserve the base drawing",
+    detail:
+      "When the user asks to remove or tweak one feature on an existing layer image, use the current selected asset as the source and preserve the pose, style, proportions, and composition instead of redrawing the whole character.",
+    tags: ["editing", "layers", "consistency", "source-preservation"]
   }
 ];
 
@@ -186,6 +194,15 @@ app.get("/api/projects/:projectId", async (req, res, next) => {
   }
 });
 
+app.get("/api/projects/:projectId/fit-debug", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    res.json(buildFitDebugData(project));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.put("/api/projects/:projectId", async (req, res, next) => {
   try {
     const existing = await projectService.readProject(req.params.projectId);
@@ -243,10 +260,43 @@ app.post("/api/chat", async (req, res, next) => {
     let assistantReply = route.assistantReply || "Working on that now.";
     let action = route.actionType;
     let assistantGenerated = null;
-    const forcedLayerEdit = detectLayerEditRequest(project, promptText, route);
-    if (forcedLayerEdit) {
+    const forcedFreshDraft = shouldForceFreshTraitDraft(project, promptText, route);
+    const freshDraftTargetLayerName = forcedFreshDraft ? resolveDraftTargetLayerName(project, promptText, route) : "";
+    const forcedLayerEdit = forcedFreshDraft ? null : resolveLayerEditTarget(project, promptText, route);
+    const forcedLayerTransform = forcedFreshDraft ? null : resolveLayerTransformTarget(project, promptText, route);
+    if (forcedFreshDraft) {
+      action = "draft_variant";
+      const freshDraftLabel =
+        cleanText(route.variantNameHint) ||
+        extractFreshTraitName(promptText) ||
+        guessLayerNameFromPrompt(promptText) ||
+        "that trait";
+      assistantReply =
+        `I'll draft ${cleanText(freshDraftLabel)} for review without touching the existing layer.`;
+    } else if (forcedLayerTransform) {
+      action = "transform_layer_variant";
+      if (cleanText(route.actionType).toLowerCase() !== "transform_layer_variant") {
+        assistantReply =
+          `I'll refit the existing ${forcedLayerTransform.layer.name} layer on the stack without redrawing the asset.`;
+      }
+    } else if (forcedLayerEdit) {
       action = "edit_layer_variant";
     }
+    const forcedPureTraitRestoreTarget =
+      forcedLayerEdit?.layer || forcedLayerTransform?.layer || findLikelyLayerForEdit(project, promptText) || null;
+    const forcedFrontOnlyHeadwearTarget =
+      forcedPureTraitRestoreTarget && shouldUseFrontOnlyHeadwearTrait(forcedPureTraitRestoreTarget, promptText)
+        ? forcedPureTraitRestoreTarget
+        : null;
+    const forcedPureTraitRebuildTarget =
+      forcedPureTraitRestoreTarget &&
+      shouldRebuildPureTraitAsset(
+        forcedPureTraitRestoreTarget,
+        promptText,
+        route.removalTarget || forcedLayerEdit?.removalTarget
+      )
+        ? forcedPureTraitRestoreTarget
+        : null;
 
     if (action === "remove_layer") {
       const layer = findLayer(project, route.targetLayerName || route.removalTarget);
@@ -282,32 +332,182 @@ app.post("/api/chat", async (req, res, next) => {
     } else if (action === "draft_variant" || action === "add_variant") {
       const draftResult = await generateDraftForProject(project, apiKey, {
         promptText,
-        targetLayerName: route.targetLayerName || guessLayerNameFromPrompt(promptText),
+        targetLayerName: freshDraftTargetLayerName || resolveDraftTargetLayerName(project, promptText, route),
         extraDirection: route.variantDirection,
         attachments: contextualAttachments
       });
       project = draftResult.project;
       memory = draftResult.memory;
       assistantGenerated = toAssistantGeneratedImage(draftResult.draft);
+    } else if (forcedFrontOnlyHeadwearTarget) {
+      const frontOnlyResult = await rebuildHeadwearAsFrontTrait(project, forcedFrontOnlyHeadwearTarget, {
+        promptText
+      });
+      project = frontOnlyResult.project;
+      memory = frontOnlyResult.memory;
+      assistantGenerated = toAssistantGeneratedImage(frontOnlyResult.variant);
+      assistantReply =
+        route.assistantReply ||
+        `I rebuilt ${frontOnlyResult.layer.name} as a front-only trait so it sits on the anchor cleanly without the rear hoop showing.`;
+    } else if (forcedPureTraitRebuildTarget) {
+      const rebuildResult = await regenerateAccessoryLayerAsPureTrait(project, apiKey, forcedPureTraitRebuildTarget, {
+        promptText,
+        extraDirection: route.variantDirection
+      });
+      project = rebuildResult.project;
+      memory = rebuildResult.memory;
+      assistantGenerated = toAssistantGeneratedImage(rebuildResult.variant);
+      if (isLayerTransformPrompt(promptText)) {
+        const transformResult = await updateLayerVariantTransform(project, rebuildResult.layer, {
+          promptText,
+          extraDirection: route.variantDirection
+        });
+        project = transformResult.project;
+        memory = transformResult.memory;
+      }
+      assistantReply =
+        route.assistantReply ||
+        `I rebuilt ${rebuildResult.layer.name} as a clean isolated trait asset and refit it on the stack.`;
+    } else if (
+      forcedPureTraitRestoreTarget &&
+      shouldForcePureTraitRestore(forcedPureTraitRestoreTarget, promptText, route.removalTarget || forcedLayerEdit?.removalTarget)
+    ) {
+      const sanitizeResult = await sanitizeAccessoryLayerToPureTrait(project, forcedPureTraitRestoreTarget, {
+        promptText
+      });
+      project = sanitizeResult.project;
+      memory = sanitizeResult.memory;
+      if (isLayerTransformPrompt(promptText)) {
+        const transformResult = await updateLayerVariantTransform(project, sanitizeResult.layer, {
+          promptText,
+          extraDirection: route.variantDirection
+        });
+        project = transformResult.project;
+        memory = transformResult.memory;
+      }
+      assistantReply =
+        route.assistantReply ||
+        `I restored ${sanitizeResult.layer.name} to the last clean trait-only asset from history and removed the contaminated variant from the live layer.`;
+    } else if (action === "transform_layer_variant") {
+      const transformTarget =
+        forcedLayerTransform || resolveLayerTransformTarget(project, promptText, route);
+      if (!transformTarget) {
+        assistantReply = "I could not figure out which layer transform to update.";
+      } else {
+        const cleanRestoreRequest = shouldRestoreAccessoryLayerFromCleanSource(
+          transformTarget.layer,
+          promptText,
+          route.removalTarget
+        );
+        if (cleanRestoreRequest) {
+          const restoreResult = await restoreLayerVariantFromHistory(project, transformTarget.layer, `${promptText} restore original clean`);
+          if (restoreResult?.variant) {
+            project = restoreResult.project;
+            memory = restoreResult.memory;
+            transformTarget.layer = restoreResult.layer;
+            pruneContaminatedSelectedVariants(transformTarget.layer, restoreResult.variant.id);
+            project.updatedAt = new Date().toISOString();
+            await projectService.writeProject(project);
+          }
+        }
+        if (shouldRestoreLayerBeforeTransform(promptText)) {
+          const restoreResult = await restoreLayerVariantFromHistory(project, transformTarget.layer, promptText);
+          if (restoreResult?.variant) {
+            project = restoreResult.project;
+            memory = restoreResult.memory;
+            transformTarget.layer = restoreResult.layer;
+          }
+        }
+        const deterministicLayerFit = shouldUseDeterministicLayerFitEdit(transformTarget.layer, promptText);
+        if (deterministicLayerFit) {
+          const wrapResult = await applyDeterministicLayerVisualAdjustments(project, transformTarget.layer, {
+            promptText
+          });
+          project = wrapResult.project;
+          memory = wrapResult.memory;
+          transformTarget.layer = wrapResult.layer;
+        } else if (!cleanRestoreRequest && shouldAlsoVisuallyEditLayer(promptText)) {
+          const editResult = await reviseLayerVariantForProject(project, apiKey, {
+            layer: transformTarget.layer,
+            promptText,
+            extraDirection: route.variantDirection,
+            attachments: contextualAttachments
+          });
+          project = editResult.project;
+          memory = editResult.memory;
+          transformTarget.layer = editResult.layer;
+          assistantGenerated = toAssistantGeneratedImage(editResult.variant);
+        }
+        const transformResult = await updateLayerVariantTransform(project, transformTarget.layer, {
+          promptText,
+          extraDirection: route.variantDirection
+        });
+        project = transformResult.project;
+        memory = transformResult.memory;
+        assistantReply =
+          route.assistantReply ||
+          `I updated ${transformResult.layer.name} placement on the stack without redrawing the asset.`;
+      }
     } else if (action === "edit_layer_variant") {
       const editTarget =
-        forcedLayerEdit || detectLayerEditRequest(project, promptText, route);
+        forcedLayerEdit || resolveLayerEditTarget(project, promptText, route);
       if (!editTarget) {
         assistantReply = "I could not figure out which layer image to revise.";
       } else {
-        const editResult = await reviseLayerVariantForProject(project, apiKey, {
-          layer: editTarget.layer,
+        const cleanRestoreRequest = shouldRestoreAccessoryLayerFromCleanSource(
+          editTarget.layer,
           promptText,
-          removalTarget: editTarget.removalTarget,
-          extraDirection: route.variantDirection,
-          attachments: contextualAttachments
-        });
-        project = editResult.project;
-        memory = editResult.memory;
-        assistantGenerated = toAssistantGeneratedImage(editResult.variant);
-        assistantReply =
-          route.assistantReply ||
-          `I revised ${editResult.layer.name} so ${editTarget.removalTarget || "that feature"} is no longer baked into the base layer.`;
+          editTarget.removalTarget
+        );
+        if (cleanRestoreRequest) {
+          const restoreResult = await restoreLayerVariantFromHistory(project, editTarget.layer, `${promptText} restore original clean`);
+          if (restoreResult?.variant) {
+            project = restoreResult.project;
+            memory = restoreResult.memory;
+            editTarget.layer = restoreResult.layer;
+            pruneContaminatedSelectedVariants(editTarget.layer, restoreResult.variant.id);
+            project.updatedAt = new Date().toISOString();
+            await projectService.writeProject(project);
+          }
+          const transformResult = await updateLayerVariantTransform(project, editTarget.layer, {
+            promptText,
+            extraDirection: route.variantDirection
+          });
+          project = transformResult.project;
+          memory = transformResult.memory;
+          assistantReply =
+            route.assistantReply ||
+            `I restored a clean ${transformResult.layer.name} source and refit it on the stack instead of trying to salvage the contaminated trait image.`;
+        } else if (shouldUseDeterministicLayerFitEdit(editTarget.layer, promptText)) {
+          const fitResult = await applyDeterministicLayerVisualAdjustments(project, editTarget.layer, {
+            promptText
+          });
+          project = fitResult.project;
+          memory = fitResult.memory;
+          const transformResult = await updateLayerVariantTransform(project, fitResult.layer, {
+            promptText,
+            extraDirection: route.variantDirection
+          });
+          project = transformResult.project;
+          memory = transformResult.memory;
+          assistantReply =
+            route.assistantReply ||
+            `I kept ${transformResult.layer.name} isolated and updated its fit on the stack without redrawing other layers into it.`;
+        } else {
+          const editResult = await reviseLayerVariantForProject(project, apiKey, {
+            layer: editTarget.layer,
+            promptText,
+            removalTarget: editTarget.removalTarget,
+            extraDirection: route.variantDirection,
+            attachments: contextualAttachments
+          });
+          project = editResult.project;
+          memory = editResult.memory;
+          assistantGenerated = toAssistantGeneratedImage(editResult.variant);
+          assistantReply =
+            route.assistantReply ||
+            `I revised ${editResult.layer.name} so ${editTarget.removalTarget || "that feature"} is no longer baked into the base layer.`;
+        }
       }
     } else if (action === "feedback") {
       const feedbackMode = detectFeedbackMode(promptText);
@@ -599,6 +799,30 @@ app.get("/api/projects/:projectId/preview/render", async (req, res, next) => {
 
     const width = Math.max(1, Number(project.canvas?.width || 1024));
     const height = Math.max(1, Number(project.canvas?.height || 1024));
+    const baseSource = sources.find((source) => source.isBaseLayer) || null;
+    const compositePieces = (await Promise.all(
+      sources.map((source) => buildCompositeLayers(source, width, height, baseSource))
+    )).flat();
+    const anchorOccluder = await buildAnchorOccluderPiece(sources, width, height);
+    const baseLayers = compositePieces.filter((piece) => piece.stage === "base");
+    const behindBaseLayers = compositePieces.filter((piece) => piece.stage === "behind-base");
+    const headwearWrapLayers = compositePieces.filter((piece) => piece.stage === "headwear-wrap");
+    const normalLayers = compositePieces.filter((piece) => piece.stage === "normal");
+    const inFrontBaseLayers = compositePieces.filter((piece) => piece.stage === "in-front-base");
+    const compositeLayers = [
+      ...behindBaseLayers,
+      ...baseLayers,
+      ...headwearWrapLayers,
+      ...(anchorOccluder ? [anchorOccluder] : []),
+      ...normalLayers,
+      ...inFrontBaseLayers
+    ].map(
+      ({ input, left, top }) => ({
+        input,
+        left,
+        top
+      })
+    );
     const compositeBuffer = await sharp({
       create: {
         width,
@@ -607,7 +831,7 @@ app.get("/api/projects/:projectId/preview/render", async (req, res, next) => {
         background: { r: 0, g: 0, b: 0, alpha: 0 }
       }
     })
-      .composite(sources.map((source) => ({ input: source.absolutePath })))
+      .composite(compositeLayers)
       .png()
       .toBuffer();
 
@@ -694,6 +918,131 @@ app.post("/api/projects/:projectId/layers/:layerId/select", async (req, res, nex
   }
 });
 
+app.post("/api/projects/:projectId/layers/:layerId/transform", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const layer = project.layers.find((item) => item.id === req.params.layerId);
+
+    if (!layer) {
+      res.status(404).json({ error: `Layer ${req.params.layerId} was not found.` });
+      return;
+    }
+
+    const variantId = cleanText(req.body?.variantId) || cleanText(layer.selectedVariantId);
+    const variant =
+      layer.variants.find((item) => item.id === variantId) ||
+      layer.variants.find((item) => item.id === layer.selectedVariantId) ||
+      layer.variants[0] ||
+      null;
+
+    if (!variant) {
+      res.status(404).json({ error: "No selected layer image was available to reposition." });
+      return;
+    }
+
+    const patch = req.body?.transform;
+    if (!patch || typeof patch !== "object") {
+      res.status(400).json({ error: "A transform payload is required." });
+      return;
+    }
+
+    const currentTransform = getLayerPlacementTransform(layer, variant);
+    const nextTransform = mergeLayerTransform(currentTransform, patch);
+    applyLayerPlacementTransform(layer, nextTransform);
+    layer.selectedVariantId = variant.id;
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    const memory = await studioMemoryService.appendChangelog(project, {
+      type: "manual-transform-layer",
+      title: `Dragged ${layer.name}`,
+      detail: `Set ${variant.name} to x ${nextTransform.x}, y ${nextTransform.y}, scale ${nextTransform.scale}.`
+    });
+    res.json({ project, memory, layer, variant });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/layers/:layerId/move", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const currentIndex = project.layers.findIndex((item) => item.id === req.params.layerId);
+
+    if (currentIndex === -1) {
+      res.status(404).json({ error: "Layer not found." });
+      return;
+    }
+
+    const direction = String(req.body?.direction || "").toLowerCase();
+    const delta = direction === "forward" ? 1 : direction === "backward" ? -1 : 0;
+    if (!delta) {
+      res.status(400).json({ error: "Layer move direction must be 'forward' or 'backward'." });
+      return;
+    }
+
+    const targetIndex = currentIndex + delta;
+    if (targetIndex < 0 || targetIndex >= project.layers.length) {
+      res.json({ project, moved: false });
+      return;
+    }
+
+    const reorderedLayers = [...project.layers];
+    const [movedLayer] = reorderedLayers.splice(currentIndex, 1);
+    reorderedLayers.splice(targetIndex, 0, movedLayer);
+    project.layers = reorderedLayers;
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    const memory = await studioMemoryService.appendChangelog(project, {
+      type: "move-layer",
+      title: `${direction === "forward" ? "Brought forward" : "Sent backward"} ${movedLayer.name}`,
+      detail: `Layer stack position changed to ${targetIndex + 1} of ${project.layers.length}.`
+    });
+    res.json({ project, memory, moved: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/layers/:layerId/rename", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const layer = project.layers.find((item) => item.id === req.params.layerId);
+
+    if (!layer) {
+      res.status(404).json({ error: "Layer not found." });
+      return;
+    }
+
+    const nextName = cleanText(req.body?.name);
+    if (!nextName) {
+      res.status(400).json({ error: "Layer name is required." });
+      return;
+    }
+
+    const duplicate = project.layers.find(
+      (item) => item.id !== layer.id && slugify(item.name) === slugify(nextName)
+    );
+    if (duplicate) {
+      res.status(409).json({ error: `A layer named ${duplicate.name} already exists.` });
+      return;
+    }
+
+    const previousName = layer.name;
+    layer.name = nextName;
+    syncRenamedLayerReferences(project, layer.id, previousName, nextName);
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    const memory = await studioMemoryService.appendChangelog(project, {
+      type: "rename-layer",
+      title: `Renamed ${previousName} to ${nextName}`,
+      detail: "Updated layer folder name from the app."
+    });
+    res.json({ project, memory });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/projects/:projectId/drafts/:draftId/commit", async (req, res, next) => {
   try {
     const project = await projectService.readProject(req.params.projectId);
@@ -704,6 +1053,96 @@ app.post("/api/projects/:projectId/drafts/:draftId/commit", async (req, res, nex
       draft: result.source,
       layer: result.layer,
       variant: result.variant
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/layers/:layerId/variants/:variantId/move", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const sourceLayer = project.layers.find((item) => item.id === req.params.layerId);
+    if (!sourceLayer) {
+      res.status(404).json({ error: "Source layer not found." });
+      return;
+    }
+
+    const targetLayer =
+      project.layers.find((item) => item.id === cleanText(req.body?.targetLayerId)) ||
+      findLayer(project, req.body?.targetLayerName);
+    if (!targetLayer) {
+      res.status(404).json({ error: "Target layer not found." });
+      return;
+    }
+
+    const variant = sourceLayer.variants.find((item) => item.id === req.params.variantId);
+    if (!variant) {
+      res.status(404).json({ error: "Layer image not found." });
+      return;
+    }
+
+    if (sourceLayer.id === targetLayer.id) {
+      res.json({
+        project,
+        moved: false,
+        sourceLayer,
+        targetLayer,
+        variant
+      });
+      return;
+    }
+
+    const existingVariant =
+      targetLayer.variants.find((item) => item.imageUrl === variant.imageUrl) ||
+      targetLayer.variants.find(
+        (item) =>
+          cleanText(item.prompt) &&
+          cleanText(item.prompt) === cleanText(variant.prompt) &&
+          cleanText(item.name) === cleanText(variant.name)
+      ) ||
+      null;
+
+    sourceLayer.variants = sourceLayer.variants.filter((item) => item.id !== variant.id);
+    if (sourceLayer.selectedVariantId === variant.id) {
+      sourceLayer.selectedVariantId = sourceLayer.variants[0]?.id || null;
+    }
+
+    let movedVariant = existingVariant;
+    if (!movedVariant) {
+      variant.transform = getLayerPlacementTransform(targetLayer, variant);
+      targetLayer.variants.push(variant);
+      movedVariant = variant;
+    }
+
+    applyLayerPlacementTransform(targetLayer, getLayerPlacementTransform(targetLayer, movedVariant));
+    targetLayer.selectedVariantId = movedVariant.id;
+    syncMovedVariantReferences(project, {
+      fromLayer: sourceLayer,
+      toLayer: targetLayer,
+      fromVariantId: variant.id,
+      toVariantId: movedVariant.id,
+      imageUrl: movedVariant.imageUrl
+    });
+
+    if (isPrimaryBaseLayerName(targetLayer.name)) {
+      project.selectedPreviewId = null;
+    }
+
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    const memory = await studioMemoryService.appendChangelog(project, {
+      type: "move-variant",
+      title: `Moved ${movedVariant.name}`,
+      detail: `${movedVariant.name} moved from ${sourceLayer.name} to ${targetLayer.name}.`
+    });
+    res.json({
+      project,
+      memory,
+      moved: true,
+      sourceLayer,
+      targetLayer,
+      variant: movedVariant
     });
   } catch (error) {
     next(error);
@@ -800,6 +1239,105 @@ async function ensureDirectories() {
     drawingLessons: DURABLE_STUDIO_LESSONS
   });
   await fs.mkdir(uploadsDir, { recursive: true });
+}
+
+function loadLayerFitProfiles() {
+  const manifest = safeJsonParse(readFileSync(toolManifestPath, "utf8")) || {};
+  return Array.isArray(manifest.fitProfiles)
+    ? manifest.fitProfiles
+        .map((profile) => ({
+          id: cleanText(profile?.id),
+          label: cleanText(profile?.label),
+          layerKeywords: Array.isArray(profile?.layerKeywords)
+            ? profile.layerKeywords.map((item) => cleanText(item).toLowerCase()).filter(Boolean)
+            : [],
+          anchorRegion: cleanText(profile?.anchorRegion),
+          clipStrategy: cleanText(profile?.clipStrategy),
+          guidance: cleanText(profile?.guidance),
+          defaultTransform: profile?.defaultTransform || null,
+          anchorWidthRatio: coerceProfileNumber(profile?.anchorWidthRatio, null),
+          anchorBottomRatio: coerceProfileNumber(profile?.anchorBottomRatio, null),
+          frontStart: coerceProfileNumber(profile?.frontStart, null),
+          backCutoff: coerceProfileNumber(profile?.backCutoff, null)
+        }))
+        .filter((profile) => profile.id)
+    : [];
+}
+
+function coerceProfileNumber(value, fallback) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function getLayerFitProfile(layerName) {
+  const lowered = cleanText(layerName).toLowerCase();
+  if (!lowered) {
+    return null;
+  }
+
+  return (
+    layerFitProfiles.find((profile) => profile.layerKeywords.some((keyword) => lowered.includes(keyword))) || null
+  );
+}
+
+function buildFitDebugData(project) {
+  const canvas = project?.canvas || { width: 1024, height: 1024 };
+  const activeAnchor = getActiveAnchorLayer(project, null);
+  const layers = (project?.layers || []).map((layer) => {
+    const variants = Array.isArray(layer.variants) ? layer.variants : [];
+    const selectedVariant = variants.find((item) => item.id === layer.selectedVariantId) || null;
+    const fitProfile = getLayerFitProfile(layer.name);
+    const transform = getLayerPlacementTransform(layer, selectedVariant);
+
+    return {
+      id: layer.id,
+      name: layer.name,
+      isBaseLayer: isPrimaryBaseLayerName(layer.name),
+      selected: Boolean(selectedVariant),
+      selectedVariantId: selectedVariant?.id || null,
+      selectedVariant: selectedVariant
+        ? {
+            id: selectedVariant.id,
+            name: selectedVariant.name,
+            imageUrl: selectedVariant.imageUrl,
+            createdAt: selectedVariant.createdAt
+          }
+        : null,
+      variantCount: variants.length,
+      transform,
+      fitProfile: fitProfile
+        ? {
+            id: fitProfile.id,
+            label: fitProfile.label,
+            anchorRegion: fitProfile.anchorRegion,
+            clipStrategy: fitProfile.clipStrategy,
+            guidance: fitProfile.guidance,
+            defaultTransform: normalizeLayerTransform(fitProfile.defaultTransform || getDefaultTransformForLayer(layer.name))
+          }
+        : null
+    };
+  });
+
+  return {
+    projectId: project.id,
+    projectTitle: project.title,
+    updatedAt: project.updatedAt,
+    canvas: {
+      width: Number(canvas.width || 1024),
+      height: Number(canvas.height || 1024)
+    },
+    selectedLayerCount: layers.filter((layer) => layer.selected).length,
+    activeAnchor: activeAnchor
+      ? {
+          layerId: activeAnchor.layer.id,
+          layerName: activeAnchor.layer.name,
+          variantId: activeAnchor.variant?.id || null,
+          variantName: activeAnchor.variant?.name || null,
+          imageUrl: activeAnchor.variant?.imageUrl || null
+        }
+      : null,
+    layers
+  };
 }
 
 function getApiKey() {
@@ -904,6 +1442,7 @@ async function generateLayerVariantsForProject(project, layerId, count, apiKey, 
   await fs.mkdir(variantFolder, { recursive: true });
 
   const variants = [];
+  const layerTransform = getLayerPlacementTransform(layer);
   for (const item of plan.variants) {
     const imageAsset = await openaiService.generateImageAsset({
       apiKey,
@@ -926,11 +1465,13 @@ async function generateLayerVariantsForProject(project, layerId, count, apiKey, 
       prompt: item.prompt,
       imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
       analysis,
+      transform: layerTransform,
       createdAt: new Date().toISOString()
     });
   }
 
   layer.variants.push(...variants);
+  applyLayerPlacementTransform(layer, layerTransform);
   if (!layer.selectedVariantId && variants[0]) {
     layer.selectedVariantId = variants[0].id;
   }
@@ -1038,25 +1579,65 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
     throw error;
   }
 
-  const sourceVariant = findSourceVariantForLayerEdit(layer, options.promptText);
+  const removalTarget = cleanText(options.removalTarget);
+  const selectedVariant = getSelectedLayerVariant(layer);
+  let sourceVariant = findSourceVariantForLayerEdit(layer, options.promptText);
   if (!sourceVariant?.imageUrl) {
     const error = new Error("No layer image was available to revise.");
     error.status = 404;
     throw error;
   }
 
-  const removalTarget = cleanText(options.removalTarget);
+  let sourceAbsolutePath = publicAssetUrlToAbsolutePath(sourceVariant.imageUrl);
+  let sourceBuffer = await fs.readFile(sourceAbsolutePath);
+  let sourceAnalysis = await assetToolService.inspectPngBuffer(sourceBuffer);
+  let sourceDataUrl = `data:image/png;base64,${sourceBuffer.toString("base64")}`;
+  const shouldReplaceSelectedVariant =
+    selectedVariant &&
+    selectedVariant.id !== sourceVariant.id &&
+    shouldPreferCleanHistoricalSource(layer, options.promptText, removalTarget, sourceAnalysis);
+
+  if (shouldPreferCleanHistoricalSource(layer, options.promptText, removalTarget, sourceAnalysis)) {
+    const cleanHistoricalSource = findRestorableLayerSource(project, layer, `${options.promptText} restore original clean`);
+    if (cleanHistoricalSource?.imageUrl && cleanHistoricalSource.imageUrl !== sourceVariant.imageUrl) {
+      sourceVariant = cleanHistoricalSource;
+      sourceAbsolutePath = publicAssetUrlToAbsolutePath(sourceVariant.imageUrl);
+      sourceBuffer = await fs.readFile(sourceAbsolutePath);
+      sourceAnalysis = await assetToolService.inspectPngBuffer(sourceBuffer);
+      sourceDataUrl = `data:image/png;base64,${sourceBuffer.toString("base64")}`;
+    }
+  }
+
+  const anchorReference = await getActiveAnchorReferenceAttachment(project, layer, [sourceVariant.imageUrl]);
+  const chatExampleReferences = await getChatExampleReferenceAttachments(project, layer, options.promptText, [
+    sourceVariant.imageUrl,
+    anchorReference?.imageUrl
+  ]);
+  const referenceImages = [
+    sourceDataUrl,
+    cleanText(anchorReference?.dataUrl),
+    ...chatExampleReferences.map((attachment) => cleanText(attachment?.dataUrl)),
+    ...(Array.isArray(options.attachments)
+      ? options.attachments
+          .map((attachment) => cleanText(attachment?.dataUrl))
+          .filter(Boolean)
+          .slice(0, 3)
+      : [])
+  ]
+    .filter(Boolean)
+    .slice(0, 8);
   const editPrompt = buildLayerRevisionPrompt(project, layer, sourceVariant, {
     promptText: options.promptText,
     removalTarget,
     extraDirection: options.extraDirection
   });
 
-  const imageAsset = await openaiService.generateImageAsset({
+  const imageAsset = await openaiService.editImageAsset({
     apiKey,
     prompt: editPrompt,
-    size: project.canvas.generationSize,
-    background: "transparent"
+    images: referenceImages,
+    background: "transparent",
+    inputFidelity: "high"
   });
 
   const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
@@ -1068,7 +1649,16 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
   await fs.writeFile(absolutePath, await resizePng(imageAsset.buffer, project.canvas));
   const variantBuffer = await fs.readFile(absolutePath);
   const analysis = await inspectVariantAgainstLayer(layer, variantBuffer);
+  if (shouldRejectContaminatedLayerEdit(layer, sourceAnalysis, analysis)) {
+    await fs.unlink(absolutePath).catch(() => {});
+    const error = new Error(
+      `The ${layer.name} edit pulled other layer content into the asset, so it was rejected to keep the layer isolated.`
+    );
+    error.status = 422;
+    throw error;
+  }
 
+  const layerTransform = getLayerPlacementTransform(layer, sourceVariant);
   const revisedVariant = {
     id: variantId,
     type: "variant",
@@ -1079,17 +1669,24 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
     targetLayerName: layer.name,
     status: "committed",
     analysis,
+    transform: layerTransform,
     createdAt: new Date().toISOString()
   };
 
   layer.variants = Array.isArray(layer.variants) ? layer.variants : [];
-  const sourceIndex = layer.variants.findIndex((item) => item.id === sourceVariant.id);
+  const sourceIndex = shouldReplaceSelectedVariant
+    ? layer.variants.findIndex((item) => item.id === selectedVariant.id)
+    : layer.variants.findIndex((item) => item.id === sourceVariant.id);
   if (sourceIndex >= 0) {
     layer.variants[sourceIndex] = revisedVariant;
   } else {
     layer.variants.push(revisedVariant);
   }
   layer.selectedVariantId = revisedVariant.id;
+  applyLayerPlacementTransform(layer, layerTransform);
+  if (isPrimaryBaseLayerName(layer.name)) {
+    project.selectedPreviewId = null;
+  }
 
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
@@ -1119,6 +1716,92 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
   };
 }
 
+async function updateLayerVariantTransform(project, layer, options = {}) {
+  const variant = findSourceVariantForLayerEdit(layer, options.promptText);
+  if (!variant) {
+    const error = new Error("No selected layer image was available to reposition.");
+    error.status = 404;
+    throw error;
+  }
+
+  const currentTransform = getLayerPlacementTransform(layer, variant);
+  const nextTransform = mergeLayerTransform(
+    currentTransform,
+    inferTransformPatchFromPrompt(layer, options.promptText, currentTransform)
+  );
+
+  applyLayerPlacementTransform(layer, nextTransform);
+  layer.selectedVariantId = variant.id;
+  project.updatedAt = new Date().toISOString();
+  await projectService.writeProject(project);
+
+  let memory = await studioMemoryService.appendChangelog(project, {
+    type: "transform-layer-variant",
+    title: `Updated ${layer.name} placement`,
+    detail: `Moved ${variant.name} to x ${nextTransform.x}, y ${nextTransform.y}, scale ${nextTransform.scale}.`
+  });
+  memory = await refreshMemoryIfPossible(project, memory);
+
+  return {
+    project,
+    memory,
+    layer,
+    variant
+  };
+}
+
+async function restoreLayerVariantFromHistory(project, layer, promptText = "") {
+  const source = findRestorableLayerSource(project, layer, promptText);
+  if (!source?.imageUrl) {
+    return {
+      project,
+      memory: await studioMemoryService.getMemory(project),
+      layer,
+      variant: null
+    };
+  }
+
+  layer.variants = Array.isArray(layer.variants) ? layer.variants : [];
+  const existingVariant =
+    layer.variants.find((item) => item.imageUrl === source.imageUrl) ||
+    layer.variants.find((item) => cleanText(item.name) === cleanText(source.name)) ||
+    null;
+
+  let variant = existingVariant;
+  if (!variant) {
+    variant = {
+      id: createId("variant"),
+      name: cleanText(source.name) || `${layer.name} Restored`,
+      notes: cleanText(source.notes),
+      prompt: cleanText(source.prompt),
+      imageUrl: source.imageUrl,
+      analysis: source.analysis || null,
+      transform: getLayerPlacementTransform(layer, source),
+      createdAt: new Date().toISOString()
+    };
+    layer.variants.unshift(variant);
+  }
+
+  applyLayerPlacementTransform(layer, getLayerPlacementTransform(layer, variant));
+  layer.selectedVariantId = variant.id;
+  project.updatedAt = new Date().toISOString();
+  await projectService.writeProject(project);
+
+  let memory = await studioMemoryService.appendChangelog(project, {
+    type: "restore-layer-variant",
+    title: `Restored ${layer.name}`,
+    detail: `Re-selected ${variant.name} from project history before applying placement changes.`
+  });
+  memory = await refreshMemoryIfPossible(project, memory);
+
+  return {
+    project,
+    memory,
+    layer,
+    variant
+  };
+}
+
 async function commitDraftToLayer(project, draftId, targetLayerName) {
   project.draftHistory = Array.isArray(project.draftHistory) ? project.draftHistory : [];
   const draft = project.draftHistory.find((item) => item.id === draftId);
@@ -1129,6 +1812,86 @@ async function commitDraftToLayer(project, draftId, targetLayerName) {
   }
 
   return commitGeneratedSourceToLayer(project, draft, targetLayerName);
+}
+
+function syncRenamedLayerReferences(project, layerId, previousName, nextName) {
+  const oldName = cleanText(previousName);
+  const newName = cleanText(nextName);
+  if (!oldName || !newName || oldName === newName) {
+    return;
+  }
+
+  for (const draft of project.draftHistory || []) {
+    if (cleanText(draft.committedLayerId) === cleanText(layerId)) {
+      draft.committedLayerName = newName;
+    }
+    if (cleanText(draft.targetLayerName) === oldName) {
+      draft.targetLayerName = newName;
+    }
+  }
+
+  for (const message of project.chatHistory || []) {
+    if (!message.generatedImage) {
+      continue;
+    }
+
+    if (cleanText(message.generatedImage.committedLayerId) === cleanText(layerId)) {
+      message.generatedImage.committedLayerName = newName;
+      message.generatedImage.targetLayerName = newName;
+      continue;
+    }
+
+    if (cleanText(message.generatedImage.targetLayerName) === oldName) {
+      message.generatedImage.targetLayerName = newName;
+    }
+  }
+}
+
+function syncMovedVariantReferences(project, move) {
+  const fromLayerId = cleanText(move?.fromLayer?.id);
+  const toLayerId = cleanText(move?.toLayer?.id);
+  const fromLayerName = cleanText(move?.fromLayer?.name);
+  const toLayerName = cleanText(move?.toLayer?.name);
+  const fromVariantId = cleanText(move?.fromVariantId);
+  const toVariantId = cleanText(move?.toVariantId) || fromVariantId;
+  const imageUrl = cleanText(move?.imageUrl);
+
+  for (const draft of project.draftHistory || []) {
+    if (cleanText(draft.committedVariantId) === fromVariantId) {
+      draft.committedLayerId = toLayerId;
+      draft.committedLayerName = toLayerName;
+      draft.committedVariantId = toVariantId;
+      draft.targetLayerName = toLayerName;
+      draft.updatedAt = new Date().toISOString();
+      continue;
+    }
+
+    if (imageUrl && cleanText(draft.imageUrl) === imageUrl && cleanText(draft.committedLayerId) === fromLayerId) {
+      draft.committedLayerId = toLayerId;
+      draft.committedLayerName = toLayerName;
+      draft.committedVariantId = toVariantId;
+      draft.targetLayerName = toLayerName;
+      draft.updatedAt = new Date().toISOString();
+    }
+  }
+
+  for (const message of project.chatHistory || []) {
+    const image = message.generatedImage;
+    if (!image) {
+      continue;
+    }
+
+    if (imageUrl && cleanText(image.imageUrl) === imageUrl) {
+      if (cleanText(image.targetLayerName) === fromLayerName || cleanText(image.targetLayerName) === toLayerName) {
+        image.targetLayerName = toLayerName;
+      }
+      continue;
+    }
+
+    if (cleanText(image.targetLayerName) === fromLayerName && cleanText(image.status) === "committed") {
+      image.targetLayerName = toLayerName;
+    }
+  }
 }
 
 async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
@@ -1148,6 +1911,7 @@ async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
     null;
 
   if (existingVariant) {
+    applyLayerPlacementTransform(layer, getLayerPlacementTransform(layer, existingVariant));
     layer.selectedVariantId = existingVariant.id;
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
@@ -1172,6 +1936,7 @@ async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
     };
   }
 
+  const layerTransform = getLayerPlacementTransform(layer);
   const variant = {
     id: createId("variant"),
     name: cleanText(source.name) || `${layer.name} Variant`,
@@ -1179,11 +1944,16 @@ async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
     prompt: cleanText(source.prompt),
     imageUrl: source.imageUrl,
     analysis: source.analysis || null,
+    transform: layerTransform,
     createdAt: new Date().toISOString()
   };
 
   layer.variants.push(variant);
+  applyLayerPlacementTransform(layer, layerTransform);
   layer.selectedVariantId = variant.id;
+  if (isPrimaryBaseLayerName(layer.name)) {
+    project.selectedPreviewId = null;
+  }
 
   const draft = Array.isArray(project.draftHistory)
     ? project.draftHistory.find((item) => item.id === source.id)
@@ -1234,32 +2004,197 @@ function ensureLayer(project, layerName) {
     placementNotes: "",
     variantIdeas: [],
     variants: [],
-    selectedVariantId: null
+    selectedVariantId: null,
+    transform: getDefaultTransformForLayer(normalizedName)
   };
   project.layers.push(layer);
   return layer;
 }
 
-function detectLayerEditRequest(project, promptText, route = {}) {
+function shouldForceFreshTraitDraft(project, promptText, route = {}) {
   const lowered = cleanText(promptText).toLowerCase();
-  if (!/(remove|without|take off|take the|strip|erase)/.test(lowered)) {
+  const routedAction = cleanText(route.actionType).toLowerCase();
+  const guessedLayerName = cleanText(route.targetLayerName) || guessLayerNameFromPrompt(promptText);
+  const matchingExistingLayer = guessedLayerName ? findLayer(project, guessedLayerName) : null;
+  const keepExistingIntent = hasKeepExistingTraitIntent(lowered);
+  const explicitSeparateFolderIntent = hasExplicitSeparateFolderIntent(lowered);
+  const freshCreationIntent =
+    /\b(draw|make|create|generate|design|craft|show|give)\b/.test(lowered) ||
+    /\b(new|another|fresh|different)\b/.test(lowered);
+
+  if (!freshCreationIntent) {
+    return false;
+  }
+
+  if (!keepExistingIntent && !explicitSeparateFolderIntent && mentionsExplicitExistingLayerMutation(lowered)) {
+    return false;
+  }
+
+  if (["commit_draft", "remove_variant", "remove_layer", "update_canvas"].includes(routedAction)) {
+    return false;
+  }
+
+  if (keepExistingIntent || explicitSeparateFolderIntent) {
+    return true;
+  }
+
+  if (!matchingExistingLayer && !["edit_layer_variant", "transform_layer_variant", "draft_variant", "add_variant"].includes(routedAction)) {
+    return false;
+  }
+
+  return Boolean(matchingExistingLayer) || ["edit_layer_variant", "transform_layer_variant"].includes(routedAction);
+}
+
+function mentionsExplicitExistingLayerMutation(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  return (
+    isFeatureRemovalPrompt(lowered) ||
+    isLayerTransformPrompt(lowered) ||
+    shouldAlsoVisuallyEditLayer(lowered) ||
+    /(edit|revise|modify|update|rework|fix|replace|overwrite|restore|revert|put .* back|back into|existing layer|existing folder|current layer|current folder|same layer|same folder|selected layer|selected folder|use the current|go back into)/.test(
+      lowered
+    ) ||
+    /\b(add|put|save|commit)\b[\s\S]*\b(layer|folder)\b/.test(
+      lowered
+    )
+  );
+}
+
+function hasKeepExistingTraitIntent(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  return (
+    /(leave|keep)\s+(?:the\s+)?(?:old|existing|current|other)\s+(?:one|layer|folder|trait|version)\b/.test(lowered) ||
+    /\b(?:leave|keep)\b[\s\S]*\b(?:alone|also|too|as well)\b/.test(lowered) ||
+    /\b(?:don't|do not)\s+(?:replace|overwrite|touch|edit|change)\b/.test(lowered) ||
+    /\bwithout\s+(?:touching|editing|changing|replacing)\b/.test(lowered)
+  );
+}
+
+function hasExplicitSeparateFolderIntent(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  return (
+    /\b(?:separate|different)\b[\s\S]*\b(?:layer|folder)\b/.test(lowered) ||
+    /\bits own\b[\s\S]*\b(?:layer|folder)\b/.test(lowered) ||
+    /\bon its own\b[\s\S]*\b(?:layer|folder)\b/.test(lowered)
+  );
+}
+
+function resolveDraftTargetLayerName(project, promptText, route = {}) {
+  const explicitTarget = cleanText(route.targetLayerName);
+  const semanticTarget = guessLayerNameFromPrompt(promptText);
+  const guessedTarget = explicitTarget || semanticTarget;
+  const separateFolderIntent = hasExplicitSeparateFolderIntent(promptText);
+  const existingSemanticTarget = semanticTarget ? findLayer(project, semanticTarget) : null;
+
+  if (explicitTarget) {
+    const existingExplicitTarget = findLayer(project, explicitTarget);
+    if (existingExplicitTarget && !separateFolderIntent) {
+      return existingExplicitTarget.name;
+    }
+    if (existingSemanticTarget && !separateFolderIntent) {
+      return existingSemanticTarget.name;
+    }
+    if (!existingExplicitTarget) {
+      return explicitTarget;
+    }
+  }
+
+  const existingSuggestedTarget = guessedTarget ? findLayer(project, guessedTarget) : null;
+  if (existingSuggestedTarget && !separateFolderIntent) {
+    return existingSuggestedTarget.name;
+  }
+
+  if (separateFolderIntent) {
+    return resolveFreshTraitDraftLayerName(project, promptText, route);
+  }
+
+  return guessedTarget || resolveFreshTraitDraftLayerName(project, promptText, route);
+}
+
+function resolveFreshTraitDraftLayerName(project, promptText, route = {}) {
+  const explicitTarget = cleanText(route.targetLayerName);
+  if (explicitTarget && !findLayer(project, explicitTarget)) {
+    return explicitTarget;
+  }
+
+  const hintedName = cleanText(route.variantNameHint);
+  if (hintedName && !isGenericTraitLayerName(hintedName)) {
+    return makeUniqueLayerName(project, titleCaseWords(hintedName));
+  }
+
+  const extractedName = extractFreshTraitName(promptText);
+  if (extractedName && !isGenericTraitLayerName(extractedName)) {
+    return makeUniqueLayerName(project, extractedName);
+  }
+
+  const guessedLayerName = cleanText(route.targetLayerName) || guessLayerNameFromPrompt(promptText);
+  if (guessedLayerName) {
+    const genericFallback = isGenericTraitLayerName(guessedLayerName)
+      ? buildGenericFreshLayerName(promptText, guessedLayerName)
+      : guessedLayerName;
+    return makeUniqueLayerName(project, genericFallback);
+  }
+
+  return makeUniqueLayerName(project, "New Trait");
+}
+
+function resolveLayerEditTarget(project, promptText, route = {}) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const explicitEdit = cleanText(route.actionType).toLowerCase() === "edit_layer_variant";
+  const visualEdit = shouldAlsoVisuallyEditLayer(promptText);
+  if (!isFeatureRemovalPrompt(lowered) && !explicitEdit && !visualEdit) {
     return null;
   }
 
   const layer =
     findLayer(project, route.targetLayerName) ||
     findLayer(project, extractLayerLookupFromPrompt(promptText)) ||
-    findLayer(project, guessLayerNameFromPrompt(promptText));
+    findLayer(project, guessLayerNameFromPrompt(promptText)) ||
+    findLikelyLayerForEdit(project, promptText);
 
-  const removalTarget = cleanText(route.removalTarget) || extractRemovalTargetFromPrompt(promptText);
-  if (!layer || !removalTarget) {
+  if (!layer) {
     return null;
   }
 
+  if (isAccessoryLayerName(layer.name) && isLayerTransformPrompt(lowered) && !visualEdit && !isFeatureRemovalPrompt(lowered)) {
+    return null;
+  }
+
+  const removalTarget = cleanText(route.removalTarget) || extractRemovalTargetFromPrompt(promptText);
   return {
     layer,
     removalTarget
   };
+}
+
+function isFeatureRemovalPrompt(loweredPrompt) {
+  return /(remove|without|take off|take the|strip|erase)/.test(cleanText(loweredPrompt).toLowerCase());
+}
+
+function resolveLayerTransformTarget(project, promptText, route = {}) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const explicitTransform = cleanText(route.actionType).toLowerCase() === "transform_layer_variant";
+  if (!isLayerTransformPrompt(lowered) && !explicitTransform) {
+    return null;
+  }
+
+  const layer =
+    findLayer(project, route.targetLayerName) ||
+    findLayer(project, extractLayerLookupFromPrompt(promptText)) ||
+    findLayer(project, guessLayerNameFromPrompt(promptText)) ||
+    findLikelyLayerForEdit(project, promptText);
+
+  if (!layer) {
+    return null;
+  }
+
+  return { layer };
+}
+
+function isLayerTransformPrompt(loweredPrompt) {
+  return /(rework|adjust|align|move|shift|resize|position|sit|place|fit|tuck|lower|raise|nudge|center|bigger|smaller|scale|closer|higher|up on|up onto|all the way|wider|width|span|broader|narrower|tighter|slimmer)/.test(
+    cleanText(loweredPrompt).toLowerCase()
+  );
 }
 
 function findLayer(project, lookup) {
@@ -1273,6 +2208,64 @@ function findLayer(project, lookup) {
     project.layers.find((layer) => slugify(layer.name).includes(token)) ||
     null
   );
+}
+
+function findLikelyLayerForEdit(project, promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const tokens = extractPromptTokens(promptText);
+  const handIntent = mentionsHandPlacementArea(lowered);
+  let bestLayer = null;
+  let bestScore = 0;
+
+  for (const layer of project.layers || []) {
+    let score = 0;
+    const layerName = cleanText(layer.name).toLowerCase();
+    const layerDescription = cleanText(layer.description).toLowerCase();
+    const fitProfile = getLayerFitProfile(layer.name);
+    const hasSelectedVariant = Boolean(
+      Array.isArray(layer.variants) && layer.variants.find((item) => item.id === layer.selectedVariantId)
+    );
+
+    if (layerName && lowered.includes(layerName)) {
+      score += 20;
+    }
+
+    if (/crown|tiara|headwear|hat/.test(lowered) && /headwear|hat/.test(layerName)) {
+      score += 18;
+    }
+
+    if (/base cat|cat base|base layer/.test(lowered) && /base|body|character/.test(layerName)) {
+      score += 18;
+    }
+
+    if (handIntent && cleanText(fitProfile?.id) === "handheld") {
+      score += 26;
+    }
+
+    if (handIntent && /(weapon|sword|staff|wand|gun|tool|prop|item|orb|flower|cane|bat|microphone)/.test(layerName)) {
+      score += 18;
+    }
+
+    if (handIntent && hasSelectedVariant && !isPrimaryBaseLayerName(layer.name)) {
+      score += 6;
+    }
+
+    for (const token of tokens) {
+      if (layerName.includes(token)) {
+        score += 6;
+      }
+      if (layerDescription.includes(token)) {
+        score += 2;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestLayer = layer;
+    }
+  }
+
+  return bestScore > 0 ? bestLayer : null;
 }
 
 function removeVariantFromLayer(layer, lookup) {
@@ -1308,20 +2301,819 @@ function findSourceVariantForLayerEdit(layer, promptText) {
   return variants.find((item) => item.id === layer.selectedVariantId) || variants[0] || null;
 }
 
+function getSelectedLayerVariant(layer) {
+  const variants = Array.isArray(layer?.variants) ? layer.variants : [];
+  return variants.find((item) => item.id === layer.selectedVariantId) || null;
+}
+
+function shouldForcePureTraitRestore(layer, promptText, removalTarget = "") {
+  if (!isAccessoryLayerName(layer?.name)) {
+    return false;
+  }
+
+  const loweredPrompt = cleanText(promptText).toLowerCase();
+  const loweredTarget = cleanText(removalTarget).toLowerCase();
+  return (
+    shouldRestoreAccessoryLayerFromCleanSource(layer, promptText, removalTarget) ||
+    /(revert|restore|just the|only the|trait only|pure trait|crown only|no cat|no head|without cat|without head)/.test(loweredPrompt) ||
+    /(cat|head|body|character|avatar|subject|construct)/.test(loweredTarget)
+  );
+}
+
+function shouldRebuildPureTraitAsset(layer, promptText, removalTarget = "") {
+  if (!isAccessoryLayerName(layer?.name)) {
+    return false;
+  }
+
+  const loweredPrompt = cleanText(promptText).toLowerCase();
+  const loweredTarget = cleanText(removalTarget).toLowerCase();
+  const selectedAnalysis = getSelectedLayerVariant(layer)?.analysis || null;
+  const contaminatedSelected = isLikelyContaminatedAccessoryAnalysis(layer, selectedAnalysis);
+  const pureTraitIntent =
+    /(just the|only the|trait only|pure trait|isolated asset|single asset|single layer asset|singular asset|crown only|hat only|headwear only|no cat|no head|without cat|without head|without body|remove .* from .* layer)/.test(
+      loweredPrompt
+    ) ||
+    /(cat|head|face|body|character|avatar|subject|construct)/.test(loweredTarget);
+
+  return contaminatedSelected && pureTraitIntent;
+}
+
+function shouldRestoreAccessoryLayerFromCleanSource(layer, promptText, removalTarget = "") {
+  return shouldPreferCleanHistoricalSource(
+    layer,
+    promptText,
+    removalTarget,
+    getSelectedLayerVariant(layer)?.analysis || null
+  );
+}
+
+function normalizeLayerTransform(transform) {
+  return {
+    x: clampTransformNumber(transform?.x, 0, -0.45, 0.45),
+    y: clampTransformNumber(transform?.y, 0, -0.45, 0.45),
+    scale: clampTransformNumber(transform?.scale, 1, 0.15, 1.8),
+    depthMode: cleanText(transform?.depthMode).toLowerCase() === "headwear_wrap" ? "headwear_wrap" : "flat",
+    backCutoff: clampTransformNumber(transform?.backCutoff, 0.6, 0.2, 0.9),
+    frontStart: clampTransformNumber(transform?.frontStart, 0.56, 0.1, 0.95)
+  };
+}
+
+function getLayerPlacementTransform(layer, fallbackVariant = null) {
+  return normalizeLayerTransform(
+    layer?.transform ||
+      fallbackVariant?.transform ||
+      getSelectedLayerVariant(layer)?.transform ||
+      getDefaultTransformForLayer(layer?.name)
+  );
+}
+
+function applyLayerPlacementTransform(layer, transform) {
+  const nextTransform = normalizeLayerTransform(transform || getLayerPlacementTransform(layer));
+  layer.transform = nextTransform;
+
+  if (Array.isArray(layer?.variants)) {
+    for (const variant of layer.variants) {
+      if (!variant) {
+        continue;
+      }
+      variant.transform = nextTransform;
+    }
+  }
+
+  return nextTransform;
+}
+
+function mergeLayerTransform(current, patch) {
+  const next = {
+    x: patch.x ?? current.x,
+    y: patch.y ?? current.y,
+    scale: patch.scale ?? current.scale,
+    depthMode: patch.depthMode ?? current.depthMode,
+    backCutoff: patch.backCutoff ?? current.backCutoff,
+    frontStart: patch.frontStart ?? current.frontStart
+  };
+
+  return normalizeLayerTransform(next);
+}
+
+function shouldRestoreLayerBeforeTransform(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  return /(put .* back|restore|how it was|that was a fail|undo|revert|clean .* layer only|original)/.test(lowered);
+}
+
+function shouldAlsoVisuallyEditLayer(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  return /(edit|hide|mask|crop|trim|cut|doesn.?t show|dont show|back part|front only|occlude|look like it.?s really on)/.test(
+    lowered
+  );
+}
+
+function shouldUseDeterministicLayerFitEdit(layer, promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  if (!isAccessoryLayerName(layer?.name)) {
+    return false;
+  }
+
+  return (
+    /(back part|back hoop|really on|sit naturally|sits naturally|see how|example|proper|fit|fits|fitting|tighten|tighter|too wide|wide|narrow|narrower|slimmer|stack|overlay|clip|sized?|wear|worn|hold|held|grip|gripping|hand|paw|arm|eye line|face better)/.test(
+      lowered
+    ) &&
+    mentionsAnchorPlacementArea(lowered)
+  );
+}
+
+function shouldUseFrontOnlyHeadwearTrait(layer, promptText) {
+  if (cleanText(getLayerFitProfile(layer?.name)?.id) !== "headwear") {
+    return false;
+  }
+
+  const lowered = cleanText(promptText).toLowerCase();
+  return (
+    /(back hoop|back loop|back part|rear hoop|rear loop|underside|hollow|hole|trim|cut away|front only|sit on .* head|sitting on .* head|worn on .* head|seat.*head|sits on .* head|crown .* head)/.test(
+      lowered
+    ) &&
+    mentionsAnchorPlacementArea(lowered)
+  );
+}
+
+function isAccessoryLayerName(layerName) {
+  return Boolean(getLayerFitProfile(layerName));
+}
+
+function mentionsAnchorPlacementArea(loweredPrompt) {
+  return /(head|face|eye|eyes|eye line|forehead|brow|cheek|muzzle|base|body|character|avatar|subject|construct|center piece|centerpiece|main asset|main body|main character|upper area|upper body|hand|hands|paw|paws|arm|arms|grip|holding)/.test(
+    cleanText(loweredPrompt).toLowerCase()
+  );
+}
+
+function mentionsHandPlacementArea(loweredPrompt) {
+  return /(hand|hands|paw|paws|arm|arms|grip|holding|hold|held)/.test(cleanText(loweredPrompt).toLowerCase());
+}
+
+function shouldRejectContaminatedLayerEdit(layer, sourceAnalysis, revisedAnalysis) {
+  if (isPrimaryBaseLayerName(layer?.name) || !isAccessoryLayerName(layer?.name)) {
+    return false;
+  }
+
+  const sourceBottom = Number(sourceAnalysis?.bounds?.bottom ?? 0);
+  const revisedBottom = Number(revisedAnalysis?.bounds?.bottom ?? 0);
+  const sourceHeight = Math.max(1, Number(sourceAnalysis?.height || revisedAnalysis?.height || 1024));
+  const revisedBottomRatio = revisedBottom / sourceHeight;
+  const sourceBottomRatio = sourceBottom / sourceHeight;
+  const sourceCoverage = Number(sourceAnalysis?.alphaCoverage || 0);
+  const revisedCoverage = Number(revisedAnalysis?.alphaCoverage || 0);
+
+  if (/headwear|hat|crown|tiara/.test(cleanText(layer?.name).toLowerCase())) {
+    return (
+      revisedBottomRatio > Math.max(sourceBottomRatio + 0.14, 0.62) ||
+      revisedCoverage > Math.max(sourceCoverage * 1.9, sourceCoverage + 0.09, 0.22)
+    );
+  }
+
+  return (
+    revisedBottomRatio > Math.max(sourceBottomRatio + 0.18, 0.72) ||
+    revisedCoverage > Math.max(sourceCoverage * 2.1, sourceCoverage + 0.12, 0.3)
+  );
+}
+
+function isLikelyContaminatedAccessoryAnalysis(layer, analysis) {
+  if (isPrimaryBaseLayerName(layer?.name) || !isAccessoryLayerName(layer?.name)) {
+    return false;
+  }
+
+  const height = Math.max(1, Number(analysis?.height || 1024));
+  const bottomRatio = Number(analysis?.bounds?.bottom ?? 0) / height;
+  const coverage = Number(analysis?.alphaCoverage || 0);
+  const lowered = cleanText(layer?.name).toLowerCase();
+
+  if (/headwear|hat|crown|tiara/.test(lowered)) {
+    return bottomRatio > 0.62 || coverage > 0.22;
+  }
+
+  return bottomRatio > 0.72 || coverage > 0.3;
+}
+
+function shouldPreferCleanHistoricalSource(layer, promptText, removalTarget, sourceAnalysis) {
+  if (!isAccessoryLayerName(layer?.name)) {
+    return false;
+  }
+
+  const loweredPrompt = cleanText(promptText).toLowerCase();
+  const loweredTarget = cleanText(removalTarget).toLowerCase();
+  const removingAnchorConstruct =
+    /(cat|base|body|character|avatar|subject|construct|head|face)/.test(loweredTarget) ||
+    /(remove|fix|clean|strip|erase).*(cat|base|body|character|avatar|subject|construct|head|face)/.test(loweredPrompt) ||
+    /(cat|base|body|character|avatar|subject|construct|head|face).*(from|out of|off).*(layer|crown|hat|headwear)/.test(loweredPrompt);
+
+  return removingAnchorConstruct || isLikelyContaminatedAccessoryAnalysis(layer, sourceAnalysis);
+}
+
+function pruneContaminatedSelectedVariants(layer, keepVariantId = "") {
+  if (!Array.isArray(layer?.variants) || !layer.variants.length) {
+    return;
+  }
+
+  const keepId = cleanText(keepVariantId);
+  layer.variants = layer.variants.filter((variant) => {
+    if (variant.id === keepId) {
+      return true;
+    }
+    return !isLikelyContaminatedAccessoryAnalysis(layer, variant.analysis);
+  });
+
+  if (keepId) {
+    layer.selectedVariantId = keepId;
+  }
+}
+
+async function sanitizeAccessoryLayerToPureTrait(project, layer, options = {}) {
+  const source = findRestorableLayerSource(project, layer, `${options.promptText || ""} restore original clean pure trait`);
+  if (!source?.imageUrl) {
+    const error = new Error(`No clean historical ${layer.name} source was available to restore.`);
+    error.status = 404;
+    throw error;
+  }
+
+  layer.variants = Array.isArray(layer.variants) ? layer.variants : [];
+  let variant =
+    layer.variants.find((item) => item.imageUrl === source.imageUrl) ||
+    layer.variants.find((item) => cleanText(item.name) === cleanText(source.name)) ||
+    null;
+
+  if (!variant) {
+    variant = {
+      id: cleanText(source.id) || createId("variant"),
+      name: cleanText(source.name) || `${layer.name} Restored`,
+      notes: cleanText(source.notes),
+      prompt: cleanText(source.prompt),
+      imageUrl: source.imageUrl,
+      analysis: source.analysis || null,
+      transform: getLayerPlacementTransform(layer, source),
+      createdAt: source.createdAt || new Date().toISOString()
+    };
+    layer.variants.unshift(variant);
+  }
+
+  pruneContaminatedSelectedVariants(layer, variant.id);
+  applyLayerPlacementTransform(layer, getLayerPlacementTransform(layer, variant));
+  layer.selectedVariantId = variant.id;
+  project.updatedAt = new Date().toISOString();
+  await projectService.writeProject(project);
+
+  let memory = await studioMemoryService.appendChangelog(project, {
+    type: "sanitize-layer-variant",
+    title: `Restored clean ${layer.name} trait`,
+    detail: `Reverted ${layer.name} to ${variant.name} and pruned contaminated accessory variants from the live layer.`
+  });
+  memory = await refreshMemoryIfPossible(project, memory);
+
+  return {
+    project,
+    memory,
+    layer,
+    variant
+  };
+}
+
+async function regenerateAccessoryLayerAsPureTrait(project, apiKey, layer, options = {}) {
+  const source = findRestorableLayerSource(project, layer, `${options.promptText || ""} restore original clean pure trait`);
+  const prompt = buildPureTraitRegenerationPrompt(project, layer, source, options);
+  const imageAsset = await openaiService.generateImageAsset({
+    apiKey,
+    prompt,
+    size: project.canvas.generationSize,
+    background: "transparent"
+  });
+
+  const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
+  await fs.mkdir(variantFolder, { recursive: true });
+
+  const variantId = createId("variant");
+  const filename = `${variantId}.png`;
+  const absolutePath = path.join(variantFolder, filename);
+  await fs.writeFile(absolutePath, await resizePng(imageAsset.buffer, project.canvas));
+  const variantBuffer = await fs.readFile(absolutePath);
+  const analysis = await inspectVariantAgainstLayer(layer, variantBuffer);
+  if (isLikelyContaminatedAccessoryAnalysis(layer, analysis)) {
+    await fs.unlink(absolutePath).catch(() => {});
+    const error = new Error(
+      `The regenerated ${layer.name} trait still included anchor content, so it was rejected instead of saving another contaminated asset.`
+    );
+    error.status = 422;
+    throw error;
+  }
+
+  const layerTransform = getLayerPlacementTransform(layer, source);
+  const variant = {
+    id: variantId,
+    type: "variant",
+    name: buildPureTraitVariantName(layer, source),
+    notes: buildPureTraitVariantNotes(layer, source),
+    prompt,
+    imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
+    targetLayerName: layer.name,
+    status: "committed",
+    analysis,
+    transform: layerTransform,
+    createdAt: new Date().toISOString()
+  };
+
+  const safeExistingVariants = (Array.isArray(layer.variants) ? layer.variants : []).filter(
+    (item) => !isLikelyContaminatedAccessoryAnalysis(layer, item.analysis)
+  );
+  layer.variants = [variant, ...safeExistingVariants.filter((item) => item.id !== variant.id)];
+  applyLayerPlacementTransform(layer, layerTransform);
+  layer.selectedVariantId = variant.id;
+  project.updatedAt = new Date().toISOString();
+  await projectService.writeProject(project);
+
+  let memory = await studioMemoryService.appendChangelog(project, {
+    type: "rebuild-pure-trait",
+    title: `Rebuilt ${layer.name} as a pure trait`,
+    detail: `Generated a new isolated ${layer.name} asset and pruned contaminated accessory variants from the live layer.`
+  });
+  memory = await refreshMemoryIfPossible(project, memory, apiKey);
+  await refreshBrainIfPossible(project, memory, apiKey, {
+    type: "rebuild-pure-trait",
+    prompt: options.promptText,
+    layerName: layer.name,
+    summary: variant.notes,
+    analysis
+  });
+
+  return {
+    project,
+    memory,
+    layer,
+    variant
+  };
+}
+
+async function rebuildHeadwearAsFrontTrait(project, layer, options = {}) {
+  const selectedVariant = getSelectedLayerVariant(layer);
+  const source =
+    findRestorableLayerSource(project, layer, `${options.promptText || ""} restore original clean pure trait`) ||
+    selectedVariant ||
+    findSourceVariantForLayerEdit(layer, options.promptText);
+  if (!source?.imageUrl) {
+    const error = new Error(`No clean ${layer.name} source was available to rebuild.`);
+    error.status = 404;
+    throw error;
+  }
+
+  const sourceAbsolutePath = publicAssetUrlToAbsolutePath(source.imageUrl);
+  const sourceBuffer = await fs.readFile(sourceAbsolutePath);
+  const sourceAnalysis = source.analysis || (await assetToolService.inspectPngBuffer(sourceBuffer));
+  const rebuiltBuffer = await deriveFrontOnlyHeadwearBuffer(sourceBuffer, sourceAnalysis);
+
+  const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
+  await fs.mkdir(variantFolder, { recursive: true });
+
+  const variantId = createId("variant");
+  const filename = `${variantId}.png`;
+  const absolutePath = path.join(variantFolder, filename);
+  await fs.writeFile(absolutePath, await resizePng(rebuiltBuffer, project.canvas));
+  const variantBuffer = await fs.readFile(absolutePath);
+  const analysis = await inspectVariantAgainstLayer(layer, variantBuffer);
+
+  let transform =
+    (await buildAnchorAwareLayerTransform(project, layer, {
+      ...source,
+      analysis: sourceAnalysis,
+      transform: getLayerPlacementTransform(layer, source)
+    })) || getLayerPlacementTransform(layer, source);
+  transform = mergeLayerTransform(transform, inferTransformPatchFromPrompt(layer, options.promptText, transform));
+  transform = normalizeLayerTransform({
+    ...transform,
+    depthMode: "flat"
+  });
+
+  const variant = {
+    id: variantId,
+    type: "variant",
+    name: buildFrontOnlyHeadwearVariantName(source),
+    notes: buildFrontOnlyHeadwearVariantNotes(source),
+    prompt: buildFrontOnlyHeadwearPrompt(project, layer, source, options),
+    imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
+    targetLayerName: layer.name,
+    status: "committed",
+    analysis,
+    transform,
+    createdAt: new Date().toISOString()
+  };
+
+  layer.variants = Array.isArray(layer.variants) ? layer.variants : [];
+  const replaceId = selectedVariant?.id || cleanText(source.id);
+  const replaceIndex = layer.variants.findIndex((item) => item.id === replaceId);
+  if (replaceIndex >= 0) {
+    layer.variants[replaceIndex] = variant;
+  } else {
+    layer.variants.unshift(variant);
+  }
+  applyLayerPlacementTransform(layer, transform);
+  layer.selectedVariantId = variant.id;
+  project.updatedAt = new Date().toISOString();
+  await projectService.writeProject(project);
+
+  let memory = await studioMemoryService.appendChangelog(project, {
+    type: "rebuild-front-trait",
+    title: `Rebuilt ${layer.name} as a front-only trait`,
+    detail: `Removed the rear hoop / hollow opening from ${cleanText(source.name) || layer.name} and kept the trait in front of the anchor construct.`
+  });
+  memory = await refreshMemoryIfPossible(project, memory);
+
+  return {
+    project,
+    memory,
+    layer,
+    variant
+  };
+}
+
+async function deriveFrontOnlyHeadwearBuffer(sourceBuffer, sourceAnalysis) {
+  const normalized = await sharp(sourceBuffer).ensureAlpha().png().toBuffer();
+  const metadata = await sharp(normalized).metadata();
+  const width = Math.max(1, Number(metadata.width || sourceAnalysis?.width || 1024));
+  const height = Math.max(1, Number(metadata.height || sourceAnalysis?.height || 1024));
+  const bounds = sourceAnalysis?.bounds || {
+    left: 0,
+    top: 0,
+    right: width - 1,
+    bottom: height - 1
+  };
+  const traitWidth = Math.max(1, Number(bounds.right) - Number(bounds.left) + 1);
+  const traitHeight = Math.max(1, Number(bounds.bottom) - Number(bounds.top) + 1);
+  const centerX = Number(bounds.left) + traitWidth / 2;
+  const mainHole = {
+    cx: centerX,
+    cy: Number(bounds.top) + traitHeight * 0.84,
+    rx: traitWidth * 0.27,
+    ry: traitHeight * 0.1
+  };
+  const upperHole = {
+    cx: centerX,
+    cy: Number(bounds.top) + traitHeight * 0.775,
+    rx: traitWidth * 0.2,
+    ry: traitHeight * 0.05
+  };
+  const maskSvg = Buffer.from(`
+    <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">
+      <rect width="100%" height="100%" fill="transparent"/>
+      <ellipse cx="${mainHole.cx}" cy="${mainHole.cy}" rx="${mainHole.rx}" ry="${mainHole.ry}" fill="white"/>
+      <ellipse cx="${upperHole.cx}" cy="${upperHole.cy}" rx="${upperHole.rx}" ry="${upperHole.ry}" fill="white"/>
+    </svg>
+  `);
+
+  return sharp(normalized)
+    .composite([
+      {
+        input: maskSvg,
+        blend: "dest-out"
+      }
+    ])
+    .png()
+    .toBuffer();
+}
+
+async function applyDeterministicLayerVisualAdjustments(project, layer, options = {}) {
+  const variant = findSourceVariantForLayerEdit(layer, options.promptText);
+  if (!variant) {
+    const error = new Error("No selected layer image was available to visually adjust.");
+    error.status = 404;
+    throw error;
+  }
+
+  const fitProfile = getLayerFitProfile(layer.name);
+  const anchorAwareTransform = await buildAnchorAwareLayerTransform(project, layer, variant, options.promptText);
+  const nextTransform =
+    anchorAwareTransform ||
+    mergeLayerTransform(getLayerPlacementTransform(layer, variant), {
+      depthMode: cleanText(fitProfile?.clipStrategy) === "headwear_wrap" ? "headwear_wrap" : "flat",
+      backCutoff: coerceProfileNumber(fitProfile?.backCutoff, 0.66),
+      frontStart: coerceProfileNumber(fitProfile?.frontStart, 0.62)
+    });
+  applyLayerPlacementTransform(layer, nextTransform);
+  layer.selectedVariantId = variant.id;
+  project.updatedAt = new Date().toISOString();
+  await projectService.writeProject(project);
+
+  let memory = await studioMemoryService.appendChangelog(project, {
+    type: "deterministic-layer-visual-adjustment",
+    title: `Adjusted ${layer.name} fit rendering`,
+    detail: `Updated ${fitProfile?.label || layer.name} fit rendering on ${variant.name} so it can sit on the anchor construct without redrawing the layer.`
+  });
+  memory = await refreshMemoryIfPossible(project, memory);
+
+  return {
+    project,
+    memory,
+    layer,
+    variant
+  };
+}
+
+async function buildAnchorAwareLayerTransform(project, layer, variant, promptText = "") {
+  const fitProfile = getLayerFitProfile(layer?.name);
+  const profileId = cleanText(fitProfile?.id).toLowerCase();
+  const loweredPrompt = cleanText(promptText).toLowerCase();
+  const currentTransform = getLayerPlacementTransform(layer, variant);
+  if (!profileId) {
+    return null;
+  }
+
+  const anchorLayer = getActiveAnchorLayer(project, layer);
+  const anchorVariant = getSelectedLayerVariant(anchorLayer);
+  const anchorBounds = anchorVariant?.analysis?.bounds || null;
+  const variantBounds = variant?.analysis?.bounds || null;
+  const canvasWidth = Math.max(1, Number(project?.canvas?.width || 1024));
+  const canvasHeight = Math.max(1, Number(project?.canvas?.height || 1024));
+  const imageWidth = Math.max(1, Number(variant?.analysis?.width || canvasWidth));
+  const imageHeight = Math.max(1, Number(variant?.analysis?.height || canvasHeight));
+  if (!anchorBounds || !variantBounds) {
+    return mergeLayerTransform(currentTransform, {
+      depthMode: cleanText(fitProfile?.clipStrategy) === "headwear_wrap" ? "headwear_wrap" : "flat",
+      backCutoff: coerceProfileNumber(fitProfile?.backCutoff, currentTransform.backCutoff),
+      frontStart: coerceProfileNumber(fitProfile?.frontStart, currentTransform.frontStart)
+    });
+  }
+
+  const defaultTransform = normalizeLayerTransform(getDefaultTransformForLayer(layer?.name));
+  const anchorWidth = Math.max(1, Number(anchorBounds.right) - Number(anchorBounds.left) + 1);
+  const anchorHeight = Math.max(1, Number(anchorBounds.bottom) - Number(anchorBounds.top) + 1);
+  const variantWidth = Math.max(1, Number(variantBounds.right) - Number(variantBounds.left) + 1);
+  const anchorCenterX = (Number(anchorBounds.left) + Number(anchorBounds.right)) / 2;
+  const variantCenterX = (Number(variantBounds.left) + Number(variantBounds.right)) / 2;
+  const variantCenterY = (Number(variantBounds.top) + Number(variantBounds.bottom)) / 2;
+  let baseScale = defaultTransform.scale;
+  let imageLeft = 0;
+  let imageTop = 0;
+
+  if (profileId === "headwear") {
+    const targetWidth = anchorWidth * coerceProfileNumber(fitProfile?.anchorWidthRatio, 0.64);
+    baseScale = clampTransformNumber(targetWidth / variantWidth, defaultTransform.scale, 0.15, 1.8);
+    const targetBottom = Number(anchorBounds.top) + anchorHeight * coerceProfileNumber(fitProfile?.anchorBottomRatio, 0.22);
+    imageLeft = anchorCenterX - variantCenterX * baseScale;
+    imageTop = targetBottom - Number(variantBounds.bottom) * baseScale;
+  } else if (profileId === "eyewear") {
+    let targetWidthRatio = coerceProfileNumber(fitProfile?.anchorWidthRatio, 0.68);
+    let targetCenterYRatio = coerceProfileNumber(fitProfile?.anchorCenterYRatio, 0.46);
+    if (/(width of .*face|face width|span .*face|full .*face width|across .*face|edge to edge|ear to ear)/.test(loweredPrompt)) {
+      targetWidthRatio = 0.9;
+    } else if (/(wider|bigger|larger|broader|too small)/.test(loweredPrompt)) {
+      targetWidthRatio = Math.max(targetWidthRatio, 0.8);
+    } else if (/(too wide|tighten|tighter|narrow|narrower|slimmer)/.test(loweredPrompt)) {
+      targetWidthRatio = Math.min(targetWidthRatio, 0.62);
+    }
+    if (/(higher|raise|up|closer to .*eyes|closer to .*face)/.test(loweredPrompt)) {
+      targetCenterYRatio = Math.max(0.4, targetCenterYRatio - 0.03);
+    }
+    if (/(lower|down)/.test(loweredPrompt)) {
+      targetCenterYRatio = Math.min(0.55, targetCenterYRatio + 0.03);
+    }
+    const targetWidth = anchorWidth * targetWidthRatio;
+    baseScale = clampTransformNumber(targetWidth / variantWidth, defaultTransform.scale, 0.15, 1.25);
+    const targetCenterY = Number(anchorBounds.top) + anchorHeight * targetCenterYRatio;
+    imageLeft = anchorCenterX - variantCenterX * baseScale;
+    imageTop = targetCenterY - variantCenterY * baseScale;
+  } else {
+    return null;
+  }
+
+  const fittedTransform = normalizeLayerTransform({
+    x: (imageLeft - (canvasWidth - imageWidth * baseScale) / 2) / canvasWidth,
+    y: (imageTop - (canvasHeight - imageHeight * baseScale) / 2) / canvasHeight,
+    scale: baseScale,
+    depthMode: cleanText(fitProfile?.clipStrategy) === "headwear_wrap" ? "headwear_wrap" : "flat",
+    backCutoff: coerceProfileNumber(fitProfile?.backCutoff, currentTransform.backCutoff),
+    frontStart: coerceProfileNumber(fitProfile?.frontStart, currentTransform.frontStart)
+  });
+
+  if (profileId === "eyewear") {
+    return fittedTransform;
+  }
+
+  return applyTransformResidual(fittedTransform, currentTransform, defaultTransform);
+}
+
+function applyTransformResidual(baselineTransform, currentTransform, defaultTransform) {
+  const safeDefaultScale = Math.max(0.001, Number(defaultTransform?.scale || 1));
+  const scaleRatio = Math.max(0.5, Math.min(1.5, Number(currentTransform?.scale || 1) / safeDefaultScale));
+  const currentBackCutoff = Number(currentTransform?.backCutoff || 0.66);
+  const currentFrontStart = Number(currentTransform?.frontStart || 0.62);
+  const defaultBackCutoff = Number(defaultTransform?.backCutoff || 0.66);
+  const defaultFrontStart = Number(defaultTransform?.frontStart || 0.62);
+  const baselineBackCutoff = Number(baselineTransform?.backCutoff || 0.66);
+  const baselineFrontStart = Number(baselineTransform?.frontStart || 0.62);
+
+  return normalizeLayerTransform({
+    x: Number(baselineTransform?.x || 0) + (Number(currentTransform?.x || 0) - Number(defaultTransform?.x || 0)),
+    y: Number(baselineTransform?.y || 0) + (Number(currentTransform?.y || 0) - Number(defaultTransform?.y || 0)),
+    scale: Number(baselineTransform?.scale || 1) * scaleRatio,
+    depthMode: cleanText(currentTransform?.depthMode).toLowerCase() === "headwear_wrap" ? "headwear_wrap" : baselineTransform?.depthMode,
+    backCutoff: Math.max(baselineBackCutoff, baselineBackCutoff + (currentBackCutoff - defaultBackCutoff)),
+    frontStart: Math.max(baselineFrontStart, baselineFrontStart + (currentFrontStart - defaultFrontStart))
+  });
+}
+
+function findRestorableLayerSource(project, layer, promptText = "") {
+  const lowered = cleanText(promptText).toLowerCase();
+  const layerToken = slugify(layer?.name);
+  const draftMatches = Array.isArray(project.draftHistory)
+    ? [...project.draftHistory]
+        .filter((item) => cleanText(item.committedLayerName) && slugify(item.committedLayerName) === layerToken)
+        .filter((item) => item.imageUrl)
+        .filter((item) => {
+          const name = cleanText(item.name).toLowerCase();
+          if (/(revised|without|fail)/.test(name) && /put .* back|restore|revert|original|clean/.test(lowered)) {
+            return false;
+          }
+          if (isLikelyContaminatedAccessoryAnalysis(layer, item.analysis)) {
+            return false;
+          }
+          return true;
+        })
+    : [];
+
+  if (draftMatches[0]) {
+    return {
+      id: cleanText(draftMatches[0].committedVariantId) || cleanText(draftMatches[0].id) || createId("variant"),
+      name: cleanText(draftMatches[0].name),
+      notes: cleanText(draftMatches[0].notes),
+      prompt: cleanText(draftMatches[0].prompt),
+      imageUrl: cleanText(draftMatches[0].imageUrl),
+      analysis: draftMatches[0].analysis || null,
+      transform: getLayerPlacementTransform(layer)
+    };
+  }
+
+  const currentVariants = Array.isArray(layer?.variants) ? [...layer.variants] : [];
+  const safeCurrent = currentVariants.find(
+    (item) =>
+      !/(revised|without|fail)/.test(cleanText(item.name).toLowerCase()) &&
+      !isLikelyContaminatedAccessoryAnalysis(layer, item.analysis)
+  );
+  if (safeCurrent) {
+    return safeCurrent;
+  }
+
+  return currentVariants.find((item) => !isLikelyContaminatedAccessoryAnalysis(layer, item.analysis)) || currentVariants[0] || null;
+}
+
+function inferTransformPatchFromPrompt(layer, promptText, currentTransform = null) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const patch = {};
+  const current = normalizeLayerTransform(currentTransform || getDefaultTransformForLayer(layer.name));
+  const fitProfile = getLayerFitProfile(layer.name);
+  const isHandheldProfile = cleanText(fitProfile?.id) === "handheld";
+  const isEyewearProfile = cleanText(fitProfile?.id) === "eyewear";
+  const explicitFaceWidthFit =
+    isEyewearProfile && /(width of .*face|face width|span .*face|full .*face width|across .*face|edge to edge|ear to ear)/.test(lowered);
+
+  if (/(sit|fit|place|position|closer|up on|up onto|all the way|wear|worn)/.test(lowered) && mentionsAnchorPlacementArea(lowered)) {
+    patch.x = current.x;
+    patch.y = current.y;
+    patch.scale = current.scale;
+  }
+
+  if (isHandheldProfile && mentionsHandPlacementArea(lowered)) {
+    patch.x = current.x;
+    patch.y = current.y;
+    patch.scale = current.scale;
+  }
+
+  if (/(smaller|shrink|reduce|tiny|too big|too wide|tighten|tighter|narrow|narrower|slimmer)/.test(lowered)) {
+    patch.scale = (patch.scale ?? current.scale) * 0.85;
+  }
+
+  if (/(bigger|larger|grow|too small|too narrow|wider)/.test(lowered)) {
+    patch.scale = (patch.scale ?? current.scale) * 1.15;
+  }
+
+  if (/(higher|raise|up|top|closer|all the way)/.test(lowered)) {
+    patch.y = (patch.y ?? current.y) - 0.05;
+  }
+
+  if (/(lower|down)/.test(lowered)) {
+    patch.y = (patch.y ?? current.y) + 0.05;
+  }
+
+  if (/(left)/.test(lowered)) {
+    patch.x = (patch.x ?? current.x) - 0.05;
+  }
+
+  if (/(right)/.test(lowered)) {
+    patch.x = (patch.x ?? current.x) + 0.05;
+  }
+
+  if (/(center|centre|middle)/.test(lowered)) {
+    patch.x = 0;
+  }
+
+  if (isHandheldProfile && /(left hand|left paw|left arm)/.test(lowered)) {
+    patch.x = -Math.abs(current.x || 0.22);
+  }
+
+  if (isHandheldProfile && /(right hand|right paw|right arm)/.test(lowered)) {
+    patch.x = Math.abs(current.x || 0.22);
+  }
+
+  if (isHandheldProfile && /(in .* hand|into .* hand|on .* hand|held|holding|grip)/.test(lowered)) {
+    patch.y = patch.y ?? current.y;
+    patch.scale = Math.min(patch.scale ?? current.scale, current.scale * 1.05);
+  }
+
+  if (shouldUseDeterministicLayerFitEdit(layer, promptText)) {
+    patch.depthMode = cleanText(fitProfile?.clipStrategy) === "headwear_wrap" ? "headwear_wrap" : "flat";
+    patch.backCutoff = coerceProfileNumber(fitProfile?.backCutoff, current.backCutoff);
+    patch.frontStart = coerceProfileNumber(fitProfile?.frontStart, current.frontStart);
+    patch.x = 0;
+    if (cleanText(fitProfile?.id) === "headwear") {
+      patch.scale = patch.scale ?? current.scale;
+      patch.y = patch.y ?? current.y;
+      if (/(back hoop|back part|doesn.?t show|dont show|hide)/.test(lowered)) {
+        patch.frontStart = Math.min(0.9, (patch.frontStart ?? current.frontStart) + 0.03);
+        patch.backCutoff = Math.min(0.9, Math.max(patch.backCutoff ?? current.backCutoff, (patch.frontStart ?? current.frontStart) + 0.03));
+      }
+    }
+    if (isEyewearProfile) {
+      patch.x = 0;
+      patch.y = patch.y ?? current.y;
+      patch.scale = patch.scale ?? current.scale;
+      if (explicitFaceWidthFit) {
+        patch.scale = current.scale;
+      }
+      if (/(too wide|tighten|tighter|narrow|narrower|slimmer|fit .* face better|fit .* eyes better)/.test(lowered)) {
+        patch.scale = (patch.scale ?? current.scale) * 0.92;
+      }
+    }
+    if (isHandheldProfile) {
+      patch.x = /(left hand|left paw|left arm)/.test(lowered)
+        ? -Math.abs(current.x || 0.22)
+        : /(right hand|right paw|right arm)/.test(lowered)
+          ? Math.abs(current.x || 0.22)
+          : current.x;
+      patch.y = current.y;
+      patch.scale = Math.min(patch.scale ?? current.scale, current.scale * 1.02);
+    }
+  }
+
+  if (/(all the way|proper|properly|nicely|see how|example)/.test(lowered) && mentionsAnchorPlacementArea(lowered)) {
+    patch.y = Math.min(patch.y ?? current.y, current.y - 0.1);
+    patch.x = 0;
+  }
+
+  return Object.keys(patch).length ? patch : current;
+}
+
+function getDefaultTransformForLayer(layerName) {
+  const fitProfile = getLayerFitProfile(layerName);
+  if (fitProfile?.defaultTransform) {
+    return normalizeLayerTransform(fitProfile.defaultTransform);
+  }
+
+  return { x: 0, y: 0, scale: 1 };
+}
+
+function clampTransformNumber(value, fallback, min, max) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+
+  return Math.min(max, Math.max(min, Number(numeric.toFixed(3))));
+}
+
 function buildLayerRevisionPrompt(project, layer, sourceVariant, options = {}) {
   const removalTarget = cleanText(options.removalTarget);
   const extraDirection = cleanText(options.extraDirection);
   const sourcePrompt = cleanText(sourceVariant?.prompt);
   const sourceNotes = cleanText(sourceVariant?.notes);
+  const requestedEdit = cleanText(options.promptText);
+  const activeConstructSummary = buildActiveConstructSummary(project, layer);
+  const fitGuidance = buildLayerFitPromptGuidance(project, layer);
+  const fitProfile = getLayerFitProfile(layer.name);
 
   return [
     `Create a revised ${layer.name} NFT layer asset for the collection ${project.title}.`,
+    "Use the provided source image as the exact base to edit rather than inventing a new drawing.",
     sourcePrompt ? `Stay visually consistent with this existing layer prompt: ${sourcePrompt}.` : "",
     sourceNotes ? `Preserve these approved notes from the current asset: ${sourceNotes}.` : "",
-    `Keep the same pose, framing, alignment, proportions, facial expression, line quality, and overall style so it still stacks cleanly with the rest of the collection.`,
+    requestedEdit ? `Requested revision: ${requestedEdit}.` : "",
+    activeConstructSummary,
+    fitGuidance,
+    fitProfile?.anchorRegion ? `Fit region: ${fitProfile.anchorRegion}.` : "",
+    fitProfile?.clipStrategy ? `Preferred clip strategy: ${fitProfile.clipStrategy}.` : "",
+    "If an earlier successful example image from chat is attached, use it as a fit and construction reference for how this layer should sit in the stack.",
+    `Keep the same pose, framing, alignment, proportions, facial expression, line quality, palette, and overall style so it still stacks cleanly with the rest of the collection.`,
     removalTarget
       ? `Remove ${removalTarget} completely from this ${layer.name} asset so that feature is not baked into the layer anymore.`
       : `Revise the current ${layer.name} asset according to the latest request without changing the core pose or style.`,
+    isAccessoryLayerName(layer.name)
+      ? `This must remain a pure ${layer.name} trait asset. Do not include any base character, body, head, face, hands, or other layer content in the output.`
+      : "",
+    "Do not redraw or restyle the whole character.",
+    "Do not change any part of the source image except the requested feature adjustment.",
+    "If reference images are attached, use them only to improve positioning, scale, and fit while preserving the source asset style.",
     `Anything that belongs on a separate trait layer must stay off this ${layer.name} asset.`,
     extraDirection,
     "Output one isolated layer asset only.",
@@ -1330,6 +3122,157 @@ function buildLayerRevisionPrompt(project, layer, sourceVariant, options = {}) {
   ]
     .filter(Boolean)
     .join(" ");
+}
+
+function buildActiveConstructSummary(project, targetLayer) {
+  const anchor = getActiveAnchorLayer(project, targetLayer);
+  if (!anchor?.variant) {
+    return "";
+  }
+
+  return `Active construct anchor: the selected ${anchor.layer.name} layer named ${anchor.variant.name} is the central construct that this ${targetLayer?.name || "layer"} must fit around.`;
+}
+
+function buildLayerFitPromptGuidance(project, layer) {
+  const lowered = cleanText(layer?.name).toLowerCase();
+  const anchor = getActiveAnchorLayer(project, layer);
+  const anchorLabel = anchor?.layer?.name ? anchor.layer.name : "the active base construct";
+  const fitProfile = getLayerFitProfile(layer?.name);
+
+  if (fitProfile?.guidance) {
+    return `Fit profile ${fitProfile.label || fitProfile.id} for ${anchorLabel}: ${fitProfile.guidance}`;
+  }
+
+  if (/headwear|hat|crown|tiara/.test(lowered)) {
+    return `Keep this headwear sized and aligned for ${anchorLabel}: centered in the upper anchor region, stack-safe, and shaped to feel built for that character instead of a random standalone canvas.`;
+  }
+
+  if (/eyes|eyewear|glasses|shades/.test(lowered)) {
+    return `Keep this eyewear aligned to ${anchorLabel}: centered over the eye line, narrowed to the visible face width, stack-safe over the eyes, and never redrawing any head or face content into the trait.`;
+  }
+
+  if (/neckwear|necklace|chain|scarf|bow/.test(lowered)) {
+    return `Keep this neckwear aligned to ${anchorLabel}: centered around the neck/chest area with clean spacing and no body redraw.`;
+  }
+
+  if (/handheld|weapon|sword|staff|wand|gun|tool|prop|item|orb|flower|cane|bat|microphone/.test(lowered)) {
+    return `Keep this handheld trait aligned to ${anchorLabel}: size it to the character and place it so it reads as being held by the visible hand or grip area instead of floating beside the body.`;
+  }
+
+  if (/background/.test(lowered)) {
+    return `Treat ${anchorLabel} as the foreground subject and keep this background supportive instead of overlapping the character silhouette.`;
+  }
+
+  return anchor ? `Fit this ${layer.name} asset so it stacks cleanly around ${anchorLabel} without redrawing the anchor layer.` : "";
+}
+
+function getActiveAnchorLayer(project, targetLayer = null) {
+  const layers = Array.isArray(project?.layers) ? project.layers : [];
+  const targetId = cleanText(targetLayer?.id);
+  const candidates = [
+    ...layers.filter((layer) => layer.id !== targetId && isPrimaryBaseLayerName(layer.name)),
+    ...layers.filter((layer) => layer.id !== targetId && !isPrimaryBaseLayerName(layer.name))
+  ];
+
+  for (const layer of candidates) {
+    const variants = Array.isArray(layer.variants) ? layer.variants : [];
+    const variant = variants.find((item) => item.id === layer.selectedVariantId) || variants[0] || null;
+    if (variant?.imageUrl || variant?.prompt || variant?.name) {
+      return { layer, variant };
+    }
+  }
+
+  return null;
+}
+
+async function getActiveAnchorReferenceAttachment(project, targetLayer, excludeUrls = []) {
+  const anchor = getActiveAnchorLayer(project, targetLayer);
+  const imageUrl = cleanText(anchor?.variant?.imageUrl);
+  if (!imageUrl || excludeUrls.includes(imageUrl)) {
+    return null;
+  }
+
+  try {
+    const absolutePath = publicAssetUrlToAbsolutePath(imageUrl);
+    const fileBuffer = await fs.readFile(absolutePath);
+    return {
+      id: cleanText(anchor.variant.id) || createId("anchor"),
+      name: cleanText(anchor.variant.name) || `${anchor.layer.name} anchor`,
+      imageUrl,
+      dataUrl: `data:image/png;base64,${fileBuffer.toString("base64")}`
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function getChatExampleReferenceAttachments(project, layer, promptText, excludeUrls = []) {
+  const matches = findChatImageReferencesForLayer(project, layer, promptText, excludeUrls);
+  const attachments = [];
+
+  for (const match of matches) {
+    const imageUrl = cleanText(match?.imageUrl);
+    if (!imageUrl) {
+      continue;
+    }
+
+    try {
+      const absolutePath = publicAssetUrlToAbsolutePath(imageUrl);
+      const fileBuffer = await fs.readFile(absolutePath);
+      attachments.push({
+        id: cleanText(match.id) || createId("chat-ref"),
+        name: cleanText(match.name) || "Chat example",
+        imageUrl,
+        dataUrl: `data:image/png;base64,${fileBuffer.toString("base64")}`
+      });
+    } catch {
+      // Ignore broken old chat assets.
+    }
+  }
+
+  return attachments;
+}
+
+function findChatImageReferencesForLayer(project, layer, promptText, excludeUrls = []) {
+  const layerName = cleanText(layer?.name).toLowerCase();
+  const promptLowered = cleanText(promptText).toLowerCase();
+  const blocked = new Set(excludeUrls.map((value) => cleanText(value)).filter(Boolean));
+  const candidates = [...(project.chatHistory || [])]
+    .reverse()
+    .filter((message) => message.role !== "user" && message.generatedImage?.imageUrl)
+    .map((message) => {
+      const image = normalizeGeneratedChatImage(message.generatedImage);
+      if (!image.imageUrl || blocked.has(image.imageUrl)) {
+        return null;
+      }
+
+      const targetLayer = cleanText(image.targetLayerName).toLowerCase();
+      const name = cleanText(image.name).toLowerCase();
+      const notes = cleanText(image.notes).toLowerCase();
+      const prompt = cleanText(image.prompt).toLowerCase();
+      const text = cleanText(message.text).toLowerCase();
+      let score = scoreGeneratedImageMatch(image, message, promptText);
+
+      if (layerName && targetLayer === layerName) {
+        score += 30;
+      } else if (layerName && targetLayer.includes(layerName)) {
+        score += 18;
+      }
+
+      if (/headwear|hat|crown|tiara/.test(layerName) && /(crown|headwear|hat|tiara)/.test(`${name} ${notes} ${prompt} ${text}`)) {
+        score += 18;
+      }
+
+      if (image.type === "preview" && /(fit|head|wear|crown|cat)/.test(promptLowered)) {
+        score += 10;
+      }
+
+      return score > 0 ? { ...image, score } : null;
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.score - left.score);
+
+  return candidates.slice(0, 2);
 }
 
 function buildRevisedVariantName(layer, sourceVariant, removalTarget) {
@@ -1347,6 +3290,87 @@ function buildRevisedVariantNotes(sourceVariant, removalTarget) {
   }
 
   return [base, "Revised version of the current layer asset."].filter(Boolean).join(" ");
+}
+
+function buildPureTraitVariantName(layer, sourceVariant) {
+  if (cleanText(sourceVariant?.name)) {
+    return `${sourceVariant.name} Clean`;
+  }
+
+  return `${layer.name} Clean`;
+}
+
+function buildPureTraitVariantNotes(layer, sourceVariant) {
+  const base = cleanText(sourceVariant?.notes);
+  return [base, `Fresh isolated ${layer.name} trait asset regenerated without any base character content.`]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function buildFrontOnlyHeadwearVariantName(sourceVariant) {
+  if (cleanText(sourceVariant?.name)) {
+    return `${sourceVariant.name} Front Fit`;
+  }
+
+  return "Headwear Front Fit";
+}
+
+function buildFrontOnlyHeadwearVariantNotes(sourceVariant) {
+  const base = cleanText(sourceVariant?.notes);
+  return [base, "Rebuilt as a front-only worn headwear trait with the rear hoop / hollow area removed for stack fit."]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function buildFrontOnlyHeadwearPrompt(project, layer, sourceVariant, options = {}) {
+  const sourcePrompt = cleanText(sourceVariant?.prompt);
+  const sourceNotes = cleanText(sourceVariant?.notes);
+  const requestedEdit = cleanText(options.promptText);
+  const activeConstructSummary = buildActiveConstructSummary(project, layer);
+  const fitGuidance = buildLayerFitPromptGuidance(project, layer);
+
+  return [
+    `Rebuilt ${layer.name} as a front-only worn trait for ${project.title}.`,
+    sourcePrompt ? `Source trait direction: ${sourcePrompt}.` : "",
+    sourceNotes ? `Source notes: ${sourceNotes}.` : "",
+    requestedEdit ? `Requested fit edit: ${requestedEdit}.` : "",
+    activeConstructSummary,
+    fitGuidance,
+    "Remove the rear hoop / underside opening so the trait reads as worn on the anchor head from the front view.",
+    "Keep only the single isolated trait asset with no base character pixels.",
+    "Transparent background, PNG-ready."
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function buildPureTraitRegenerationPrompt(project, layer, sourceVariant, options = {}) {
+  const sourcePrompt = cleanText(sourceVariant?.prompt);
+  const sourceNotes = cleanText(sourceVariant?.notes);
+  const requestedEdit = cleanText(options.promptText);
+  const activeConstructSummary = buildActiveConstructSummary(project, layer);
+  const fitGuidance = buildLayerFitPromptGuidance(project, layer);
+  const fitProfile = getLayerFitProfile(layer.name);
+
+  return [
+    `Create one fresh isolated ${layer.name} NFT trait asset for the collection ${project.title}.`,
+    "This is a pure single-trait rebuild, not an edit of a contaminated image.",
+    sourcePrompt ? `Use this approved clean trait direction as the design source: ${sourcePrompt}.` : "",
+    sourceNotes ? `Preserve these approved trait notes: ${sourceNotes}.` : "",
+    requestedEdit ? `Current request: ${requestedEdit}.` : "",
+    activeConstructSummary,
+    fitGuidance,
+    fitProfile?.anchorRegion ? `Fit region: ${fitProfile.anchorRegion}.` : "",
+    fitProfile?.clipStrategy ? `Preferred clip strategy: ${fitProfile.clipStrategy}.` : "",
+    "Use the anchor/base construct only as sizing and later placement context for how this trait should stack.",
+    "Do not include any cat head, ears, face, body, hands, paws, arms, or other character pixels in the output.",
+    "Do not include any other layer content in the output.",
+    "Draw only the single requested trait asset itself.",
+    "Transparent background. No mockup, no scene, no text, no watermark.",
+    "Centered composition, stack-safe proportions, crisp edges, PNG-ready."
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 function extractLayerLookupFromPrompt(promptText) {
@@ -1384,6 +3408,88 @@ function titleCaseWords(value) {
     .filter(Boolean)
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(" ");
+}
+
+function isGenericTraitLayerName(layerName) {
+  const token = slugify(layerName || "");
+  if (!token) {
+    return false;
+  }
+
+  return [
+    "headwear",
+    "hat",
+    "crown",
+    "tiara",
+    "base-cat",
+    "body",
+    "background",
+    "fur",
+    "eyes",
+    "mouth",
+    "clothing",
+    "accessory",
+    "handheld"
+  ].includes(token);
+}
+
+function extractFreshTraitName(promptText) {
+  const cleaned = cleanText(promptText).replace(/[.!?]+$/g, "");
+  const match = cleaned.match(
+    /(?:draw|make|create|generate|design|craft|show|give)\s+(?:me\s+)?(?:a\s+|an\s+|another\s+|new\s+)?(.+)/i
+  );
+  if (!match?.[1]) {
+    return "";
+  }
+
+  const rawCandidate = cleanText(match[1])
+    .replace(/\b(?:asset|trait|folder|layer)\b/gi, "")
+    .replace(/\((?:[^)]*(?:leave|keep|old|existing|current|alone|also)[^)]*)\)/gi, "")
+    .replace(/\b(?:leave|keep)\b[\s\S]*?\b(?:alone|also|too|as well)\b/gi, "")
+    .replace(/\b(?:don't|do not)\s+(?:replace|overwrite|touch|edit|change)\b/gi, "")
+    .replace(/\b(?:for|with|that|to|using|based on|like)\b[\s\S]*$/i, "")
+    .replace(/^\b(?:new|another|fresh|different)\b\s*/i, "")
+    .trim();
+
+  return titleCaseWords(rawCandidate);
+}
+
+function buildGenericFreshLayerName(promptText, guessedLayerName) {
+  const lowered = cleanText(promptText).toLowerCase();
+  if (/(crown|tiara)/.test(lowered)) {
+    return "New Crown";
+  }
+
+  if (/(hat|headwear)/.test(lowered)) {
+    return "New Headwear";
+  }
+
+  if (/(glasses|shades|eyewear)/.test(lowered)) {
+    return "New Eyewear";
+  }
+
+  if (/(background)/.test(lowered)) {
+    return "New Background";
+  }
+
+  if (/(sword|wand|staff|gun|weapon|prop|tool|item|handheld)/.test(lowered)) {
+    return "New Handheld";
+  }
+
+  return `New ${titleCaseWords(guessedLayerName)}`;
+}
+
+function makeUniqueLayerName(project, preferredName) {
+  const baseName = titleCaseWords(preferredName) || "New Trait";
+  let attempt = baseName;
+  let index = 2;
+
+  while (findLayer(project, attempt)) {
+    attempt = `${baseName} ${index}`;
+    index += 1;
+  }
+
+  return attempt;
 }
 
 async function resolveAttachments(ids) {
@@ -1645,13 +3751,29 @@ function guessLayerNameFromPrompt(promptText) {
     return name.charAt(0).toUpperCase() + name.slice(1);
   }
 
-  const known = ["background", "body", "face", "eyes", "mouth", "hat", "headwear", "clothes", "clothing", "fur", "accessory"];
+  const known = ["background", "body", "base cat", "cat base", "face", "eyes", "mouth", "hat", "headwear", "crown", "tiara", "clothes", "clothing", "fur", "weapon", "sword", "staff", "wand", "gun", "tool", "prop", "handheld", "accessory"];
   const match = known.find((item) => lowered.includes(item));
   if (!match) {
     return "";
   }
 
-  return match === "clothes" ? "Clothing" : match === "headwear" ? "Hat" : match.charAt(0).toUpperCase() + match.slice(1);
+  if (match === "clothes") {
+    return "Clothing";
+  }
+
+  if (["headwear", "hat", "crown", "tiara"].includes(match)) {
+    return "Headwear";
+  }
+
+  if (["weapon", "sword", "staff", "wand", "gun", "tool", "prop", "handheld"].includes(match)) {
+    return "Handheld";
+  }
+
+  if (["base cat", "cat base", "body"].includes(match)) {
+    return "Base Cat";
+  }
+
+  return match.charAt(0).toUpperCase() + match.slice(1);
 }
 
 function detectFeedbackMode(promptText) {
@@ -1902,11 +4024,8 @@ function buildHashLipsExportManifest(project, layerFolders) {
 async function getPreviewCompositeSources(project) {
   const sources = [];
   const seen = new Set();
-  const preview = Array.isArray(project.previewHistory)
-    ? project.previewHistory.find((item) => item.id === project.selectedPreviewId) || project.previewHistory[0]
-    : null;
 
-  const pushSource = async (imageUrl) => {
+  const pushSource = async (imageUrl, meta = {}) => {
     const cleanUrl = cleanText(imageUrl);
     if (!cleanUrl || seen.has(cleanUrl)) {
       return;
@@ -1915,21 +4034,163 @@ async function getPreviewCompositeSources(project) {
     const absolutePath = publicAssetUrlToAbsolutePath(cleanUrl);
     try {
       await fs.access(absolutePath);
-      sources.push({ imageUrl: cleanUrl, absolutePath });
+      sources.push({
+        imageUrl: cleanUrl,
+        absolutePath,
+        layerId: cleanText(meta.layerId),
+        layerName: cleanText(meta.layerName),
+        layerIndex: Number.isFinite(meta.layerIndex) ? Number(meta.layerIndex) : -1,
+        isBaseLayer: Boolean(meta.isBaseLayer),
+        analysis: meta.analysis || null
+      });
       seen.add(cleanUrl);
     } catch {
       // Ignore missing assets so one broken file does not stop the composite render.
     }
   };
 
-  await pushSource(preview?.imageUrl);
-
   for (const layer of project.layers || []) {
     const variant = (layer.variants || []).find((item) => item.id === layer.selectedVariantId);
-    await pushSource(variant?.imageUrl);
+    if (variant?.imageUrl) {
+      await pushSource(variant.imageUrl, {
+        layerId: layer.id,
+        layerName: layer.name,
+        layerIndex: project.layers.indexOf(layer),
+        isBaseLayer: isPrimaryBaseLayerName(layer.name),
+        analysis: variant.analysis || null
+      });
+      const latest = sources[sources.length - 1];
+      if (latest) {
+        latest.transform = getLayerPlacementTransform(layer, variant);
+      }
+    }
   }
 
   return sources;
+}
+
+async function buildCompositeLayers(source, width, height, baseSource = null) {
+  const transform = normalizeLayerTransform(source.transform);
+  const metadata = await sharp(source.absolutePath).metadata();
+  const baseWidth = Math.max(1, Number(metadata.width || width));
+  const baseHeight = Math.max(1, Number(metadata.height || height));
+  const targetWidth = Math.max(1, Math.round(baseWidth * transform.scale));
+  const targetHeight = Math.max(1, Math.round(baseHeight * transform.scale));
+  const left = Math.round((width - targetWidth) / 2 + transform.x * width);
+  const top = Math.round((height - targetHeight) / 2 + transform.y * height);
+
+  const input = await sharp(source.absolutePath)
+    .resize({
+      width: targetWidth,
+      height: targetHeight,
+      fit: "contain"
+    })
+    .png()
+    .toBuffer();
+
+  const sourceIndex = Number.isFinite(source.layerIndex) ? Number(source.layerIndex) : -1;
+  const baseIndex = Number.isFinite(baseSource?.layerIndex) ? Number(baseSource.layerIndex) : -1;
+  const shouldWrapBehindBase =
+    transform.depthMode === "headwear_wrap" &&
+    /headwear|hat|crown|tiara/.test(cleanText(source.layerName).toLowerCase()) &&
+    baseSource &&
+    sourceIndex !== -1 &&
+    baseIndex !== -1 &&
+    sourceIndex < baseIndex;
+
+  if (shouldWrapBehindBase) {
+    return [
+      {
+        input,
+        left,
+        top,
+        stage: "headwear-wrap"
+      }
+    ];
+  }
+
+  return [
+    {
+      input,
+      left,
+      top,
+      stage: source.isBaseLayer ? "base" : "normal"
+    }
+  ];
+}
+
+async function buildAnchorOccluderPiece(sources, width, height) {
+  const baseSource = sources.find((source) => source.isBaseLayer);
+  const baseIndex = Number.isFinite(baseSource?.layerIndex) ? Number(baseSource.layerIndex) : -1;
+  const headwearSource = sources.find(
+    (source) =>
+      normalizeLayerTransform(source.transform).depthMode === "headwear_wrap" &&
+      /headwear|hat|crown|tiara/.test(cleanText(source.layerName).toLowerCase()) &&
+      Number.isFinite(source.layerIndex) &&
+      baseIndex !== -1 &&
+      Number(source.layerIndex) < baseIndex
+  );
+  if (!baseSource || !headwearSource) {
+    return null;
+  }
+
+  const baseAnalysis = baseSource.analysis || null;
+  const baseBounds = baseAnalysis?.bounds || null;
+  if (!baseBounds) {
+    return null;
+  }
+
+  const fitProfile = getLayerFitProfile(headwearSource.layerName);
+  const occluderRatio = Math.min(0.5, coerceProfileNumber(fitProfile?.anchorBottomRatio, 0.22) + 0.035);
+  const transform = normalizeLayerTransform(baseSource.transform);
+  const metadata = await sharp(baseSource.absolutePath).metadata();
+  const imageWidth = Math.max(1, Number(metadata.width || width));
+  const imageHeight = Math.max(1, Number(metadata.height || height));
+  const targetWidth = Math.max(1, Math.round(imageWidth * transform.scale));
+  const targetHeight = Math.max(1, Math.round(imageHeight * transform.scale));
+  const left = Math.round((width - targetWidth) / 2 + transform.x * width);
+  const top = Math.round((height - targetHeight) / 2 + transform.y * height);
+  const resizedBase = await sharp(baseSource.absolutePath)
+    .resize({
+      width: targetWidth,
+      height: targetHeight,
+      fit: "contain"
+    })
+    .png()
+    .toBuffer();
+
+  const anchorHeight = Math.max(1, Number(baseBounds.bottom) - Number(baseBounds.top) + 1);
+  const capBottom = Math.max(
+    1,
+    Math.min(
+      targetHeight,
+      Math.round((Number(baseBounds.top) + anchorHeight * occluderRatio) * transform.scale)
+    )
+  );
+
+  return {
+    input: await sharp(resizedBase)
+      .extract({
+        left: 0,
+        top: 0,
+        width: targetWidth,
+        height: capBottom
+      })
+      .png()
+      .toBuffer(),
+    left,
+    top,
+    stage: "anchor-occluder"
+  };
+}
+
+function isPrimaryBaseLayerName(layerName) {
+  const token = cleanText(layerName).toLowerCase();
+  if (!token) {
+    return false;
+  }
+
+  return /(base|body|character|avatar)/.test(token);
 }
 
 function publicAssetUrlToAbsolutePath(assetUrl) {

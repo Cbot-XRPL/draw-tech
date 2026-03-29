@@ -179,6 +179,19 @@ function normalizeToolManifest(manifest) {
             useWhen: normalizeStringList(item?.useWhen, 8)
           }))
           .filter((item) => item.id)
+      : [],
+    fitProfiles: Array.isArray(manifest?.fitProfiles)
+      ? manifest.fitProfiles
+          .map((item) => ({
+            id: cleanText(item?.id),
+            label: cleanText(item?.label),
+            layerKeywords: normalizeStringList(item?.layerKeywords, 16),
+            anchorRegion: cleanText(item?.anchorRegion),
+            clipStrategy: cleanText(item?.clipStrategy),
+            guidance: cleanText(item?.guidance),
+            defaultTransform: item?.defaultTransform || null
+          }))
+          .filter((item) => item.id)
       : []
   };
 }

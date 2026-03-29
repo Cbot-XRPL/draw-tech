@@ -74,6 +74,86 @@
         "A future workflow needs simple programmatic paintover or bitmap transforms.",
         "A pure JavaScript fallback is safer than a heavier native graphics stack."
       ]
+    },
+    {
+      "id": "layer-fit-profiles",
+      "name": "Layer fit profiles",
+      "packages": ["sharp", "pngjs"],
+      "useWhen": [
+        "A trait layer must be fitted to a selected base or anchor construct.",
+        "The app needs deterministic placement, clipping, and region-aware stack behavior instead of a full redraw."
+      ]
+    }
+  ],
+  "fitProfiles": [
+    {
+      "id": "headwear",
+      "label": "Headwear",
+      "layerKeywords": ["headwear", "hat", "crown", "tiara", "helmet", "hair"],
+      "anchorRegion": "upper_anchor_region",
+      "clipStrategy": "headwear_wrap",
+      "guidance": "Trait should sit on the upper anchor region, centered and worn by the main construct rather than floating above it.",
+      "anchorWidthRatio": 0.64,
+      "anchorBottomRatio": 0.22,
+      "frontStart": 0.62,
+      "backCutoff": 0.66,
+      "defaultTransform": { "x": 0, "y": -0.24, "scale": 0.58, "depthMode": "headwear_wrap", "backCutoff": 0.66, "frontStart": 0.62 }
+    },
+    {
+      "id": "eyewear",
+      "label": "Eyewear",
+      "layerKeywords": ["eyes", "eyewear", "glasses", "shades", "goggles", "visor", "mask"],
+      "anchorRegion": "eye_line_region",
+      "clipStrategy": "flat",
+      "guidance": "Trait should align to the eye line, stay within the visible face width, and remain isolated from the anchor face and head.",
+      "anchorWidthRatio": 0.68,
+      "anchorCenterYRatio": 0.46,
+      "defaultTransform": { "x": 0, "y": -0.02, "scale": 0.56 }
+    },
+    {
+      "id": "mouth",
+      "label": "Mouth Detail",
+      "layerKeywords": ["mouth", "smile", "expression", "teeth", "tongue", "beard", "moustache", "mustache"],
+      "anchorRegion": "lower_face_region",
+      "clipStrategy": "flat",
+      "guidance": "Trait should align to the lower face area and preserve the anchor silhouette.",
+      "defaultTransform": { "x": 0, "y": 0.09, "scale": 0.42 }
+    },
+    {
+      "id": "neckwear",
+      "label": "Neckwear",
+      "layerKeywords": ["neckwear", "necklace", "chain", "scarf", "bow", "collar", "tie"],
+      "anchorRegion": "neck_region",
+      "clipStrategy": "flat",
+      "guidance": "Trait should align to the neck and upper chest area with clean spacing.",
+      "defaultTransform": { "x": 0, "y": 0.18, "scale": 0.58 }
+    },
+    {
+      "id": "outfit",
+      "label": "Outfit",
+      "layerKeywords": ["outfit", "clothing", "clothes", "shirt", "hoodie", "jacket", "armor", "torso"],
+      "anchorRegion": "torso_region",
+      "clipStrategy": "flat",
+      "guidance": "Trait should fit the torso and body mass of the anchor construct without changing the anchor pose.",
+      "defaultTransform": { "x": 0, "y": 0.1, "scale": 0.9 }
+    },
+    {
+      "id": "handheld",
+      "label": "Handheld Prop",
+      "layerKeywords": ["handheld", "held item", "hand item", "weapon", "sword", "staff", "wand", "gun", "tool", "prop", "orb", "flower", "cane", "bat", "microphone"],
+      "anchorRegion": "hand_anchor_region",
+      "clipStrategy": "flat",
+      "guidance": "Trait should be sized to the active construct and positioned so it reads as being held by the visible hand, paw, or grip area instead of floating near the body.",
+      "defaultTransform": { "x": 0.22, "y": 0.12, "scale": 0.34 }
+    },
+    {
+      "id": "background",
+      "label": "Background",
+      "layerKeywords": ["background", "bg", "scene", "backdrop"],
+      "anchorRegion": "full_canvas_behind_subject",
+      "clipStrategy": "behind_anchor",
+      "guidance": "Layer belongs behind the anchor construct and should not intrude into the main silhouette.",
+      "defaultTransform": { "x": 0, "y": 0, "scale": 1 }
     }
   ]
 }

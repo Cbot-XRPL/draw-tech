@@ -3,6 +3,14 @@ const state = {
   config: null,
   pendingAttachments: [],
   busy: false,
+  fitDebugVisible: false,
+  fitDebugLoading: false,
+  fitDebugData: null,
+  dragMode: false,
+  dragState: null,
+  dragSelection: null,
+  pendingDragTransforms: {},
+  folderDrag: null,
   previewAsset: {
     requestKey: "",
     loaded: false,
@@ -24,14 +32,26 @@ const elements = {
   loadingRail: document.getElementById("loadingRail"),
   loadingFill: document.getElementById("loadingFill"),
   sendPromptBtn: document.getElementById("sendPromptBtn"),
+  toggleFitDebugBtn: document.getElementById("toggleFitDebugBtn"),
+  toggleDragModeBtn: document.getElementById("toggleDragModeBtn"),
+  saveDragBtn: document.getElementById("saveDragBtn"),
+  dragScaleControls: document.getElementById("dragScaleControls"),
+  dragScaleDownBtn: document.getElementById("dragScaleDownBtn"),
+  dragScaleReadout: document.getElementById("dragScaleReadout"),
+  dragScaleUpBtn: document.getElementById("dragScaleUpBtn"),
   refreshPreviewBtn: document.getElementById("refreshPreviewBtn"),
   downloadHashlipsBtn: document.getElementById("downloadHashlipsBtn"),
   projectTitle: document.getElementById("projectTitle"),
   canvasBadge: document.getElementById("canvasBadge"),
   stage: document.getElementById("stage"),
   previewImage: document.getElementById("previewImage"),
+  stageLayerStack: document.getElementById("stageLayerStack"),
   stageEmpty: document.getElementById("stageEmpty"),
   chatLog: document.getElementById("chatLog"),
+  fitDebugPanel: document.getElementById("fitDebugPanel"),
+  downloadFitDebugBtn: document.getElementById("downloadFitDebugBtn"),
+  fitDebugSummary: document.getElementById("fitDebugSummary"),
+  fitDebugContent: document.getElementById("fitDebugContent"),
   layersPanel: document.getElementById("layersPanel"),
   layerCount: document.getElementById("layerCount"),
   toast: document.getElementById("toast")
@@ -77,42 +97,81 @@ elements.imageUploadInput.addEventListener("change", async () => {
     return;
   }
 
-  await withBusy(async () => {
-    const formData = new FormData();
-    for (const file of files) {
-      formData.append("images", file);
-    }
-
-    const response = await fetch("/api/uploads", {
-      method: "POST",
-      body: formData
-    });
-    const data = await response.json();
-    if (!response.ok) {
-      throw new Error(data?.error || "Upload failed.");
-    }
-
-    state.pendingAttachments.push(...(data.attachments || []));
-    state.pendingAttachments = state.pendingAttachments.slice(-6);
-    elements.imageUploadInput.value = "";
-    render();
-    showToast("Image refs attached.");
-  });
+  await uploadAttachmentFiles(files, "Image refs attached.");
+  elements.imageUploadInput.value = "";
 });
 
 elements.sendPromptBtn.addEventListener("click", async () => {
   await submitPrompt();
 });
 
+elements.toggleFitDebugBtn.addEventListener("click", async () => {
+  state.fitDebugVisible = !state.fitDebugVisible;
+  if (state.fitDebugVisible && state.project?.id && !state.fitDebugData) {
+    await loadFitDebug();
+  }
+  render();
+});
+
+elements.toggleDragModeBtn.addEventListener("click", () => {
+  if (state.dragState) {
+    cancelStageDrag();
+  }
+
+  if (state.dragMode && hasPendingDragTransforms()) {
+    state.pendingDragTransforms = {};
+    state.dragSelection = null;
+    state.dragMode = false;
+    render();
+    showToast("Drag mode off. Unsaved layer moves were discarded.");
+    return;
+  }
+
+  state.dragMode = !state.dragMode;
+  if (!state.dragMode) {
+    state.dragSelection = null;
+  }
+  render();
+  showToast(state.dragMode ? "Drag mode on. Drag layers, use scale +/- if needed, then click Save Drag." : "Drag mode off.");
+});
+
+elements.saveDragBtn.addEventListener("click", async () => {
+  await savePendingDragTransforms();
+});
+
+elements.dragScaleDownBtn.addEventListener("click", () => {
+  adjustSelectedLayerScale(-0.05);
+});
+
+elements.dragScaleUpBtn.addEventListener("click", () => {
+  adjustSelectedLayerScale(0.05);
+});
+
 elements.refreshPreviewBtn.addEventListener("click", async () => {
   await submitPrompt({ rerunLatest: true, preservePrompt: true });
 });
+
+elements.stageLayerStack.addEventListener("pointerdown", handleStageLayerPointerDown);
+window.addEventListener("pointermove", handleStageLayerPointerMove);
+window.addEventListener("pointerup", handleStageLayerPointerUp);
+window.addEventListener("pointercancel", handleStageLayerPointerUp);
+window.addEventListener("keydown", handleDragModeKeyDown);
 
 elements.promptInput.addEventListener("keydown", async (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
     event.preventDefault();
     await submitPrompt();
   }
+});
+
+elements.promptInput.addEventListener("paste", async (event) => {
+  const files = extractImageFilesFromClipboard(event.clipboardData);
+  if (!files.length) {
+    return;
+  }
+
+  event.preventDefault();
+  await uploadAttachmentFiles(files, files.length === 1 ? "Pasted image attached." : "Pasted images attached.");
 });
 
 elements.downloadHashlipsBtn.addEventListener("click", () => {
@@ -124,12 +183,38 @@ elements.downloadHashlipsBtn.addEventListener("click", () => {
   window.location.href = `/api/projects/${state.project.id}/export/hashlips`;
 });
 
+elements.downloadFitDebugBtn.addEventListener("click", async () => {
+  if (!state.project?.id) {
+    showToast("Generate something first.", true);
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/projects/${state.project.id}/fit-debug`);
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data?.error || "Could not download fit debug JSON.");
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${slugify(state.project.title || "draw-tech")}-fit-debug.json`;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    showToast(error.message || "Could not download fit debug JSON.", true);
+  }
+});
+
 async function bootstrap() {
   await loadConfig();
   if (state.config?.defaultProjectId) {
     const response = await api(`/api/projects/${state.config.defaultProjectId}`);
-    state.project = response.project;
-    hydrateCanvasFromProject();
+    await applyProject(response.project);
   }
   render();
 }
@@ -156,14 +241,41 @@ async function submitPrompt(options = {}) {
       }
     });
 
-    state.project = response.project;
-    hydrateCanvasFromProject();
+    await applyProject(response.project);
     if (!options.preservePrompt) {
       elements.promptInput.value = "";
     }
     state.pendingAttachments = [];
     render();
     showToast(response.assistantReply || "Done.");
+  });
+}
+
+async function uploadAttachmentFiles(files, successMessage = "Image refs attached.") {
+  const uploadFiles = Array.from(files || []).filter((file) => String(file?.type || "").startsWith("image/"));
+  if (!uploadFiles.length) {
+    return;
+  }
+
+  await withBusy(async () => {
+    const formData = new FormData();
+    for (const file of uploadFiles.slice(0, 6)) {
+      formData.append("images", file);
+    }
+
+    const response = await fetch("/api/uploads", {
+      method: "POST",
+      body: formData
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data?.error || "Upload failed.");
+    }
+
+    state.pendingAttachments.push(...(data.attachments || []));
+    state.pendingAttachments = state.pendingAttachments.slice(-6);
+    render();
+    showToast(successMessage);
   });
 }
 
@@ -181,14 +293,16 @@ function render() {
   renderPreview();
   renderPendingAttachments();
   renderChat();
+  renderFitDebug();
   renderLayers();
   syncBusyState();
 }
 
 function renderPreview() {
-  const selectedPreview = getSelectedPreview();
-  const selectedVariants = getSelectedVariants();
-  const stackSources = buildPreviewStackSources(selectedPreview, selectedVariants);
+  const selectedEntries = getSelectedLayerEntries();
+  syncDragSelection(selectedEntries);
+  const activeDragEntry = getActiveDragEntry(selectedEntries);
+  const stackSources = buildPreviewStackSources(selectedEntries);
   const renderToken = stackSources.map((item) => `${item.imageUrl}:${item.cacheKey}`).join("|");
   const previewUrl =
     state.project?.id && stackSources.length
@@ -198,6 +312,13 @@ function renderPreview() {
       : "";
 
   elements.stage.style.aspectRatio = getAspectRatio(readCanvasFromState());
+  elements.toggleDragModeBtn.classList.toggle("is-active", state.dragMode);
+  elements.saveDragBtn.classList.toggle("hidden", !state.dragMode || !hasPendingDragTransforms());
+  elements.saveDragBtn.textContent = hasPendingDragTransforms() ? "Save Drag" : "Save Drag";
+  elements.dragScaleControls.classList.toggle("hidden", !state.dragMode || !activeDragEntry);
+  elements.dragScaleReadout.textContent = activeDragEntry
+    ? `Scale ${Math.round(getEntryDisplayTransform(activeDragEntry).scale * 100)}%`
+    : "Scale 100%";
   elements.previewImage.decoding = "sync";
   elements.previewImage.loading = "eager";
   elements.previewImage.style.display = "none";
@@ -224,6 +345,8 @@ function renderPreview() {
     elements.previewImage.style.display = "none";
   }
 
+  renderStageLayerStack(selectedEntries);
+  elements.previewImage.classList.toggle("is-stage-hidden", state.dragMode && selectedEntries.length > 0);
   syncPreviewStatus();
 }
 
@@ -249,7 +372,10 @@ function renderChat() {
                   <img class="generated-preview" src="${message.generatedImage.imageUrl}" alt="${escapeHtml(message.generatedImage.name || "Generated image")}" />
                   <div class="generated-meta">
                     <div class="generated-name">${escapeHtml(message.generatedImage.name || (message.generatedImage.type === "preview" ? "Preview" : "Draft"))}</div>
-                    <div class="generated-notes">${escapeHtml(message.generatedImage.notes || message.generatedImage.prompt || "")}</div>
+                    <div
+                      class="generated-notes"
+                      title="${escapeHtml(message.generatedImage.notes || message.generatedImage.prompt || "")}"
+                    >${escapeHtml(summarizeDisplayText(message.generatedImage.notes || message.generatedImage.prompt || "", 160))}</div>
                     <div class="generated-actions">
                       <span class="generated-status">${escapeHtml(message.generatedImage.status || "ready")}</span>
                       ${
@@ -285,6 +411,114 @@ function renderChat() {
     )
     .join("");
   bindChatActions();
+}
+
+function renderFitDebug() {
+  const hasProject = Boolean(state.project?.id);
+  elements.toggleFitDebugBtn.classList.toggle("is-active", state.fitDebugVisible);
+  elements.toggleFitDebugBtn.textContent = state.fitDebugVisible ? "Hide Fit Debug" : "Fit Debug";
+  elements.fitDebugPanel.classList.toggle("hidden", !state.fitDebugVisible || !hasProject);
+
+  if (!state.fitDebugVisible || !hasProject) {
+    return;
+  }
+
+  if (state.fitDebugLoading) {
+    elements.fitDebugSummary.textContent = "Loading fit profile data...";
+    elements.fitDebugContent.innerHTML = "";
+    return;
+  }
+
+  if (!state.fitDebugData) {
+    elements.fitDebugSummary.textContent = "No fit profile data loaded yet.";
+    elements.fitDebugContent.innerHTML = "";
+    return;
+  }
+
+  const data = state.fitDebugData;
+  const activeAnchor = data.activeAnchor
+    ? `
+      <article class="fit-debug-card fit-debug-card-anchor">
+        <div class="fit-debug-card-head">
+          <strong>Active Anchor</strong>
+          <span class="badge">${escapeHtml(data.activeAnchor.layerName || "None")}</span>
+        </div>
+        <div class="fit-debug-kv">
+          <span>Variant</span>
+          <span>${escapeHtml(data.activeAnchor.variantName || "No selected asset")}</span>
+        </div>
+        <div class="fit-debug-kv">
+          <span>Image</span>
+          <span>${escapeHtml(data.activeAnchor.imageUrl || "n/a")}</span>
+        </div>
+      </article>
+    `
+    : `
+      <article class="fit-debug-card fit-debug-card-anchor">
+        <div class="fit-debug-card-head">
+          <strong>Active Anchor</strong>
+          <span class="badge badge-warn">Missing</span>
+        </div>
+        <div class="fit-debug-empty">No base or anchor layer is selected right now.</div>
+      </article>
+    `;
+
+  elements.fitDebugSummary.innerHTML = `
+    <div class="fit-debug-summary-row">
+      <span class="badge">${escapeHtml(data.projectTitle || "Project")}</span>
+      <span class="badge">${escapeHtml(formatCanvas(data.canvas || {}))}</span>
+      <span class="badge">${Number(data.layers?.length || 0)} layer${Number(data.layers?.length || 0) === 1 ? "" : "s"}</span>
+      <span class="badge">${Number(data.selectedLayerCount || 0)} selected</span>
+    </div>
+    <div class="fit-debug-summary-note">
+      Hidden inspector for anchor, fit profile, clip strategy, and live transform values.
+    </div>
+  `;
+
+  elements.fitDebugContent.innerHTML = [
+    activeAnchor,
+    ...(data.layers || []).map(
+      (layer) => `
+        <article class="fit-debug-card">
+          <div class="fit-debug-card-head">
+            <strong>${escapeHtml(layer.name || "Layer")}</strong>
+            <div class="fit-debug-card-badges">
+              ${layer.isBaseLayer ? '<span class="badge">Base</span>' : ""}
+              <span class="badge ${layer.selected ? "" : "badge-warn"}">${layer.selected ? "Selected" : "Unselected"}</span>
+            </div>
+          </div>
+          <div class="fit-debug-kv">
+            <span>Profile</span>
+            <span>${escapeHtml(layer.fitProfile?.label || layer.fitProfile?.id || "none")}</span>
+          </div>
+          <div class="fit-debug-kv">
+            <span>Anchor Region</span>
+            <span>${escapeHtml(layer.fitProfile?.anchorRegion || "none")}</span>
+          </div>
+          <div class="fit-debug-kv">
+            <span>Clip Strategy</span>
+            <span>${escapeHtml(layer.fitProfile?.clipStrategy || "none")}</span>
+          </div>
+          <div class="fit-debug-kv">
+            <span>Selected Asset</span>
+            <span>${escapeHtml(layer.selectedVariant?.name || "none")}</span>
+          </div>
+          <div class="fit-debug-kv">
+            <span>Image</span>
+            <span>${escapeHtml(layer.selectedVariant?.imageUrl || "n/a")}</span>
+          </div>
+          <pre class="fit-debug-code">${escapeHtml(
+            JSON.stringify(layer.transform || {}, null, 2)
+          )}</pre>
+          ${
+            layer.fitProfile?.guidance
+              ? `<div class="fit-debug-guidance">${escapeHtml(layer.fitProfile.guidance)}</div>`
+              : ""
+          }
+        </article>
+      `
+    )
+  ].join("");
 }
 
 function renderPendingAttachments() {
@@ -328,31 +562,72 @@ function renderLayers() {
 
   elements.layersPanel.className = "layer-folder-list";
   elements.layersPanel.innerHTML = layers
-    .map((layer) => {
+    .map((layer, index) => ({ layer, actualIndex: index }))
+    .reverse()
+    .map(({ layer, actualIndex }) => {
       const variants = layer.variants || [];
+      const isBackmostLayer = actualIndex === 0;
+      const isFrontmostLayer = actualIndex === layers.length - 1;
+      const frontRank = layers.length - actualIndex;
       return `
         <details class="layer-folder" open>
           <summary>
             <div class="folder-title">
               <div class="folder-name">${escapeHtml(layer.name)}</div>
-              <div class="folder-meta">${variants.length} image${variants.length === 1 ? "" : "s"}</div>
+              <div class="folder-meta">
+                ${variants.length} image${variants.length === 1 ? "" : "s"} / Front ${frontRank} of ${layers.length}
+              </div>
             </div>
             <div class="folder-actions">
+              <button
+                class="btn btn-ghost btn-stack"
+                data-action="move-layer-back"
+                data-layer-id="${layer.id}"
+                title="Send layer backward"
+                aria-label="Send ${escapeHtml(layer.name)} backward"
+                ${isBackmostLayer ? "disabled" : ""}
+              >
+                -
+              </button>
+              <button
+                class="btn btn-ghost btn-stack"
+                data-action="move-layer-forward"
+                data-layer-id="${layer.id}"
+                title="Bring layer forward"
+                aria-label="Bring ${escapeHtml(layer.name)} forward"
+                ${isFrontmostLayer ? "disabled" : ""}
+              >
+                +
+              </button>
+              <button
+                class="btn btn-ghost"
+                data-action="rename-layer"
+                data-layer-id="${layer.id}"
+                data-layer-name="${escapeHtml(layer.name)}"
+              >
+                Rename
+              </button>
               <button class="btn btn-danger" data-action="remove-layer" data-layer-id="${layer.id}">Remove Layer</button>
             </div>
           </summary>
 
-          <div class="folder-body">
+          <div class="folder-body" data-drop-layer-id="${layer.id}">
             ${
               variants.length
                 ? variants
                     .map(
                       (variant) => `
-                        <article class="variant-item">
+                        <article
+                          class="variant-item"
+                          draggable="true"
+                          data-source-layer-id="${layer.id}"
+                          data-variant-id="${variant.id}"
+                          data-variant-name="${escapeHtml(variant.name)}"
+                        >
                           <img src="${variant.imageUrl}" alt="${escapeHtml(variant.name)}" />
                           <div class="variant-meta">
-                            <div class="variant-name">${escapeHtml(variant.name)}</div>
-                            <div class="variant-notes">${escapeHtml(variant.notes || "")}</div>
+                            <div class="variant-name" title="${escapeHtml(variant.name)}">${escapeHtml(summarizeDisplayText(variant.name, 48))}</div>
+                            <div class="variant-notes" title="${escapeHtml(variant.notes || "")}">${escapeHtml(summarizeDisplayText(variant.notes || "", 120))}</div>
                             <div class="variant-actions">
                               <button
                                 class="check-toggle ${variant.id === layer.selectedVariantId ? "is-checked" : ""}"
@@ -395,6 +670,163 @@ function renderLayers() {
 }
 
 function bindLayerActions() {
+  const clearFolderDropTargets = () => {
+    elements.layersPanel.querySelectorAll(".folder-body.is-drop-target").forEach((folderBody) => {
+      folderBody.classList.remove("is-drop-target");
+    });
+  };
+
+  const readVariantDragPayload = (event) => {
+    if (state.folderDrag) {
+      return state.folderDrag;
+    }
+
+    const raw =
+      event.dataTransfer?.getData("application/json") ||
+      event.dataTransfer?.getData("text/plain") ||
+      "";
+    if (!raw) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  };
+
+  elements.layersPanel.querySelectorAll(".variant-item[draggable='true']").forEach((item) => {
+    item.addEventListener("dragstart", (event) => {
+      if (state.busy) {
+        event.preventDefault();
+        return;
+      }
+
+      const payload = {
+        sourceLayerId: item.dataset.sourceLayerId,
+        variantId: item.dataset.variantId,
+        variantName: item.dataset.variantName || "Layer image"
+      };
+      state.folderDrag = payload;
+      item.classList.add("is-dragging");
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", JSON.stringify(payload));
+      }
+    });
+
+    item.addEventListener("dragend", () => {
+      item.classList.remove("is-dragging");
+      state.folderDrag = null;
+      clearFolderDropTargets();
+    });
+  });
+
+  elements.layersPanel.querySelectorAll(".folder-body[data-drop-layer-id]").forEach((folderBody) => {
+    folderBody.addEventListener("dragover", (event) => {
+      const payload = readVariantDragPayload(event);
+      if (!payload || payload.sourceLayerId === folderBody.dataset.dropLayerId) {
+        return;
+      }
+
+      event.preventDefault();
+      if (event.dataTransfer) {
+        event.dataTransfer.dropEffect = "move";
+      }
+      clearFolderDropTargets();
+      folderBody.classList.add("is-drop-target");
+    });
+
+    folderBody.addEventListener("dragleave", (event) => {
+      if (event.currentTarget.contains(event.relatedTarget)) {
+        return;
+      }
+      folderBody.classList.remove("is-drop-target");
+    });
+
+    folderBody.addEventListener("drop", async (event) => {
+      const payload = readVariantDragPayload(event);
+      clearFolderDropTargets();
+      if (!payload || payload.sourceLayerId === folderBody.dataset.dropLayerId) {
+        return;
+      }
+
+      event.preventDefault();
+      await withBusy(async () => {
+        const response = await api(
+          `/api/projects/${state.project.id}/layers/${payload.sourceLayerId}/variants/${payload.variantId}/move`,
+          {
+            method: "POST",
+            body: {
+              targetLayerId: folderBody.dataset.dropLayerId
+            }
+          }
+        );
+        await applyProject(response.project);
+        render();
+        showToast(
+          response.moved
+            ? `Moved ${payload.variantName || "layer image"} to ${response.targetLayer?.name || "layer"}.`
+            : `${payload.variantName || "Layer image"} is already in ${response.targetLayer?.name || "that folder"}.`
+        );
+      });
+    });
+  });
+
+  elements.layersPanel.querySelectorAll("[data-action='move-layer-back'], [data-action='move-layer-forward']").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      await withBusy(async () => {
+        const response = await api(`/api/projects/${state.project.id}/layers/${button.dataset.layerId}/move`, {
+          method: "POST",
+          body: {
+            direction: button.dataset.action === "move-layer-forward" ? "forward" : "backward"
+          }
+        });
+        await applyProject(response.project);
+        render();
+        showToast(
+          button.dataset.action === "move-layer-forward"
+            ? "Layer moved forward."
+            : "Layer moved backward."
+        );
+      });
+    });
+  });
+
+  elements.layersPanel.querySelectorAll("[data-action='rename-layer']").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      const currentName = String(button.dataset.layerName || "").trim();
+      const nextName = window.prompt("Rename layer folder", currentName);
+      if (nextName === null) {
+        return;
+      }
+
+      const trimmedName = nextName.trim();
+      if (!trimmedName || trimmedName === currentName) {
+        return;
+      }
+
+      await withBusy(async () => {
+        const response = await api(`/api/projects/${state.project.id}/layers/${button.dataset.layerId}/rename`, {
+          method: "POST",
+          body: {
+            name: trimmedName
+          }
+        });
+        await applyProject(response.project);
+        render();
+        showToast("Layer renamed.");
+      });
+    });
+  });
+
   elements.layersPanel.querySelectorAll("[data-action='select-variant']").forEach((button) => {
     button.addEventListener("click", async () => {
       await withBusy(async () => {
@@ -405,7 +837,7 @@ function bindLayerActions() {
             body: { variantId: button.dataset.variantId }
           }
         );
-        state.project = response.project;
+        await applyProject(response.project);
         render();
       });
     });
@@ -420,7 +852,7 @@ function bindLayerActions() {
             method: "DELETE"
           }
         );
-        state.project = response.project;
+        await applyProject(response.project);
         render();
         showToast("Layer image removed.");
       });
@@ -428,12 +860,15 @@ function bindLayerActions() {
   });
 
   elements.layersPanel.querySelectorAll("[data-action='remove-layer']").forEach((button) => {
-    button.addEventListener("click", async () => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+
       await withBusy(async () => {
         const response = await api(`/api/projects/${state.project.id}/layers/${button.dataset.layerId}`, {
           method: "DELETE"
         });
-        state.project = response.project;
+        await applyProject(response.project);
         render();
         showToast("Layer removed.");
       });
@@ -449,7 +884,7 @@ function bindChatActions() {
           method: "POST",
           body: { layerName: button.dataset.layerName || "" }
         });
-        state.project = response.project;
+        await applyProject(response.project);
         render();
         showToast(`Draft added to ${response.layer?.name || "layer"}.`);
       });
@@ -483,13 +918,26 @@ function getSelectedPreview() {
   return previews.find((item) => item.id === state.project.selectedPreviewId) || previews[0];
 }
 
-function getSelectedVariants() {
+function getSelectedLayerEntries() {
   return (state.project?.layers || [])
-    .map((layer) => layer.variants.find((variant) => variant.id === layer.selectedVariantId))
+    .map((layer, layerIndex) => {
+      const variant = layer.variants.find((item) => item.id === layer.selectedVariantId);
+      return variant
+        ? {
+            ...variant,
+            layerId: layer.id,
+            layerName: layer.name,
+            layerIndex,
+            isBaseLayer: isPrimaryBaseLayerName(layer.name),
+            transform: normalizeClientTransform(layer.transform || variant.transform),
+            analysis: variant.analysis || null
+          }
+        : null;
+    })
     .filter(Boolean);
 }
 
-function buildPreviewStackSources(selectedPreview, selectedVariants) {
+function buildPreviewStackSources(selectedEntries) {
   const seen = new Set();
   const items = [];
 
@@ -508,25 +956,460 @@ function buildPreviewStackSources(selectedPreview, selectedVariants) {
     });
   };
 
-  pushSource({
-    imageUrl: selectedPreview?.imageUrl,
-    name: selectedPreview?.name || state.project?.title || "Preview",
-    createdAt: selectedPreview?.createdAt,
-    id: selectedPreview?.id,
-    className: "stage-image stack-base-preview"
-  });
-
-  for (const variant of selectedVariants) {
+  for (const entry of selectedEntries) {
     pushSource({
-      imageUrl: variant.imageUrl,
-      name: variant.name,
-      createdAt: variant.createdAt,
-      id: variant.id,
+      imageUrl: entry.imageUrl,
+      name: entry.name,
+      createdAt: entry.createdAt,
+      id: entry.id,
       className: "stack-layer"
     });
   }
 
   return items;
+}
+
+function renderStageLayerStack(selectedEntries) {
+  if (!state.dragMode || !selectedEntries.length) {
+    elements.stageLayerStack.className = "stage-layer-stack hidden";
+    elements.stageLayerStack.innerHTML = "";
+    return;
+  }
+
+  const orderedEntries = [...selectedEntries].sort((left, right) => left.layerIndex - right.layerIndex);
+  elements.stageLayerStack.className = `stage-layer-stack is-active${state.busy ? " is-disabled" : ""}`;
+  elements.stageLayerStack.innerHTML = orderedEntries
+    .map((entry) => {
+      const transform = getEntryDisplayTransform(entry);
+      const layout = computeStageLayerLayout(entry, transform);
+      const active = state.dragState?.layerId === entry.layerId && state.dragState?.variantId === entry.id;
+      const selected = state.dragSelection?.layerId === entry.layerId && state.dragSelection?.variantId === entry.id;
+      return `
+        <div
+          class="stage-drag-layer ${active ? "is-active" : ""} ${selected ? "is-selected" : ""}"
+          data-layer-id="${entry.layerId}"
+          data-variant-id="${entry.id}"
+          style="left:${formatPercent(layout.leftPercent)}%;top:${formatPercent(layout.topPercent)}%;width:${formatPercent(layout.widthPercent)}%;height:${formatPercent(layout.heightPercent)}%;z-index:${entry.layerIndex + 1};"
+        >
+          <img
+            class="stage-drag-image"
+            src="${buildAssetUrl(entry.imageUrl, entry.createdAt || entry.id || state.project?.updatedAt || "drag")}"
+            alt="${escapeHtml(entry.name || entry.layerName)}"
+            draggable="false"
+          />
+          <div
+            class="stage-drag-hitbox"
+            data-drag-layer-id="${entry.layerId}"
+            data-variant-id="${entry.id}"
+            title="Drag ${escapeHtml(entry.layerName)}"
+            style="left:${formatPercent(layout.hitLeftPercent)}%;top:${formatPercent(layout.hitTopPercent)}%;width:${formatPercent(layout.hitWidthPercent)}%;height:${formatPercent(layout.hitHeightPercent)}%;"
+          >
+            <span class="stage-drag-label">${escapeHtml(entry.layerName)}</span>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+}
+
+function computeStageLayerLayout(entry, transformOverride = null) {
+  const canvas = readCanvasFromState();
+  const transform = normalizeClientTransform(transformOverride || entry.transform);
+  const canvasWidth = Math.max(1, Number(canvas?.width || 1024));
+  const canvasHeight = Math.max(1, Number(canvas?.height || 1024));
+  const imageWidth = Math.max(1, Number(entry.analysis?.width || canvasWidth));
+  const imageHeight = Math.max(1, Number(entry.analysis?.height || canvasHeight));
+  const scaledWidth = imageWidth * transform.scale;
+  const scaledHeight = imageHeight * transform.scale;
+  const left = (canvasWidth - scaledWidth) / 2 + transform.x * canvasWidth;
+  const top = (canvasHeight - scaledHeight) / 2 + transform.y * canvasHeight;
+  const bounds = entry.analysis?.bounds || {
+    left: 0,
+    top: 0,
+    right: imageWidth - 1,
+    bottom: imageHeight - 1
+  };
+  const hitWidth = Math.max(1, Number(bounds.right) - Number(bounds.left) + 1);
+  const hitHeight = Math.max(1, Number(bounds.bottom) - Number(bounds.top) + 1);
+
+  return {
+    leftPercent: (left / canvasWidth) * 100,
+    topPercent: (top / canvasHeight) * 100,
+    widthPercent: (scaledWidth / canvasWidth) * 100,
+    heightPercent: (scaledHeight / canvasHeight) * 100,
+    hitLeftPercent: (Number(bounds.left) / imageWidth) * 100,
+    hitTopPercent: (Number(bounds.top) / imageHeight) * 100,
+    hitWidthPercent: (hitWidth / imageWidth) * 100,
+    hitHeightPercent: (hitHeight / imageHeight) * 100
+  };
+}
+
+function normalizeClientTransform(transform) {
+  return {
+    x: clampClientNumber(transform?.x, 0, -0.45, 0.45),
+    y: clampClientNumber(transform?.y, 0, -0.45, 0.45),
+    scale: clampClientNumber(transform?.scale, 1, 0.15, 1.8),
+    depthMode: String(transform?.depthMode || "").toLowerCase() === "headwear_wrap" ? "headwear_wrap" : "flat",
+    backCutoff: clampClientNumber(transform?.backCutoff, 0.6, 0.2, 0.9),
+    frontStart: clampClientNumber(transform?.frontStart, 0.56, 0.1, 0.95)
+  };
+}
+
+function clampClientNumber(value, fallback, min, max) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+
+  return Math.min(max, Math.max(min, Number(numeric.toFixed(3))));
+}
+
+function formatPercent(value) {
+  return Number(value || 0).toFixed(4);
+}
+
+function createDragTransformKey(layerId) {
+  return `${String(layerId || "").trim()}`;
+}
+
+function getPendingDragRecord(layerId) {
+  return state.pendingDragTransforms[createDragTransformKey(layerId)] || null;
+}
+
+function getPendingDragTransform(layerId) {
+  return getPendingDragRecord(layerId)?.transform || null;
+}
+
+function hasPendingDragTransforms() {
+  return Object.keys(state.pendingDragTransforms).length > 0;
+}
+
+function getEntryDisplayTransform(entry) {
+  if (!entry) {
+    return normalizeClientTransform({});
+  }
+
+  if (state.dragState?.layerId === entry.layerId && state.dragState?.variantId === entry.id) {
+    return normalizeClientTransform(state.dragState.transform);
+  }
+
+  return normalizeClientTransform(getPendingDragTransform(entry.layerId) || entry.transform);
+}
+
+function syncDragSelection(selectedEntries) {
+  if (!state.dragMode || !selectedEntries.length) {
+    state.dragSelection = null;
+    return;
+  }
+
+  const currentSelection = state.dragSelection
+    ? selectedEntries.find(
+        (entry) =>
+          entry.layerId === state.dragSelection.layerId &&
+          entry.id === state.dragSelection.variantId
+      ) || null
+    : null;
+
+  if (currentSelection) {
+    return;
+  }
+
+  const frontmostEntry = [...selectedEntries].sort((left, right) => right.layerIndex - left.layerIndex)[0] || null;
+  state.dragSelection = frontmostEntry
+    ? {
+        layerId: frontmostEntry.layerId,
+        variantId: frontmostEntry.id
+      }
+    : null;
+}
+
+function getActiveDragEntry(selectedEntries = getSelectedLayerEntries()) {
+  if (!state.dragSelection) {
+    return null;
+  }
+
+  return (
+    selectedEntries.find(
+      (entry) =>
+        entry.layerId === state.dragSelection.layerId &&
+        entry.id === state.dragSelection.variantId
+    ) || null
+  );
+}
+
+function getStageEntryByIds(layerId, variantId) {
+  return getSelectedLayerEntries().find(
+    (entry) => entry.layerId === layerId && entry.id === variantId
+  ) || null;
+}
+
+function handleStageLayerPointerDown(event) {
+  if (!state.dragMode || state.busy) {
+    return;
+  }
+
+  const handle = event.target.closest("[data-drag-layer-id]");
+  if (!handle) {
+    return;
+  }
+
+  const layerId = String(handle.dataset.dragLayerId || "").trim();
+  const variantId = String(handle.dataset.variantId || "").trim();
+  const entry = getStageEntryByIds(layerId, variantId);
+  if (!entry) {
+    return;
+  }
+
+  event.preventDefault();
+  state.dragSelection = {
+    layerId,
+    variantId
+  };
+  const captureTarget = handle;
+  if (typeof captureTarget.setPointerCapture === "function") {
+    try {
+      captureTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Ignore pointer capture issues on older browsers.
+    }
+  }
+
+  state.dragState = {
+    pointerId: event.pointerId,
+    layerId,
+    variantId,
+    entry,
+    captureTarget,
+    startClientX: event.clientX,
+    startClientY: event.clientY,
+    startTransform: normalizeClientTransform(getPendingDragTransform(layerId) || entry.transform),
+    transform: normalizeClientTransform(getPendingDragTransform(layerId) || entry.transform),
+    moved: false,
+    saving: false
+  };
+
+  renderStageLayerStack(getSelectedLayerEntries());
+}
+
+function handleStageLayerPointerMove(event) {
+  if (!state.dragState || state.dragState.saving || event.pointerId !== state.dragState.pointerId) {
+    return;
+  }
+
+  event.preventDefault();
+  const stageRect = elements.stage.getBoundingClientRect();
+  const deltaX = (event.clientX - state.dragState.startClientX) / Math.max(1, stageRect.width);
+  const deltaY = (event.clientY - state.dragState.startClientY) / Math.max(1, stageRect.height);
+  const nextTransform = normalizeClientTransform({
+    ...state.dragState.startTransform,
+    x: state.dragState.startTransform.x + deltaX,
+    y: state.dragState.startTransform.y + deltaY
+  });
+
+  state.dragState.transform = nextTransform;
+  state.dragState.moved = state.dragState.moved || Math.abs(deltaX) > 0.002 || Math.abs(deltaY) > 0.002;
+
+  const layerElement = elements.stageLayerStack.querySelector(
+    `[data-layer-id="${state.dragState.layerId}"][data-variant-id="${state.dragState.variantId}"]`
+  );
+  if (layerElement) {
+    const layout = computeStageLayerLayout(state.dragState.entry, nextTransform);
+    layerElement.style.left = `${formatPercent(layout.leftPercent)}%`;
+    layerElement.style.top = `${formatPercent(layout.topPercent)}%`;
+    layerElement.style.width = `${formatPercent(layout.widthPercent)}%`;
+    layerElement.style.height = `${formatPercent(layout.heightPercent)}%`;
+  }
+}
+
+function handleStageLayerPointerUp(event) {
+  if (!state.dragState || state.dragState.saving || event.pointerId !== state.dragState.pointerId) {
+    return;
+  }
+
+  const dragState = state.dragState;
+  if (typeof dragState.captureTarget?.releasePointerCapture === "function") {
+    try {
+      dragState.captureTarget.releasePointerCapture(dragState.pointerId);
+    } catch {
+      // Ignore pointer release issues on older browsers.
+    }
+  }
+
+  if (!dragState.moved) {
+    cancelStageDrag();
+    render();
+    return;
+  }
+
+  stageDraggedLayerTransform(dragState);
+}
+
+function cancelStageDrag() {
+  if (typeof state.dragState?.captureTarget?.releasePointerCapture === "function") {
+    try {
+      state.dragState.captureTarget.releasePointerCapture(state.dragState.pointerId);
+    } catch {
+      // Ignore pointer release issues on older browsers.
+    }
+  }
+  state.dragState = null;
+}
+
+function stageDraggedLayerTransform(dragState) {
+  const key = createDragTransformKey(dragState.layerId);
+  state.pendingDragTransforms[key] = {
+    layerId: dragState.layerId,
+    variantId: dragState.variantId,
+    transform: normalizeClientTransform(dragState.transform)
+  };
+  state.dragSelection = {
+    layerId: dragState.layerId,
+    variantId: dragState.variantId
+  };
+  state.dragState = null;
+  render();
+  showToast(`Move staged for ${dragState.entry.layerName}. Click Save Drag.`);
+}
+
+function adjustSelectedLayerScale(delta) {
+  if (!state.dragMode || state.busy) {
+    return;
+  }
+
+  const selectedEntries = getSelectedLayerEntries();
+  syncDragSelection(selectedEntries);
+  const activeEntry = getActiveDragEntry(selectedEntries);
+  if (!activeEntry) {
+    showToast("Select a layer on the canvas first.", true);
+    return;
+  }
+
+  const currentTransform = getEntryDisplayTransform(activeEntry);
+  const nextTransform = normalizeClientTransform({
+    ...currentTransform,
+    scale: currentTransform.scale + delta
+  });
+
+  const key = createDragTransformKey(activeEntry.layerId);
+  state.pendingDragTransforms[key] = {
+    layerId: activeEntry.layerId,
+    variantId: activeEntry.id,
+    transform: nextTransform
+  };
+  state.dragSelection = {
+    layerId: activeEntry.layerId,
+    variantId: activeEntry.id
+  };
+  render();
+}
+
+function handleDragModeKeyDown(event) {
+  if (!state.dragMode || state.busy) {
+    return;
+  }
+
+  if (isTypingTarget(event.target)) {
+    return;
+  }
+
+  const key = String(event.key || "");
+  const isArrowKey =
+    key === "ArrowUp" || key === "ArrowDown" || key === "ArrowLeft" || key === "ArrowRight";
+  if (!isArrowKey) {
+    return;
+  }
+
+  const stepPixels = event.shiftKey ? 10 : 2;
+  const canvas = readCanvasFromState();
+  const stepX = stepPixels / Math.max(1, Number(canvas?.width || 1024));
+  const stepY = stepPixels / Math.max(1, Number(canvas?.height || 1024));
+
+  let deltaX = 0;
+  let deltaY = 0;
+  if (key === "ArrowLeft") {
+    deltaX = -stepX;
+  } else if (key === "ArrowRight") {
+    deltaX = stepX;
+  } else if (key === "ArrowUp") {
+    deltaY = -stepY;
+  } else if (key === "ArrowDown") {
+    deltaY = stepY;
+  }
+
+  const moved = nudgeSelectedLayer(deltaX, deltaY);
+  if (!moved) {
+    return;
+  }
+
+  event.preventDefault();
+}
+
+function nudgeSelectedLayer(deltaX, deltaY) {
+  const selectedEntries = getSelectedLayerEntries();
+  syncDragSelection(selectedEntries);
+  const activeEntry = getActiveDragEntry(selectedEntries);
+  if (!activeEntry) {
+    return false;
+  }
+
+  const currentTransform = getEntryDisplayTransform(activeEntry);
+  const nextTransform = normalizeClientTransform({
+    ...currentTransform,
+    x: currentTransform.x + deltaX,
+    y: currentTransform.y + deltaY
+  });
+
+  const key = createDragTransformKey(activeEntry.layerId);
+  state.pendingDragTransforms[key] = {
+    layerId: activeEntry.layerId,
+    variantId: activeEntry.id,
+    transform: nextTransform
+  };
+  state.dragSelection = {
+    layerId: activeEntry.layerId,
+    variantId: activeEntry.id
+  };
+  render();
+  return true;
+}
+
+async function savePendingDragTransforms() {
+  const pendingItems = Object.values(state.pendingDragTransforms || {});
+  if (!state.project?.id) {
+    showToast("Generate something first.", true);
+    return;
+  }
+
+  if (!pendingItems.length) {
+    showToast("Drag a layer first.", true);
+    return;
+  }
+
+  let latestProject = state.project;
+  let savedCount = 0;
+  let completed = false;
+
+  await withBusy(async () => {
+    for (const item of pendingItems) {
+      const response = await api(`/api/projects/${state.project.id}/layers/${item.layerId}/transform`, {
+        method: "POST",
+        body: {
+          variantId: item.variantId,
+          transform: item.transform
+        }
+      });
+      latestProject = response.project;
+      savedCount += 1;
+    }
+
+    await applyProject(latestProject);
+    render();
+    completed = true;
+  });
+
+  if (completed && savedCount) {
+    showToast(savedCount === 1 ? "Layer move saved." : `${savedCount} layer moves saved.`);
+  }
 }
 
 function resolvePromptForSubmit(options = {}) {
@@ -546,6 +1429,26 @@ function resolvePromptForSubmit(options = {}) {
   return String(latestUserMessage?.text || "").trim();
 }
 
+function extractImageFilesFromClipboard(clipboardData) {
+  if (!clipboardData) {
+    return [];
+  }
+
+  const items = Array.from(clipboardData.items || []);
+  const files = items
+    .filter((item) => item.kind === "file" && String(item.type || "").startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+
+  if (files.length) {
+    return files;
+  }
+
+  return Array.from(clipboardData.files || []).filter((file) =>
+    String(file?.type || "").startsWith("image/")
+  );
+}
+
 async function withBusy(work) {
   state.busy = true;
   syncBusyState();
@@ -559,11 +1462,44 @@ async function withBusy(work) {
   }
 }
 
+async function applyProject(project) {
+  state.project = project;
+  state.fitDebugData = null;
+  state.dragState = null;
+  state.pendingDragTransforms = {};
+  state.folderDrag = null;
+  hydrateCanvasFromProject();
+  if (state.fitDebugVisible && state.project?.id) {
+    await loadFitDebug();
+  }
+}
+
+async function loadFitDebug() {
+  if (!state.project?.id) {
+    state.fitDebugData = null;
+    return;
+  }
+
+  state.fitDebugLoading = true;
+  renderFitDebug();
+  try {
+    const response = await api(`/api/projects/${state.project.id}/fit-debug`);
+    state.fitDebugData = response;
+  } catch (error) {
+    state.fitDebugData = null;
+    showToast(error.message || "Could not load fit debug.", true);
+  } finally {
+    state.fitDebugLoading = false;
+    renderFitDebug();
+  }
+}
+
 function syncBusyState() {
   document.querySelectorAll("button").forEach((button) => {
     button.disabled = state.busy;
   });
   elements.loadingRail.classList.toggle("is-active", state.busy);
+  elements.stageLayerStack.classList.toggle("is-disabled", state.busy);
 }
 
 async function api(url, options = {}) {
@@ -600,6 +1536,22 @@ function formatCanvas(canvas) {
   return `${Number(canvas?.width || 1024)} x ${Number(canvas?.height || 1024)}`;
 }
 
+function slugify(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "draw-tech";
+}
+
+function summarizeDisplayText(value, maxLength = 140) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
 function buildAssetUrl(url, cacheKey = "") {
   const cleanUrl = String(url || "").trim();
   if (!cleanUrl) {
@@ -610,13 +1562,30 @@ function buildAssetUrl(url, cacheKey = "") {
   return `${cleanUrl}${separator}v=${encodeURIComponent(String(cacheKey || "static"))}`;
 }
 
+function isTypingTarget(target) {
+  if (!target || !(target instanceof Element)) {
+    return false;
+  }
+
+  const tagName = String(target.tagName || "").toLowerCase();
+  return (
+    tagName === "input" ||
+    tagName === "textarea" ||
+    tagName === "select" ||
+    Boolean(target.closest('input, textarea, select, [contenteditable="true"]'))
+  );
+}
+
 function syncPreviewStatus() {
-  const hasPreview = buildPreviewStackSources(getSelectedPreview(), getSelectedVariants()).length > 0;
+  const hasPreview = buildPreviewStackSources(getSelectedLayerEntries()).length > 0;
+  const hasInteractivePreview = state.dragMode && getSelectedLayerEntries().length > 0;
   let message = "No preview yet";
   let showStatus = false;
 
   if (!hasPreview) {
     showStatus = true;
+  } else if (hasInteractivePreview) {
+    showStatus = false;
   } else if (!state.previewAsset.loaded && !state.previewAsset.failed) {
     message = "Loading preview...";
     showStatus = true;
@@ -637,3 +1606,8 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 }
+
+function isPrimaryBaseLayerName(layerName) {
+  return /(base|body|character|avatar)/.test(String(layerName || "").toLowerCase());
+}
+

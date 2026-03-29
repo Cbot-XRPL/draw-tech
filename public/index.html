@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=19" />
+    <link rel="stylesheet" href="/styles.css?v=33" />
   </head>
   <body>
     <div class="app-shell">
@@ -83,6 +83,18 @@
               <h2 id="projectTitle">New Session</h2>
             </div>
             <div class="preview-head-actions">
+              <button id="toggleFitDebugBtn" class="btn btn-ghost btn-fit-debug" type="button">Fit Debug</button>
+              <button id="toggleDragModeBtn" class="btn btn-ghost btn-drag-mode" type="button">Drag Layers</button>
+              <button id="saveDragBtn" class="btn btn-primary hidden" type="button">Save Drag</button>
+              <div id="dragScaleControls" class="drag-scale-controls hidden">
+                <button id="dragScaleDownBtn" class="btn btn-ghost btn-scale" type="button" aria-label="Make selected layer smaller">
+                  -
+                </button>
+                <span id="dragScaleReadout" class="badge drag-scale-readout">Scale 100%</span>
+                <button id="dragScaleUpBtn" class="btn btn-ghost btn-scale" type="button" aria-label="Make selected layer bigger">
+                  +
+                </button>
+              </div>
               <button id="refreshPreviewBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Run prompt again">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path
@@ -110,6 +122,7 @@
           <div class="stage-wrap">
             <div id="stage" class="stage">
               <img id="previewImage" class="preview-stage-image hidden" alt="NFT preview" />
+              <div id="stageLayerStack" class="stage-layer-stack hidden" aria-hidden="true"></div>
               <div id="stageEmpty" class="stage-empty">No preview yet</div>
             </div>
           </div>
@@ -128,6 +141,18 @@
         </article>
       </section>
 
+      <section id="fitDebugPanel" class="panel fit-debug-panel hidden">
+        <div class="fit-debug-head">
+          <div>
+            <p class="eyebrow">Hidden Debug</p>
+            <h2>Layer Fit Inspector</h2>
+          </div>
+          <button id="downloadFitDebugBtn" class="btn btn-ghost" type="button">Download JSON</button>
+        </div>
+        <div id="fitDebugSummary" class="fit-debug-summary"></div>
+        <div id="fitDebugContent" class="fit-debug-grid"></div>
+      </section>
+
       <section class="panel layers-panel-shell">
         <div class="panel-head">
           <div>
@@ -142,7 +167,7 @@
       </section>
 
       <div id="toast" class="toast hidden"></div>
-      <script type="module" src="/app.js?v=19"></script>
+      <script type="module" src="/app.js?v=33"></script>
     </div>
   </body>
 </html>

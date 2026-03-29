@@ -6,6 +6,7 @@ export function createOpenAIService() {
     createPreviewPlan,
     createLayerVariantPlan,
     generateImageAsset,
+    editImageAsset,
     refreshStudioMemory,
     refreshStudioBrain
   };
@@ -16,16 +17,25 @@ async function routeUserPrompt(apiKey, project, memory, brain, toolManifest, pro
     "You route a user's NFT-building request inside a layer-based art app.",
     "Return JSON only.",
     "Keys: actionType, assistantReply, title, targetLayerName, variantNameHint, variantDirection, removalTarget, canvasWidth, canvasHeight.",
-    "Valid actionType values: preview, draft_variant, commit_draft, edit_layer_variant, feedback, remove_variant, remove_layer, update_canvas, noop.",
+    "Valid actionType values: preview, draft_variant, commit_draft, edit_layer_variant, transform_layer_variant, feedback, remove_variant, remove_layer, update_canvas, noop.",
     "Use preview when the user is describing a new scene, new collection direction, or wants to see a new overall image.",
     "Use draft_variant when the user asks to draw a trait, object, or isolated asset for review before it goes into a layer folder.",
+    "If the user asks for a new or another trait like a new crown, new hat, new glasses, new prop, or any fresh asset concept, keep it separate from editing the existing layers by using draft_variant.",
+    "Do not edit, replace, overwrite, or reuse an existing layer just because the trait family already exists.",
+    "If the user says to leave the old layer alone, keep the old one too, make a separate layer, or not replace the current layer, that must stay draft_variant even if they also ask for the new trait to fit nicely on the base asset.",
+    "A draft_variant may still target an existing semantic folder as the suggested destination for later commit; that does not mean editing that layer.",
     "Use commit_draft when the user is approving a recent draft and wants it added to a folder or layer.",
-    "Use edit_layer_variant when the user wants an existing layer image revised, such as removing a feature from the cat base so it only appears in its own layer.",
+    "Use edit_layer_variant when the user wants an existing layer image revised, such as removing a feature from the base/body layer so it only appears in its own trait layer, or reworking a trait so it fits correctly on the anchor character.",
+    "For edit_layer_variant, preserve the exact source image composition and change only the requested feature unless the user explicitly asks for a redraw.",
+    "Use transform_layer_variant when the user wants an existing layer asset moved, scaled, centered, lowered, raised, or fit better on the stack without redrawing the image.",
+    "Only use edit_layer_variant or transform_layer_variant when the user explicitly asks to revise, modify, move, fit, transform, update, replace, or put something back into an existing layer or folder.",
     "Use feedback when the user is telling you what they liked, disliked, or want remembered about prior generations or layer behavior.",
     "Use remove_variant or remove_layer only when the user clearly asks to delete.",
     "You can use recent chat history and recent generated images to resolve references like it, that, the cat from earlier, the last preview, or the one in chat.",
     "assistantReply should be one short sentence for the visible chat log.",
     "If targetLayerName is obvious, fill it in with a human-friendly layer name.",
+    "For draft_variant, use variantNameHint to capture the specific fresh trait the user asked for.",
+    "If an existing semantic folder clearly fits the draft, such as crowns or hats mapping to Headwear, prefer that folder name as targetLayerName unless the user explicitly asks for a separate folder or its own layer.",
     "variantDirection should capture the requested visual change in a short art-director style phrase.",
     "If the user is only changing the canvas, use update_canvas.",
     "Do not include markdown."
@@ -97,6 +107,9 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory, bra
     "Each prompt must describe exactly one isolated visual asset for the requested layer only.",
     "Every prompt must explicitly require a transparent background, no extra objects, no scene, no border, no text, and consistent style.",
     "Keep the prompts stack-friendly so they align with other layers in a layered NFT.",
+    "Always consider the active stack before proposing a new layer asset.",
+    "If the project has a centered base/body/character layer selected, treat that as the anchor construct that the new layer must fit around.",
+    "Trait assets like headwear, eyewear, neckwear, outfits, and accessories should be sized and composed to fit the active base construct immediately instead of assuming a blank canvas.",
     "Make each new variant meaningfully different from earlier ones instead of tiny color drift."
   ].join("\n");
 
@@ -117,6 +130,8 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory, bra
       variantIdeas: layer.variantIdeas,
       currentVariantNames: Array.isArray(layer.variants) ? layer.variants.map((item) => cleanText(item.name)) : []
     },
+    activeConstruct: buildActiveConstructPayload(project),
+    targetLayerGuidance: buildLayerFitGuidance(project, layer),
     references: buildAttachmentPayload(attachments),
     count
   };
@@ -235,12 +250,16 @@ async function refreshStudioBrain(apiKey, project, memory, brain, toolManifest, 
 }
 
 function buildTransparentPrompt({ project, layer, promptText }) {
+  const activeConstruct = buildActiveConstructSummary(project);
+  const layerFitGuidance = buildLayerFitPromptGuidance(project, layer);
   const fragments = [
     promptText,
     `Collection title: ${project.title}.`,
     project.styleGuide ? `Style guide: ${project.styleGuide}.` : "",
     `Layer name: ${layer.name}.`,
     layer.placementNotes ? `Placement notes: ${layer.placementNotes}.` : "",
+    activeConstruct,
+    layerFitGuidance,
     "Output a single isolated asset only.",
     "Transparent background.",
     "No mockup, no scene, no body parts from other layers, no labels, no watermark.",
@@ -303,9 +322,106 @@ function buildProjectPayload(project) {
       description: layer.description,
       placementNotes: layer.placementNotes,
       variantIdeas: layer.variantIdeas,
-      variantCount: Array.isArray(layer.variants) ? layer.variants.length : 0
+      variantCount: Array.isArray(layer.variants) ? layer.variants.length : 0,
+      selectedVariant: Array.isArray(layer.variants)
+        ? (() => {
+            const variant = layer.variants.find((item) => item.id === layer.selectedVariantId);
+            return variant
+              ? {
+                  id: cleanText(variant.id),
+                  name: cleanText(variant.name),
+                  notes: cleanText(variant.notes),
+                  prompt: cleanText(variant.prompt)
+                }
+              : null;
+          })()
+        : null
     }))
   };
+}
+
+function buildActiveConstructPayload(project) {
+  const anchor = getActiveAnchorLayer(project);
+  if (!anchor?.variant) {
+    return null;
+  }
+
+  return {
+    layerName: cleanText(anchor.layer.name),
+    variantName: cleanText(anchor.variant.name),
+    notes: cleanText(anchor.variant.notes),
+    prompt: cleanText(anchor.variant.prompt)
+  };
+}
+
+function buildActiveConstructSummary(project) {
+  const anchor = getActiveAnchorLayer(project);
+  if (!anchor?.variant) {
+    return "";
+  }
+
+  return `Active construct anchor: use the selected ${anchor.layer.name} layer named ${anchor.variant.name} as the central construct that this asset must fit around.`;
+}
+
+function buildLayerFitPromptGuidance(project, layer) {
+  const lowered = cleanText(layer?.name).toLowerCase();
+  const anchor = getActiveAnchorLayer(project);
+  const anchorLabel = anchor?.layer?.name ? anchor.layer.name : "the active base construct";
+
+  if (/headwear|hat|crown|tiara/.test(lowered)) {
+    return `Fit this headwear to ${anchorLabel}: keep it centered in the upper anchor region, readable at thumbnail size, and proportioned so it sits on the character instead of floating above a blank canvas.`;
+  }
+
+  if (/eyes|eyewear|glasses|shades/.test(lowered)) {
+    return `Fit this eyewear to ${anchorLabel}: keep it centered over the eye line, sized to the visible face width instead of the full canvas, and never redraw extra face or head content into the trait.`;
+  }
+
+  if (/neckwear|necklace|chain|scarf|bow/.test(lowered)) {
+    return `Fit this neckwear to ${anchorLabel}: keep it centered around the neck/chest area with clean stack-safe spacing.`;
+  }
+
+  if (/handheld|weapon|sword|staff|wand|gun|tool|prop|item|orb|flower|cane|bat|microphone/.test(lowered)) {
+    return `Fit this handheld trait to ${anchorLabel}: size it for the active construct and place it so it reads as being held by the visible hand, paw, arm, or grip area instead of floating beside the body.`;
+  }
+
+  if (/outfit|shirt|hoodie|jacket|body/.test(lowered)) {
+    return `Fit this body-related layer to ${anchorLabel}: preserve the active character proportions and keep the silhouette aligned to the torso area.`;
+  }
+
+  if (/background/.test(lowered)) {
+    return `Treat ${anchorLabel} as the foreground subject and design this background layer to support it without overlapping or cutting into the character silhouette.`;
+  }
+
+  return anchor ? `Fit this ${layer.name} asset so it stacks cleanly around ${anchorLabel} without redrawing the anchor layer.` : "";
+}
+
+function buildLayerFitGuidance(project, layer) {
+  return {
+    activeConstructSummary: buildActiveConstructSummary(project),
+    placementGuidance: buildLayerFitPromptGuidance(project, layer)
+  };
+}
+
+function getActiveAnchorLayer(project) {
+  const layers = Array.isArray(project?.layers) ? project.layers : [];
+  const candidates = [
+    layers.find((layer) => isAnchorLayerName(layer.name)),
+    ...layers.filter((layer) => !isAnchorLayerName(layer.name))
+  ].filter(Boolean);
+
+  for (const layer of candidates) {
+    const variants = Array.isArray(layer.variants) ? layer.variants : [];
+    const variant = variants.find((item) => item.id === layer.selectedVariantId) || variants[0] || null;
+    if (variant?.imageUrl || variant?.prompt || variant?.name) {
+      return { layer, variant };
+    }
+  }
+
+  return null;
+}
+
+function isAnchorLayerName(layerName) {
+  return /(base|body|character|avatar|cat)/.test(cleanText(layerName).toLowerCase());
 }
 
 function buildStudioPayload(memory, brain, toolManifest) {
@@ -371,7 +487,8 @@ function buildToolManifestPayload(toolManifest) {
         name: cleanText(toolManifest.name),
         systemGuidance: cleanText(toolManifest.systemGuidance),
         packages: Array.isArray(toolManifest.packages) ? toolManifest.packages : [],
-        capabilities: Array.isArray(toolManifest.capabilities) ? toolManifest.capabilities : []
+        capabilities: Array.isArray(toolManifest.capabilities) ? toolManifest.capabilities : [],
+        fitProfiles: Array.isArray(toolManifest.fitProfiles) ? toolManifest.fitProfiles : []
       }
     : null;
 }
@@ -463,6 +580,58 @@ async function generateImageAsset({ apiKey, prompt, size, background }) {
   const image = Array.isArray(data?.data) ? data.data[0] : null;
   if (!image?.b64_json) {
     const error = new Error("The image API did not return base64 image data.");
+    error.status = 502;
+    throw error;
+  }
+
+  return {
+    buffer: Buffer.from(image.b64_json, "base64")
+  };
+}
+
+async function editImageAsset({ apiKey, prompt, images, background = "transparent", inputFidelity = "high" }) {
+  const references = Array.isArray(images)
+    ? images
+        .map((imageUrl) => cleanText(imageUrl))
+        .filter(Boolean)
+        .slice(0, 16)
+        .map((imageUrl) => ({ image_url: imageUrl }))
+    : [];
+
+  if (!references.length) {
+    const error = new Error("Image edit requires at least one source image.");
+    error.status = 400;
+    throw error;
+  }
+
+  const response = await fetch("https://api.openai.com/v1/images/edits", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: "gpt-image-1.5",
+      images: references,
+      prompt,
+      background,
+      input_fidelity: inputFidelity,
+      output_format: "png",
+      moderation: "low"
+    })
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    const message = data?.error?.message || "Image edit failed.";
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
+  }
+
+  const image = Array.isArray(data?.data) ? data.data[0] : null;
+  if (!image?.b64_json) {
+    const error = new Error("The image edit API did not return base64 image data.");
     error.status = 502;
     throw error;
   }
