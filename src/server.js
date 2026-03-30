@@ -44,7 +44,8 @@ const DURABLE_STUDIO_QUALITY_RULES = [
   "When the preview is shown in the app, prefer one backend-composited preview image over multiple competing client-side render paths.",
   "A layer should only appear on preview when its checkbox-style toggle is actively selected.",
   "When simplifying the preview UI, keep frontend DOM ids and frontend render code in sync so stale references do not break painting.",
-  "When editing an existing layer image, preserve the source drawing and change only the requested feature unless the user explicitly asks for a redraw."
+  "When editing an existing layer image, preserve the source drawing and change only the requested feature unless the user explicitly asks for a redraw.",
+  "Every synced layer folder should keep one approved family fit contract so swapping variants preserves the same seat, overlap, clipping, and stack quality."
 ];
 
 const DURABLE_STUDIO_LESSONS = [
@@ -71,6 +72,12 @@ const DURABLE_STUDIO_LESSONS = [
     detail:
       "When the user asks to remove or tweak one feature on an existing layer image, use the current selected asset as the source and preserve the pose, style, proportions, and composition instead of redrawing the whole character.",
     tags: ["editing", "layers", "consistency", "source-preservation"]
+  },
+  {
+    title: "Folder variants need one shared fit contract",
+    detail:
+      "When one crown, glasses, or other synced trait sits correctly, capture that seat, overlap, and clipping pattern as the family contract for the whole folder so future variants stay interchangeable.",
+    tags: ["layers", "fit", "consistency", "variants", "stacking"]
   }
 ];
 
@@ -243,6 +250,7 @@ app.post("/api/chat", async (req, res, next) => {
 
     project.chatHistory = Array.isArray(project.chatHistory) ? project.chatHistory : [];
     project.draftHistory = Array.isArray(project.draftHistory) ? project.draftHistory : [];
+    hydrateProjectLayerFitContracts(project);
     const contextualAttachments = await extendAttachmentsWithChatContext(project, promptText, attachments);
     let memory = await studioMemoryService.getMemory(project);
     const brain = await studioBrainService.getBrain();
@@ -393,6 +401,26 @@ app.post("/api/chat", async (req, res, next) => {
         forcedLayerTransform || resolveLayerTransformTarget(project, promptText, route);
       if (!transformTarget) {
         assistantReply = "I could not figure out which layer transform to update.";
+      } else if (
+        (!Array.isArray(transformTarget.layer?.variants) || transformTarget.layer.variants.length === 0) &&
+        shouldForceFreshTraitDraft(project, promptText, {
+          ...route,
+          targetLayerName: transformTarget.layer.name,
+          actionType: "draft_variant"
+        })
+      ) {
+        const draftResult = await generateDraftForProject(project, apiKey, {
+          promptText,
+          targetLayerName: transformTarget.layer.name,
+          extraDirection: route.variantDirection,
+          attachments: contextualAttachments
+        });
+        project = draftResult.project;
+        memory = draftResult.memory;
+        assistantGenerated = toAssistantGeneratedImage(draftResult.draft);
+        assistantReply =
+          route.assistantReply ||
+          `I'll draft a new ${transformTarget.layer.name} asset for review instead of trying to reposition an empty layer.`;
       } else {
         const cleanRestoreRequest = shouldRestoreAccessoryLayerFromCleanSource(
           transformTarget.layer,
@@ -453,6 +481,26 @@ app.post("/api/chat", async (req, res, next) => {
         forcedLayerEdit || resolveLayerEditTarget(project, promptText, route);
       if (!editTarget) {
         assistantReply = "I could not figure out which layer image to revise.";
+      } else if (
+        (!Array.isArray(editTarget.layer?.variants) || editTarget.layer.variants.length === 0) &&
+        shouldForceFreshTraitDraft(project, promptText, {
+          ...route,
+          targetLayerName: editTarget.layer.name,
+          actionType: "draft_variant"
+        })
+      ) {
+        const draftResult = await generateDraftForProject(project, apiKey, {
+          promptText,
+          targetLayerName: editTarget.layer.name,
+          extraDirection: route.variantDirection,
+          attachments: contextualAttachments
+        });
+        project = draftResult.project;
+        memory = draftResult.memory;
+        assistantGenerated = toAssistantGeneratedImage(draftResult.draft);
+        assistantReply =
+          route.assistantReply ||
+          `I'll draft a new ${editTarget.layer.name} asset for review instead of trying to revise an empty layer.`;
       } else {
         const cleanRestoreRequest = shouldRestoreAccessoryLayerFromCleanSource(
           editTarget.layer,
@@ -720,6 +768,7 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
     const apiKey = getApiKey();
     const count = clampVariantCount(req.body?.count);
     const project = await projectService.readProject(req.params.projectId);
+    hydrateProjectLayerFitContracts(project);
     const layer = project.layers.find((item) => item.id === req.params.layerId);
     let memory = await studioMemoryService.getMemory(project);
 
@@ -954,6 +1003,9 @@ app.post("/api/projects/:projectId/layers/:layerId/transform", async (req, res, 
     const nextTransform = mergeLayerTransform(currentTransform, patch);
     applyPlacementTransformForVariant(layer, variant, nextTransform, useVariantTransform ? "custom" : "sync");
     layer.selectedVariantId = variant.id;
+    if (!useVariantTransform) {
+      refreshLayerFitContract(project, layer, variant, { force: true });
+    }
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
     const memory = await studioMemoryService.appendChangelog(project, {
@@ -1010,6 +1062,36 @@ app.post("/api/projects/:projectId/layers/:layerId/move", async (req, res, next)
       detail: `Layer stack position changed to ${targetIndex + 1} of ${project.layers.length}.`
     });
     res.json({ project, memory, moved: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/layers", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const nextName = cleanText(req.body?.name);
+
+    if (!nextName) {
+      res.status(400).json({ error: "Layer name is required." });
+      return;
+    }
+
+    const duplicate = project.layers.find((item) => slugify(item.name) === slugify(nextName));
+    if (duplicate) {
+      res.status(409).json({ error: `A layer named ${duplicate.name} already exists.` });
+      return;
+    }
+
+    const layer = createEmptyLayer(project, nextName);
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    const memory = await studioMemoryService.appendChangelog(project, {
+      type: "create-layer",
+      title: `Created ${layer.name}`,
+      detail: "Added a new empty layer folder from the app."
+    });
+    res.status(201).json({ project, memory, layer });
   } catch (error) {
     next(error);
   }
@@ -1323,6 +1405,10 @@ function loadLayerFitProfiles() {
           guidance: cleanText(profile?.guidance),
           defaultTransform: profile?.defaultTransform || null,
           anchorWidthRatio: coerceProfileNumber(profile?.anchorWidthRatio, null),
+          anchorHeightRatio: coerceProfileNumber(profile?.anchorHeightRatio, null),
+          anchorCenterXOffsetRatio: coerceProfileNumber(profile?.anchorCenterXOffsetRatio, null),
+          anchorCenterYRatio: coerceProfileNumber(profile?.anchorCenterYRatio, null),
+          anchorTopRatio: coerceProfileNumber(profile?.anchorTopRatio, null),
           anchorBottomRatio: coerceProfileNumber(profile?.anchorBottomRatio, null),
           frontStart: coerceProfileNumber(profile?.frontStart, null),
           backCutoff: coerceProfileNumber(profile?.backCutoff, null)
@@ -1334,6 +1420,48 @@ function loadLayerFitProfiles() {
 function coerceProfileNumber(value, fallback) {
   const numeric = Number(value);
   return Number.isFinite(numeric) ? numeric : fallback;
+}
+
+function normalizeLayerFitContract(contract) {
+  if (!contract || typeof contract !== "object") {
+    return null;
+  }
+
+  const normalized = {
+    profileId: cleanText(contract.profileId),
+    profileLabel: cleanText(contract.profileLabel),
+    scope: cleanText(contract.scope) || "anchor",
+    anchorLayerId: cleanText(contract.anchorLayerId),
+    anchorLayerName: cleanText(contract.anchorLayerName),
+    anchorVariantId: cleanText(contract.anchorVariantId),
+    anchorVariantName: cleanText(contract.anchorVariantName),
+    referenceVariantId: cleanText(contract.referenceVariantId),
+    referenceVariantName: cleanText(contract.referenceVariantName),
+    targetWidthRatio: coerceProfileNumber(contract.targetWidthRatio, null),
+    targetHeightRatio: coerceProfileNumber(contract.targetHeightRatio, null),
+    targetCenterXOffsetRatio: coerceProfileNumber(contract.targetCenterXOffsetRatio, null),
+    targetCenterYRatio: coerceProfileNumber(contract.targetCenterYRatio, null),
+    targetTopRatio: coerceProfileNumber(contract.targetTopRatio, null),
+    targetBottomRatio: coerceProfileNumber(contract.targetBottomRatio, null),
+    canvasWidthRatio: coerceProfileNumber(contract.canvasWidthRatio, null),
+    canvasHeightRatio: coerceProfileNumber(contract.canvasHeightRatio, null),
+    canvasCenterXRatio: coerceProfileNumber(contract.canvasCenterXRatio, null),
+    canvasCenterYRatio: coerceProfileNumber(contract.canvasCenterYRatio, null),
+    canvasTopRatio: coerceProfileNumber(contract.canvasTopRatio, null),
+    canvasBottomRatio: coerceProfileNumber(contract.canvasBottomRatio, null),
+    depthMode: cleanText(contract.depthMode),
+    clipStrategy: cleanText(contract.clipStrategy),
+    backCutoff: coerceProfileNumber(contract.backCutoff, null),
+    frontStart: coerceProfileNumber(contract.frontStart, null),
+    summary: cleanText(contract.summary),
+    updatedAt: cleanText(contract.updatedAt)
+  };
+
+  return Object.values(normalized).some((value) => value !== "" && value !== null) ? normalized : null;
+}
+
+function getLayerFitContract(layer) {
+  return normalizeLayerFitContract(layer?.fitContract);
 }
 
 function getLayerFitProfile(layerName) {
@@ -1355,6 +1483,7 @@ function buildFitDebugData(project) {
     const selectedVariant = variants.find((item) => item.id === layer.selectedVariantId) || null;
     const fitProfile = getLayerFitProfile(layer.name);
     const transform = getVariantPlacementTransform(layer, selectedVariant);
+    const fitContract = getLayerFitContract(layer) || buildLayerFitContract(project, layer, selectedVariant);
 
     return {
       id: layer.id,
@@ -1382,7 +1511,8 @@ function buildFitDebugData(project) {
             guidance: fitProfile.guidance,
             defaultTransform: normalizeLayerTransform(fitProfile.defaultTransform || getDefaultTransformForLayer(layer.name))
           }
-        : null
+        : null,
+      fitContract
     };
   });
 
@@ -1510,21 +1640,41 @@ async function generateLayerVariantsForProject(project, layerId, count, apiKey, 
   await fs.mkdir(variantFolder, { recursive: true });
 
   const variants = [];
-  const layerTransform = getLayerPlacementTransform(layer);
+  const existingFitContract = getLayerFitContract(layer);
+  const layerHadCommittedVariants = Array.isArray(layer.variants) && layer.variants.length > 0;
+  let layerTransform = getLayerPlacementTransform(layer);
+  const backgroundMode = isFullCanvasBackgroundLayerName(layer.name) ? "opaque" : "transparent";
   for (const item of plan.variants) {
     const imageAsset = await openaiService.generateImageAsset({
       apiKey,
       prompt: [item.prompt, cleanText(options.extraDirection)].filter(Boolean).join(" "),
       size: project.canvas.generationSize,
-      background: "transparent"
+      background: backgroundMode
     });
 
     const variantId = createId("variant");
     const filename = `${variantId}.png`;
     const absolutePath = path.join(variantFolder, filename);
-    await fs.writeFile(absolutePath, await resizePng(imageAsset.buffer, project.canvas));
+    const normalizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+    const finalBuffer = isFullCanvasBackgroundLayerName(layer.name)
+      ? await ensureOpaqueFullCanvasBackground(normalizedBuffer, item.prompt, project.canvas)
+      : normalizedBuffer;
+    await fs.writeFile(absolutePath, finalBuffer);
     const variantBuffer = await fs.readFile(absolutePath);
     const analysis = await inspectVariantAgainstLayer(layer, variantBuffer);
+    if ((!layerHadCommittedVariants || !existingFitContract) && !variants.length) {
+      const seededTransform =
+        (await buildAnchorAwareLayerTransform(
+          project,
+          layer,
+          {
+            analysis,
+            transform: layerTransform
+          },
+          [item.prompt, item.notes, cleanText(options.extraDirection)].filter(Boolean).join(" ")
+        )) || layerTransform;
+      layerTransform = seededTransform;
+    }
 
     variants.push({
       id: variantId,
@@ -1541,6 +1691,9 @@ async function generateLayerVariantsForProject(project, layerId, count, apiKey, 
 
   layer.variants.push(...variants);
   applyLayerPlacementTransform(layer, layerTransform);
+  if (variants[0]) {
+    refreshLayerFitContract(project, layer, variants[0], { force: !layerHadCommittedVariants || !existingFitContract });
+  }
   if (!layer.selectedVariantId && variants[0]) {
     layer.selectedVariantId = variants[0].id;
   }
@@ -1565,17 +1718,56 @@ async function generateLayerVariantsForProject(project, layerId, count, apiKey, 
 
 async function generateDraftForProject(project, apiKey, options = {}) {
   project.draftHistory = Array.isArray(project.draftHistory) ? project.draftHistory : [];
-  const targetLayerName = cleanText(options.targetLayerName) || "Unsorted";
+  let targetLayerName = cleanText(options.targetLayerName) || "Unsorted";
+  if (isTrueBackgroundPrompt(options.promptText)) {
+    targetLayerName = "Background";
+  } else if (isBackgroundAccentPrompt(options.promptText) && !cleanText(options.targetLayerName)) {
+    targetLayerName = "Background Accent";
+  }
+  const fullCanvasBackground = isFullCanvasBackgroundLayerName(targetLayerName);
+  const backgroundAccent = isBackgroundAccentLayerName(targetLayerName);
+  const existingLayer = findLayer(project, targetLayerName);
+  const ignoreStoredStructuralOverlayContract =
+    cleanText(getLayerFitProfile(targetLayerName)?.id) === "surface-overlay" &&
+    /\b(fit|fits|fitted|attach|attached|align|aligned|seat|seated|sit|sits|overlay|mapped|match|inside|recessed|middle|center(?:ed)?|flush|hinge|safe|vault|door|panel|plate)\b/.test(
+      cleanText(options.promptText).toLowerCase()
+    );
   const draftLayer = {
-    id: `draft-${slugify(targetLayerName) || "layer"}`,
+    id: cleanText(existingLayer?.id) || `draft-${slugify(targetLayerName) || "layer"}`,
     name: targetLayerName,
-    description: cleanText(options.extraDirection) || cleanText(options.promptText),
-    placementNotes: "Single isolated asset for draft review before folder commit.",
-    variantIdeas: [],
-    variants: project.draftHistory
-      .filter((item) => cleanText(item.targetLayerName) === targetLayerName)
-      .map((item) => ({ id: item.id, name: item.name, imageUrl: item.imageUrl }))
+    description: cleanText(existingLayer?.description) || cleanText(options.extraDirection) || cleanText(options.promptText),
+    placementNotes:
+      cleanText(existingLayer?.placementNotes) ||
+      (fullCanvasBackground
+        ? "Full painted background plate that fills the entire canvas behind all other layers."
+        : backgroundAccent
+          ? "Transparent background accent for review before folder commit."
+          : "Single isolated asset for draft review before folder commit."),
+    variantIdeas: Array.isArray(existingLayer?.variantIdeas) ? existingLayer.variantIdeas : [],
+    variants: [
+      ...(Array.isArray(existingLayer?.variants)
+        ? existingLayer.variants.map((item) => ({
+            id: item.id,
+            name: item.name,
+            imageUrl: item.imageUrl,
+            notes: item.notes,
+            prompt: item.prompt
+          }))
+        : []),
+      ...project.draftHistory
+        .filter((item) => cleanText(item.targetLayerName) === targetLayerName)
+        .map((item) => ({ id: item.id, name: item.name, imageUrl: item.imageUrl }))
+    ],
+    selectedVariantId: cleanText(existingLayer?.selectedVariantId) || null,
+    transform: existingLayer?.transform || getDefaultTransformForLayer(targetLayerName),
+    fitContract: ignoreStoredStructuralOverlayContract ? null : existingLayer?.fitContract || null
   };
+  const draftAttachments = await extendDraftAttachmentsWithAnchorReference(
+    project,
+    draftLayer,
+    options.promptText,
+    options.attachments || []
+  );
 
   let memory = await studioMemoryService.getMemory(project);
   const brain = await studioBrainService.getBrain();
@@ -1588,22 +1780,41 @@ async function generateDraftForProject(project, apiKey, options = {}) {
     memory,
     brain,
     toolManifest,
-    options.attachments || []
+    draftAttachments
   );
   const item = plan.variants[0];
-  const imageAsset = await openaiService.generateImageAsset({
-    apiKey,
-    prompt: [item?.prompt, cleanText(options.extraDirection)].filter(Boolean).join(" "),
-    size: project.canvas.generationSize,
-    background: "transparent"
-  });
+  const draftPrompt = [item?.prompt, cleanText(options.extraDirection)].filter(Boolean).join(" ");
+  const referenceImages = Array.isArray(draftAttachments)
+    ? draftAttachments
+        .map((attachment) => cleanText(attachment?.dataUrl))
+        .filter(Boolean)
+        .slice(0, 6)
+    : [];
+  const imageAsset = shouldUseReferenceGuidedDraftRender(options.promptText, targetLayerName, draftAttachments)
+    ? await openaiService.editImageAsset({
+        apiKey,
+        prompt: draftPrompt,
+        images: referenceImages,
+        background: fullCanvasBackground ? "opaque" : "transparent",
+        inputFidelity: "high"
+      })
+    : await openaiService.generateImageAsset({
+        apiKey,
+        prompt: draftPrompt,
+        size: project.canvas.generationSize,
+        background: fullCanvasBackground ? "opaque" : "transparent"
+      });
 
   const draftId = createId("draft");
   const draftFolder = path.join(generatedDir, project.id, "drafts");
   const filename = `${draftId}.png`;
   const absolutePath = path.join(draftFolder, filename);
   await fs.mkdir(draftFolder, { recursive: true });
-  await fs.writeFile(absolutePath, await resizePng(imageAsset.buffer, project.canvas));
+  const normalizedDraftBuffer = await resizePng(imageAsset.buffer, project.canvas);
+  const finalDraftBuffer = fullCanvasBackground
+    ? await ensureOpaqueFullCanvasBackground(normalizedDraftBuffer, item?.prompt || options.promptText, project.canvas)
+    : normalizedDraftBuffer;
+  await fs.writeFile(absolutePath, finalDraftBuffer);
   const draftBuffer = await fs.readFile(absolutePath);
   const analysis = await inspectDraftAgainstHistory(project, draftBuffer);
   const draft = {
@@ -1638,6 +1849,87 @@ async function generateDraftForProject(project, apiKey, options = {}) {
   });
 
   return { project, memory, draft };
+}
+
+function shouldUseReferenceGuidedDraftRender(promptText, targetLayerName, attachments = []) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const items = Array.isArray(attachments) ? attachments : [];
+  const hasReferenceImages = items.some((attachment) => cleanText(attachment?.dataUrl));
+  if (!hasReferenceImages) {
+    return false;
+  }
+
+  const hasSavedProjectReference = items.some((attachment) => cleanText(attachment?.referenceType) === "saved-project");
+  const hasUploadReference = items.some((attachment) => cleanText(attachment?.imageUrl).startsWith("/uploads/"));
+  const hasActiveAnchorReference = items.some((attachment) => cleanText(attachment?.referenceType) === "active-anchor");
+  const explicitReferenceIntent =
+    /\b(?:like|same as|similar to|match(?:ing)?|based on|using|use this|use that|inspired by|looks like)\b/.test(lowered) ||
+    /\bfrom\s+(?:my\s+|the\s+)?[a-z0-9][a-z0-9\s-]{0,40}\s+project\b/.test(lowered);
+  const fullCanvasBackground = isFullCanvasBackgroundLayerName(targetLayerName) || isTrueBackgroundPrompt(lowered);
+  const fitProfileId = cleanText(getLayerFitProfile(targetLayerName)?.id).toLowerCase();
+  const structuralOverlayTarget = fitProfileId === "surface-overlay";
+  const structuralFitIntent =
+    /\b(fit|fits|fitted|attach|attached|align|aligned|seat|seated|sit|sits|overlay|mapped|match|inside|recessed|middle|center(?:ed)?|flush|hinge)\b/.test(
+      lowered
+    ) && mentionsAnchorPlacementArea(lowered);
+
+  return (
+    hasSavedProjectReference ||
+    (fullCanvasBackground && (hasUploadReference || explicitReferenceIntent)) ||
+    ((hasActiveAnchorReference || hasUploadReference || explicitReferenceIntent) &&
+      (structuralOverlayTarget || structuralFitIntent))
+  );
+}
+
+async function extendDraftAttachmentsWithAnchorReference(project, layer, promptText, attachments = []) {
+  const values = dedupeReferenceAttachments(Array.isArray(attachments) ? [...attachments] : []);
+  if (!shouldAttachActiveAnchorToDraft(project, layer, promptText, values)) {
+    return values.slice(0, 6);
+  }
+
+  const excludeUrls = values.map((attachment) => cleanText(attachment?.imageUrl)).filter(Boolean);
+  const anchorReference = await getActiveAnchorReferenceAttachment(project, layer, excludeUrls);
+  if (!anchorReference?.dataUrl) {
+    return values.slice(0, 6);
+  }
+
+  values.push({
+    ...anchorReference,
+    mimeType: "image/png",
+    width: Number(project?.canvas?.width || 0),
+    height: Number(project?.canvas?.height || 0),
+    referenceType: cleanText(anchorReference.referenceType) || "active-anchor",
+    sourceType: cleanText(anchorReference.sourceType) || "active-anchor"
+  });
+
+  return dedupeReferenceAttachments(values).slice(0, 6);
+}
+
+function shouldAttachActiveAnchorToDraft(project, layer, promptText, attachments = []) {
+  const fitProfileId = cleanText(getLayerFitProfile(layer?.name)?.id).toLowerCase();
+  if (!project || !layer || !fitProfileId || fitProfileId === "background" || fitProfileId === "background-accent") {
+    return false;
+  }
+
+  if (!getActiveAnchorLayer(project, layer)) {
+    return false;
+  }
+
+  if ((Array.isArray(attachments) ? attachments : []).some((attachment) => cleanText(attachment?.referenceType) === "active-anchor")) {
+    return false;
+  }
+
+  if (fitProfileId === "surface-overlay") {
+    return true;
+  }
+
+  const lowered = cleanText(promptText).toLowerCase();
+  return (
+    /\b(fit|fits|fitted|attach|attached|align|aligned|seat|seated|sit|sits|overlay|mapped|match|inside|recessed|middle|center(?:ed)?|flush)\b/.test(
+      lowered
+    ) &&
+    mentionsAnchorPlacementArea(lowered)
+  );
 }
 
 async function reviseLayerVariantForProject(project, apiKey, options = {}) {
@@ -1758,6 +2050,7 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
   }
   layer.selectedVariantId = revisedVariant.id;
   applyPlacementTransformForVariant(layer, revisedVariant, revisedTransform, revisedTransformMode);
+  refreshLayerFitContract(project, layer, revisedVariant);
   if (isPrimaryBaseLayerName(layer.name)) {
     project.selectedPreviewId = null;
   }
@@ -1809,6 +2102,9 @@ async function updateLayerVariantTransform(project, layer, options = {}) {
 
   applyPlacementTransformForVariant(layer, variant, nextTransform, useVariantTransform ? "custom" : "sync");
   layer.selectedVariantId = variant.id;
+  if (!useVariantTransform) {
+    refreshLayerFitContract(project, layer, variant, { force: true });
+  }
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
 
@@ -1873,6 +2169,7 @@ async function restoreLayerVariantFromHistory(project, layer, promptText = "") {
       : getLayerPlacementTransform(layer, variant);
   applyPlacementTransformForVariant(layer, variant, variantTransform, variantTransformMode);
   layer.selectedVariantId = variant.id;
+  refreshLayerFitContract(project, layer, variant);
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
 
@@ -2009,6 +2306,7 @@ async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
       existingVariant.transformMode
     );
     layer.selectedVariantId = existingVariant.id;
+    refreshLayerFitContract(project, layer, existingVariant);
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
     let memory = await studioMemoryService.appendChangelog(project, {
@@ -2032,7 +2330,10 @@ async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
     };
   }
 
-  const layerTransform = getLayerPlacementTransform(layer);
+  const layerHadCommittedVariants = layer.variants.length > 0;
+  const existingFitContract = getLayerFitContract(layer);
+  const forceStructuralOverlayReseed = shouldForceStructuralOverlayFitSeed(layer, source);
+  let layerTransform = getLayerPlacementTransform(layer);
   const variant = {
     id: createId("variant"),
     name: cleanText(source.name) || `${layer.name} Variant`,
@@ -2044,10 +2345,24 @@ async function commitGeneratedSourceToLayer(project, source, targetLayerName) {
     transform: layerTransform,
     createdAt: new Date().toISOString()
   };
+  if (!layerHadCommittedVariants || !existingFitContract || forceStructuralOverlayReseed) {
+    const seededTransform =
+      (await buildAnchorAwareLayerTransform(
+        project,
+        layer,
+        variant,
+        [cleanText(source.prompt), cleanText(source.notes), cleanText(source.name)].filter(Boolean).join(" ")
+      )) || layerTransform;
+    layerTransform = seededTransform;
+    variant.transform = seededTransform;
+  }
 
   layer.variants.push(variant);
   applyLayerPlacementTransform(layer, layerTransform);
   layer.selectedVariantId = variant.id;
+  refreshLayerFitContract(project, layer, variant, {
+    force: !layerHadCommittedVariants || !existingFitContract || forceStructuralOverlayReseed
+  });
   if (isPrimaryBaseLayerName(layer.name)) {
     project.selectedPreviewId = null;
   }
@@ -2093,16 +2408,21 @@ function ensureLayer(project, layerName) {
     return existing;
   }
 
+  return createEmptyLayer(project, layerName);
+}
+
+function createEmptyLayer(project, layerName) {
   const normalizedName = cleanText(layerName) || "Layer";
   const layer = {
-    id: `layer-${project.layers.length + 1}-${slugify(normalizedName) || "layer"}`,
+    id: `${createId("layer")}-${slugify(normalizedName) || "layer"}`,
     name: normalizedName,
     description: "",
     placementNotes: "",
     variantIdeas: [],
     variants: [],
     selectedVariantId: null,
-    transform: getDefaultTransformForLayer(normalizedName)
+    transform: getDefaultTransformForLayer(normalizedName),
+    fitContract: null
   };
   project.layers.push(layer);
   return layer;
@@ -2111,19 +2431,32 @@ function ensureLayer(project, layerName) {
 function shouldForceFreshTraitDraft(project, promptText, route = {}) {
   const lowered = cleanText(promptText).toLowerCase();
   const routedAction = cleanText(route.actionType).toLowerCase();
-  const guessedLayerName = cleanText(route.targetLayerName) || guessLayerNameFromPrompt(promptText);
-  const matchingExistingLayer = guessedLayerName ? findLayer(project, guessedLayerName) : null;
+  const explicitPromptLayer = extractLayerLookupFromPrompt(promptText);
+  const explicitPromptTarget =
+    (explicitPromptLayer ? findExactLayer(project, explicitPromptLayer) : null) ||
+    (explicitPromptLayer ? findLayer(project, explicitPromptLayer) : null) ||
+    null;
+  const guessedLayerName = cleanText(route.targetLayerName) || cleanText(explicitPromptTarget?.name) || guessLayerNameFromPrompt(promptText);
+  const matchingExistingLayer = guessedLayerName ? findLayer(project, guessedLayerName) || explicitPromptTarget : explicitPromptTarget;
   const keepExistingIntent = hasKeepExistingTraitIntent(lowered);
   const explicitSeparateFolderIntent = hasExplicitSeparateFolderIntent(lowered);
+  const freshNamedLayerIntent = hasFreshAssetForNamedLayerIntent(lowered);
+  const targetLayerIsEmpty = !Array.isArray(matchingExistingLayer?.variants) || matchingExistingLayer.variants.length === 0;
   const freshCreationIntent =
-    /\b(draw|make|create|generate|design|craft|show|give)\b/.test(lowered) ||
+    /\b(add|draw|make|create|generate|design|craft|show|give|build|draft)\b/.test(lowered) ||
     /\b(new|another|fresh|different)\b/.test(lowered);
 
   if (!freshCreationIntent) {
     return false;
   }
 
-  if (!keepExistingIntent && !explicitSeparateFolderIntent && mentionsExplicitExistingLayerMutation(lowered)) {
+  if (
+    !keepExistingIntent &&
+    !explicitSeparateFolderIntent &&
+    !freshNamedLayerIntent &&
+    !targetLayerIsEmpty &&
+    mentionsExplicitExistingLayerMutation(lowered)
+  ) {
     return false;
   }
 
@@ -2131,7 +2464,7 @@ function shouldForceFreshTraitDraft(project, promptText, route = {}) {
     return false;
   }
 
-  if (keepExistingIntent || explicitSeparateFolderIntent) {
+  if (keepExistingIntent || explicitSeparateFolderIntent || freshNamedLayerIntent) {
     return true;
   }
 
@@ -2151,9 +2484,19 @@ function mentionsExplicitExistingLayerMutation(promptText) {
     /(edit|revise|modify|update|rework|fix|replace|overwrite|restore|revert|put .* back|back into|existing layer|existing folder|current layer|current folder|same layer|same folder|selected layer|selected folder|use the current|go back into)/.test(
       lowered
     ) ||
-    /\b(add|put|save|commit)\b[\s\S]*\b(layer|folder)\b/.test(
+    /\b(?:put|save|commit)\b[\s\S]*\b(layer|folder)\b/.test(
+      lowered
+    ) ||
+    /\badd\b[\s\S]*\b(?:to|into|back into)\b[\s\S]*\b(layer|folder)\b/.test(
       lowered
     )
+  );
+}
+
+function hasFreshAssetForNamedLayerIntent(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  return /\b(add|draw|make|create|generate|design|craft|build|draft)\b[\s\S]*\bfor\b[\s\S]*\b(layer|folder)\b/.test(
+    lowered
   );
 }
 
@@ -2176,12 +2519,87 @@ function hasExplicitSeparateFolderIntent(promptText) {
   );
 }
 
+function isBackgroundAccentPrompt(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  return (
+    /\bbackground accent\b/.test(lowered) ||
+    /\baccent background\b/.test(lowered) ||
+    /\bhalo\b/.test(lowered) ||
+    /\baura\b/.test(lowered) ||
+    /\bglow\b/.test(lowered) ||
+    /\bring\b/.test(lowered) ||
+    /\bburst\b/.test(lowered)
+  );
+}
+
+function isTrueBackgroundPrompt(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  if (!/\bbackground\b|\bbg\b|\bbackdrop\b|\bscene\b/.test(lowered)) {
+    return false;
+  }
+
+  if (isBackgroundAccentPrompt(lowered)) {
+    return false;
+  }
+
+  return (
+    /\btrue background\b/.test(lowered) ||
+    /\bfull background\b/.test(lowered) ||
+    /\bfull paint background\b/.test(lowered) ||
+    /\bfull canvas background\b/.test(lowered) ||
+    /\bfull bleed\b/.test(lowered) ||
+    /\bfill(?:s|ing)? the canvas\b/.test(lowered) ||
+    /\bentire canvas\b/.test(lowered) ||
+    /\bwhole canvas\b/.test(lowered) ||
+    /\bedge to edge\b/.test(lowered) ||
+    /\bbehind everything\b/.test(lowered) ||
+    /\bsolid white\b/.test(lowered) ||
+    /\bsolid black\b/.test(lowered) ||
+    /\bsolid color\b/.test(lowered)
+  );
+}
+
 function resolveDraftTargetLayerName(project, promptText, route = {}) {
   const explicitTarget = cleanText(route.targetLayerName);
+  const explicitPromptLookup = cleanText(extractLayerLookupFromPrompt(promptText));
+  const explicitPromptTarget =
+    (explicitPromptLookup ? findExactLayer(project, explicitPromptLookup) : null) ||
+    (explicitPromptLookup ? findLayer(project, explicitPromptLookup) : null) ||
+    null;
   const semanticTarget = guessLayerNameFromPrompt(promptText);
-  const guessedTarget = explicitTarget || semanticTarget;
+  const guessedTarget = explicitTarget || cleanText(explicitPromptTarget?.name) || semanticTarget;
   const separateFolderIntent = hasExplicitSeparateFolderIntent(promptText);
   const existingSemanticTarget = semanticTarget ? findLayer(project, semanticTarget) : null;
+  const fullBackgroundIntent = isTrueBackgroundPrompt(promptText);
+  const accentBackgroundIntent = isBackgroundAccentPrompt(promptText);
+
+  if (fullBackgroundIntent) {
+    const existingBackground =
+      (explicitTarget && !isBackgroundAccentPrompt(explicitTarget) ? findExactLayer(project, explicitTarget) : null) ||
+      findExactLayer(project, "Background") ||
+      findLayerByFitProfileId(project, "background");
+    if (existingBackground && !separateFolderIntent) {
+      return existingBackground.name;
+    }
+    if (explicitTarget && !isBackgroundAccentPrompt(explicitTarget)) {
+      return separateFolderIntent ? makeUniqueLayerName(project, explicitTarget) : explicitTarget;
+    }
+    return separateFolderIntent ? makeUniqueLayerName(project, "Background") : "Background";
+  }
+
+  if (accentBackgroundIntent) {
+    const existingBackgroundAccent =
+      (explicitTarget ? findExactLayer(project, explicitTarget) : null) ||
+      findExactLayer(project, "Background Accent") ||
+      findLayerByFitProfileId(project, "background-accent");
+    if (existingBackgroundAccent && !separateFolderIntent) {
+      return existingBackgroundAccent.name;
+    }
+    if (explicitTarget) {
+      return separateFolderIntent ? makeUniqueLayerName(project, explicitTarget) : explicitTarget;
+    }
+    return separateFolderIntent ? makeUniqueLayerName(project, "Background Accent") : "Background Accent";
+  }
 
   if (explicitTarget) {
     const existingExplicitTarget = findLayer(project, explicitTarget);
@@ -2194,6 +2612,10 @@ function resolveDraftTargetLayerName(project, promptText, route = {}) {
     if (!existingExplicitTarget) {
       return explicitTarget;
     }
+  }
+
+  if (explicitPromptTarget && !separateFolderIntent) {
+    return explicitPromptTarget.name;
   }
 
   const existingSuggestedTarget = guessedTarget ? findLayer(project, guessedTarget) : null;
@@ -2304,6 +2726,92 @@ function findLayer(project, lookup) {
     project.layers.find((layer) => slugify(layer.name) === token) ||
     project.layers.find((layer) => slugify(layer.name).includes(token)) ||
     null
+  );
+}
+
+function isBackgroundAccentLayerName(layerName) {
+  return cleanText(getLayerFitProfile(layerName)?.id).toLowerCase() === "background-accent";
+}
+
+function isFullCanvasBackgroundLayerName(layerName) {
+  return cleanText(getLayerFitProfile(layerName)?.id).toLowerCase() === "background";
+}
+
+function inferSolidBackgroundColor(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  if (/\bwhite\b/.test(lowered)) {
+    return { r: 255, g: 255, b: 255, alpha: 1 };
+  }
+  if (/\bblack\b/.test(lowered)) {
+    return { r: 0, g: 0, b: 0, alpha: 1 };
+  }
+  if (/\bblue\b/.test(lowered)) {
+    return { r: 52, g: 88, b: 255, alpha: 1 };
+  }
+  if (/\bred\b/.test(lowered)) {
+    return { r: 210, g: 44, b: 44, alpha: 1 };
+  }
+  if (/\bgreen\b/.test(lowered)) {
+    return { r: 44, g: 170, b: 92, alpha: 1 };
+  }
+  if (/\bpurple\b/.test(lowered)) {
+    return { r: 118, g: 74, b: 200, alpha: 1 };
+  }
+  if (/\bpink\b/.test(lowered)) {
+    return { r: 232, g: 118, b: 176, alpha: 1 };
+  }
+  if (/\bgold\b|\byellow\b/.test(lowered)) {
+    return { r: 226, g: 188, b: 61, alpha: 1 };
+  }
+  if (/\borange\b/.test(lowered)) {
+    return { r: 232, g: 133, b: 58, alpha: 1 };
+  }
+  if (/\bgray\b|\bgrey\b/.test(lowered)) {
+    return { r: 126, g: 126, b: 126, alpha: 1 };
+  }
+
+  return { r: 18, g: 18, b: 22, alpha: 1 };
+}
+
+async function ensureOpaqueFullCanvasBackground(buffer, promptText, canvas) {
+  const analysis = await assetToolService.inspectPngBuffer(buffer);
+  if (Number(analysis?.alphaCoverage || 0) >= 0.92) {
+    return buffer;
+  }
+
+  const background = inferSolidBackgroundColor(promptText);
+  return sharp({
+    create: {
+      width: Math.max(1, Number(canvas?.width || 1024)),
+      height: Math.max(1, Number(canvas?.height || 1024)),
+      channels: 4,
+      background
+    }
+  })
+    .composite([{ input: buffer, left: 0, top: 0 }])
+    .png()
+    .toBuffer();
+}
+
+function findExactLayer(project, lookup) {
+  const token = slugify(lookup || "");
+  if (!token) {
+    return null;
+  }
+
+  return project.layers.find((layer) => slugify(layer.name) === token) || null;
+}
+
+function findLayerByFitProfileId(project, profileId) {
+  const targetId = cleanText(profileId).toLowerCase();
+  if (!targetId) {
+    return null;
+  }
+
+  return (
+    (project.layers || []).find(
+      (layer) => cleanText(getLayerFitProfile(layer.name)?.id).toLowerCase() === targetId
+    ) || null
   );
 }
 
@@ -2531,6 +3039,237 @@ function applyPlacementTransformForVariant(layer, variant, transform, mode = var
   return applyLayerPlacementTransform(layer, transform);
 }
 
+function getVariantCanvasBounds(project, layer, variant, transform = getVariantPlacementTransform(layer, variant)) {
+  const analysis = variant?.analysis || null;
+  if (!analysis) {
+    return null;
+  }
+
+  const canvasWidth = Math.max(1, Number(project?.canvas?.width || analysis.width || 1024));
+  const canvasHeight = Math.max(1, Number(project?.canvas?.height || analysis.height || 1024));
+  const imageWidth = Math.max(1, Number(analysis.width || canvasWidth));
+  const imageHeight = Math.max(1, Number(analysis.height || canvasHeight));
+  const safeTransform = normalizeLayerTransform(transform || getVariantPlacementTransform(layer, variant));
+  const scale = Math.max(0.01, Number(safeTransform.scale || 1));
+  const scaledWidth = imageWidth * scale;
+  const scaledHeight = imageHeight * scale;
+  const drawLeft = (canvasWidth - scaledWidth) / 2 + Number(safeTransform.x || 0) * canvasWidth;
+  const drawTop = (canvasHeight - scaledHeight) / 2 + Number(safeTransform.y || 0) * canvasHeight;
+  const bounds = analysis?.bounds || {
+    left: 0,
+    top: 0,
+    right: imageWidth - 1,
+    bottom: imageHeight - 1
+  };
+  const width = Math.max(1, (Number(bounds.right) - Number(bounds.left) + 1) * scale);
+  const height = Math.max(1, (Number(bounds.bottom) - Number(bounds.top) + 1) * scale);
+  const left = drawLeft + Number(bounds.left) * scale;
+  const top = drawTop + Number(bounds.top) * scale;
+
+  return {
+    left,
+    top,
+    right: left + width,
+    bottom: top + height,
+    width,
+    height,
+    centerX: left + width / 2,
+    centerY: top + height / 2
+  };
+}
+
+function formatContractPercent(value) {
+  if (!Number.isFinite(Number(value))) {
+    return "";
+  }
+  return `${Math.round(Number(value) * 100)}%`;
+}
+
+function formatContractSignedPercent(value) {
+  if (!Number.isFinite(Number(value))) {
+    return "";
+  }
+  const percent = Math.round(Number(value) * 100);
+  return `${percent > 0 ? "+" : ""}${percent}%`;
+}
+
+function buildLayerFitContractSummary(layer, contract) {
+  const safeContract = normalizeLayerFitContract(contract);
+  if (!safeContract) {
+    return "";
+  }
+
+  const label = cleanText(safeContract.profileLabel) || cleanText(layer?.name) || "trait";
+  const reference = cleanText(safeContract.referenceVariantName) || cleanText(layer?.name) || "approved layer";
+
+  if (safeContract.scope === "anchor" && cleanText(safeContract.anchorLayerName)) {
+    if (cleanText(safeContract.profileId) === "surface-overlay") {
+      const widthText = formatContractPercent(safeContract.targetWidthRatio);
+      const heightText = formatContractPercent(safeContract.targetHeightRatio);
+      const topText = formatContractPercent(safeContract.targetTopRatio);
+      const centerYText = formatContractPercent(safeContract.targetCenterYRatio);
+      const offsetText =
+        Number.isFinite(Number(safeContract.targetCenterXOffsetRatio)) && Math.abs(Number(safeContract.targetCenterXOffsetRatio)) > 0.01
+          ? ` with horizontal offset ${formatContractSignedPercent(safeContract.targetCenterXOffsetRatio)}`
+          : " centered";
+      return `Approved interchangeable ${label} family contract from ${reference}: keep every ${layer?.name || "layer"} variant about ${widthText || "similar width"} by ${heightText || "similar height"} of ${safeContract.anchorLayerName}, seated on the visible front surface with top near ${topText || centerYText || "the same front-face position"}${offsetText}.`;
+    }
+
+    const widthText = formatContractPercent(safeContract.targetWidthRatio);
+    const yText =
+      cleanText(safeContract.profileId) === "eyewear"
+        ? `center at about ${formatContractPercent(safeContract.targetCenterYRatio)} of ${safeContract.anchorLayerName}'s height`
+        : `seat at about ${formatContractPercent(safeContract.targetBottomRatio)} of ${safeContract.anchorLayerName}'s height`;
+    const offsetText =
+      Number.isFinite(Number(safeContract.targetCenterXOffsetRatio)) && Math.abs(Number(safeContract.targetCenterXOffsetRatio)) > 0.01
+        ? ` with horizontal offset ${formatContractSignedPercent(safeContract.targetCenterXOffsetRatio)}`
+        : " centered";
+    const wrapBack = formatContractPercent(safeContract.backCutoff);
+    const wrapFront = formatContractPercent(safeContract.frontStart);
+    const clipText =
+      cleanText(safeContract.depthMode) === "headwear_wrap" && wrapBack && wrapFront
+        ? ` Keep the same wrap overlap (${wrapBack} back cutoff / ${wrapFront} front start).`
+        : "";
+    return `Approved interchangeable ${label} family contract from ${reference}: keep every ${layer?.name || "layer"} variant about ${widthText || "similar width"} of ${safeContract.anchorLayerName}, ${yText}${offsetText}.${clipText}`;
+  }
+
+  if (safeContract.scope === "canvas") {
+    const widthText = formatContractPercent(safeContract.canvasWidthRatio);
+    const heightText = formatContractPercent(safeContract.canvasHeightRatio);
+    const centerYText = formatContractPercent(safeContract.canvasCenterYRatio);
+    return `Approved interchangeable ${label} family contract from ${reference}: keep the visible footprint about ${widthText || "similar width"} by ${heightText || "similar height"} of the canvas with center height near ${centerYText || "the same vertical seat"} so swaps preserve stack quality.`;
+  }
+
+  return cleanText(safeContract.summary);
+}
+
+function buildLayerFitContract(project, layer, preferredVariant = null) {
+  if (!layer) {
+    return null;
+  }
+
+  const variant =
+    preferredVariant ||
+    getSelectedLayerVariant(layer) ||
+    (Array.isArray(layer?.variants) ? layer.variants[0] : null) ||
+    null;
+  if (!variant) {
+    return null;
+  }
+
+  const transform = getVariantPlacementTransform(layer, variant);
+  const fitProfile = getLayerFitProfile(layer.name);
+  const variantBounds = getVariantCanvasBounds(project, layer, variant, transform);
+  const canvasWidth = Math.max(1, Number(project?.canvas?.width || variant?.analysis?.width || 1024));
+  const canvasHeight = Math.max(1, Number(project?.canvas?.height || variant?.analysis?.height || 1024));
+  const baseContract = {
+    profileId: cleanText(fitProfile?.id),
+    profileLabel: cleanText(fitProfile?.label) || cleanText(layer.name),
+    referenceVariantId: cleanText(variant.id),
+    referenceVariantName: cleanText(variant.name),
+    depthMode: cleanText(transform.depthMode),
+    clipStrategy: cleanText(fitProfile?.clipStrategy),
+    backCutoff: Number(transform.backCutoff),
+    frontStart: Number(transform.frontStart),
+    updatedAt: new Date().toISOString()
+  };
+
+  const shouldAnchorToAnotherLayer = !isPrimaryBaseLayerName(layer.name);
+  const anchor = shouldAnchorToAnotherLayer ? getActiveAnchorLayer(project, layer) : null;
+  const anchorBounds =
+    anchor?.layer && anchor?.variant
+      ? getVariantCanvasBounds(project, anchor.layer, anchor.variant, getVariantPlacementTransform(anchor.layer, anchor.variant))
+      : null;
+
+  if (variantBounds && anchorBounds) {
+    const anchorWidth = Math.max(1, Number(anchorBounds.width || 1));
+    const anchorHeight = Math.max(1, Number(anchorBounds.height || 1));
+    const contract = normalizeLayerFitContract({
+      ...baseContract,
+      scope: "anchor",
+      anchorLayerId: cleanText(anchor.layer.id),
+      anchorLayerName: cleanText(anchor.layer.name),
+      anchorVariantId: cleanText(anchor.variant.id),
+      anchorVariantName: cleanText(anchor.variant.name),
+      targetWidthRatio: Number(variantBounds.width) / anchorWidth,
+      targetHeightRatio: Number(variantBounds.height) / anchorHeight,
+      targetCenterXOffsetRatio: (Number(variantBounds.centerX) - Number(anchorBounds.centerX)) / anchorWidth,
+      targetCenterYRatio: (Number(variantBounds.centerY) - Number(anchorBounds.top)) / anchorHeight,
+      targetTopRatio: (Number(variantBounds.top) - Number(anchorBounds.top)) / anchorHeight,
+      targetBottomRatio: (Number(variantBounds.bottom) - Number(anchorBounds.top)) / anchorHeight
+    });
+    if (contract) {
+      contract.summary = buildLayerFitContractSummary(layer, contract);
+    }
+    return contract;
+  }
+
+  if (variantBounds) {
+    const contract = normalizeLayerFitContract({
+      ...baseContract,
+      scope: "canvas",
+      canvasWidthRatio: Number(variantBounds.width) / canvasWidth,
+      canvasHeightRatio: Number(variantBounds.height) / canvasHeight,
+      canvasCenterXRatio: Number(variantBounds.centerX) / canvasWidth,
+      canvasCenterYRatio: Number(variantBounds.centerY) / canvasHeight,
+      canvasTopRatio: Number(variantBounds.top) / canvasHeight,
+      canvasBottomRatio: Number(variantBounds.bottom) / canvasHeight
+    });
+    if (contract) {
+      contract.summary = buildLayerFitContractSummary(layer, contract);
+    }
+    return contract;
+  }
+
+  const fallback = normalizeLayerFitContract({
+    ...baseContract,
+    scope: anchor ? "anchor" : "canvas"
+  });
+  if (fallback) {
+    fallback.summary = buildLayerFitContractSummary(layer, fallback);
+  }
+  return fallback;
+}
+
+function refreshLayerFitContract(project, layer, preferredVariant = null, options = {}) {
+  const force = options.force === true;
+  const existing = getLayerFitContract(layer);
+  const currentProfileId = cleanText(getLayerFitProfile(layer?.name)?.id);
+  const profileMismatch =
+    existing && currentProfileId && cleanText(existing.profileId) && cleanText(existing.profileId) !== currentProfileId;
+  if (existing && !force && !profileMismatch && cleanText(existing.summary)) {
+    layer.fitContract = existing;
+    return existing;
+  }
+
+  const next = buildLayerFitContract(project, layer, preferredVariant);
+  if (next) {
+    layer.fitContract = next;
+    return next;
+  }
+
+  return existing;
+}
+
+function hydrateProjectLayerFitContracts(project) {
+  let changed = false;
+  for (const layer of Array.isArray(project?.layers) ? project.layers : []) {
+    const existing = getLayerFitContract(layer);
+    const currentProfileId = cleanText(getLayerFitProfile(layer?.name)?.id);
+    const profileMismatch =
+      existing && currentProfileId && cleanText(existing.profileId) && cleanText(existing.profileId) !== currentProfileId;
+    if (existing && !profileMismatch) {
+      continue;
+    }
+    const next = buildLayerFitContract(project, layer);
+    if (next) {
+      layer.fitContract = next;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 function mergeLayerTransform(current, patch) {
   const next = {
     x: patch.x ?? current.x,
@@ -2563,7 +3302,7 @@ function shouldUseDeterministicLayerFitEdit(layer, promptText) {
   }
 
   return (
-    /(back part|back hoop|really on|sit naturally|sits naturally|see how|example|proper|fit|fits|fitting|tighten|tighter|too wide|wide|narrow|narrower|slimmer|stack|overlay|clip|sized?|wear|worn|hold|held|grip|gripping|hand|paw|arm|eye line|face better)/.test(
+    /(back part|back hoop|really on|sit naturally|sits naturally|see how|example|proper|fit|fits|fitting|tighten|tighter|too wide|wide|narrow|narrower|slimmer|stack|overlay|clip|sized?|wear|worn|hold|held|grip|gripping|hand|paw|arm|eye line|face better|door|panel|plate|safe|vault|hinge|recessed|opening|middle|center(?:ed)?|flush)/.test(
       lowered
     ) &&
     mentionsAnchorPlacementArea(lowered)
@@ -2589,7 +3328,7 @@ function isAccessoryLayerName(layerName) {
 }
 
 function mentionsAnchorPlacementArea(loweredPrompt) {
-  return /(head|face|eye|eyes|eye line|forehead|brow|cheek|muzzle|base|body|character|avatar|subject|construct|center piece|centerpiece|main asset|main body|main character|upper area|upper body|hand|hands|paw|paws|arm|arms|grip|holding)/.test(
+  return /(head|face|eye|eyes|eye line|forehead|brow|cheek|muzzle|base|body|character|avatar|subject|construct|center piece|centerpiece|main asset|main body|main character|upper area|upper body|hand|hands|paw|paws|arm|arms|grip|holding|safe|vault|door|panel|plate|opening|recessed|hinge|frame|surface|front face|front surface|middle|center(?:ed)?)/.test(
     cleanText(loweredPrompt).toLowerCase()
   );
 }
@@ -2603,6 +3342,7 @@ function shouldRejectContaminatedLayerEdit(layer, sourceAnalysis, revisedAnalysi
     return false;
   }
 
+  const profileId = cleanText(getLayerFitProfile(layer?.name)?.id).toLowerCase();
   const sourceBottom = Number(sourceAnalysis?.bounds?.bottom ?? 0);
   const revisedBottom = Number(revisedAnalysis?.bounds?.bottom ?? 0);
   const sourceHeight = Math.max(1, Number(sourceAnalysis?.height || revisedAnalysis?.height || 1024));
@@ -2610,6 +3350,10 @@ function shouldRejectContaminatedLayerEdit(layer, sourceAnalysis, revisedAnalysi
   const sourceBottomRatio = sourceBottom / sourceHeight;
   const sourceCoverage = Number(sourceAnalysis?.alphaCoverage || 0);
   const revisedCoverage = Number(revisedAnalysis?.alphaCoverage || 0);
+
+  if (profileId === "surface-overlay") {
+    return revisedCoverage > Math.max(sourceCoverage * 1.45, sourceCoverage + 0.18, 0.82);
+  }
 
   if (/headwear|hat|crown|tiara/.test(cleanText(layer?.name).toLowerCase())) {
     return (
@@ -2629,10 +3373,15 @@ function isLikelyContaminatedAccessoryAnalysis(layer, analysis) {
     return false;
   }
 
+  const profileId = cleanText(getLayerFitProfile(layer?.name)?.id).toLowerCase();
   const height = Math.max(1, Number(analysis?.height || 1024));
   const bottomRatio = Number(analysis?.bounds?.bottom ?? 0) / height;
   const coverage = Number(analysis?.alphaCoverage || 0);
   const lowered = cleanText(layer?.name).toLowerCase();
+
+  if (profileId === "surface-overlay") {
+    return coverage > 0.82;
+  }
 
   if (/headwear|hat|crown|tiara/.test(lowered)) {
     return bottomRatio > 0.62 || coverage > 0.22;
@@ -2879,6 +3628,7 @@ async function rebuildHeadwearAsFrontTrait(project, layer, options = {}) {
   }
   applyPlacementTransformForVariant(layer, variant, transform, nextTransformMode);
   layer.selectedVariantId = variant.id;
+  refreshLayerFitContract(project, layer, variant);
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
 
@@ -2966,6 +3716,9 @@ async function applyDeterministicLayerVisualAdjustments(project, layer, options 
     isVariantUsingCustomTransform(variant) ? "custom" : "sync"
   );
   layer.selectedVariantId = variant.id;
+  if (!isVariantUsingCustomTransform(variant)) {
+    refreshLayerFitContract(project, layer, variant, { force: true });
+  }
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
 
@@ -2987,6 +3740,7 @@ async function applyDeterministicLayerVisualAdjustments(project, layer, options 
 async function buildAnchorAwareLayerTransform(project, layer, variant, promptText = "") {
   const fitProfile = getLayerFitProfile(layer?.name);
   const profileId = cleanText(fitProfile?.id).toLowerCase();
+  const fitContract = getLayerFitContract(layer);
   const loweredPrompt = cleanText(promptText).toLowerCase();
   const currentTransform = getVariantPlacementTransform(layer, variant);
   if (!profileId) {
@@ -3001,11 +3755,15 @@ async function buildAnchorAwareLayerTransform(project, layer, variant, promptTex
   const canvasHeight = Math.max(1, Number(project?.canvas?.height || 1024));
   const imageWidth = Math.max(1, Number(variant?.analysis?.width || canvasWidth));
   const imageHeight = Math.max(1, Number(variant?.analysis?.height || canvasHeight));
+  const depthMode =
+    cleanText(fitContract?.depthMode) === "headwear_wrap" || cleanText(fitProfile?.clipStrategy) === "headwear_wrap"
+      ? "headwear_wrap"
+      : "flat";
   if (!anchorBounds || !variantBounds) {
     return mergeLayerTransform(currentTransform, {
-      depthMode: cleanText(fitProfile?.clipStrategy) === "headwear_wrap" ? "headwear_wrap" : "flat",
-      backCutoff: coerceProfileNumber(fitProfile?.backCutoff, currentTransform.backCutoff),
-      frontStart: coerceProfileNumber(fitProfile?.frontStart, currentTransform.frontStart)
+      depthMode,
+      backCutoff: coerceProfileNumber(fitContract?.backCutoff, coerceProfileNumber(fitProfile?.backCutoff, currentTransform.backCutoff)),
+      frontStart: coerceProfileNumber(fitContract?.frontStart, coerceProfileNumber(fitProfile?.frontStart, currentTransform.frontStart))
     });
   }
 
@@ -3013,6 +3771,7 @@ async function buildAnchorAwareLayerTransform(project, layer, variant, promptTex
   const anchorWidth = Math.max(1, Number(anchorBounds.right) - Number(anchorBounds.left) + 1);
   const anchorHeight = Math.max(1, Number(anchorBounds.bottom) - Number(anchorBounds.top) + 1);
   const variantWidth = Math.max(1, Number(variantBounds.right) - Number(variantBounds.left) + 1);
+  const variantHeight = Math.max(1, Number(variantBounds.bottom) - Number(variantBounds.top) + 1);
   const anchorCenterX = (Number(anchorBounds.left) + Number(anchorBounds.right)) / 2;
   const variantCenterX = (Number(variantBounds.left) + Number(variantBounds.right)) / 2;
   const variantCenterY = (Number(variantBounds.top) + Number(variantBounds.bottom)) / 2;
@@ -3021,14 +3780,30 @@ async function buildAnchorAwareLayerTransform(project, layer, variant, promptTex
   let imageTop = 0;
 
   if (profileId === "headwear") {
-    const targetWidth = anchorWidth * coerceProfileNumber(fitProfile?.anchorWidthRatio, 0.64);
+    const targetWidthRatio = coerceProfileNumber(
+      fitContract?.targetWidthRatio,
+      coerceProfileNumber(fitProfile?.anchorWidthRatio, 0.64)
+    );
+    const targetBottomRatio = coerceProfileNumber(
+      fitContract?.targetBottomRatio,
+      coerceProfileNumber(fitProfile?.anchorBottomRatio, 0.22)
+    );
+    const targetCenterXOffsetRatio = coerceProfileNumber(fitContract?.targetCenterXOffsetRatio, 0);
+    const targetWidth = anchorWidth * targetWidthRatio;
     baseScale = clampTransformNumber(targetWidth / variantWidth, defaultTransform.scale, 0.15, 1.8);
-    const targetBottom = Number(anchorBounds.top) + anchorHeight * coerceProfileNumber(fitProfile?.anchorBottomRatio, 0.22);
-    imageLeft = anchorCenterX - variantCenterX * baseScale;
+    const targetBottom = Number(anchorBounds.top) + anchorHeight * targetBottomRatio;
+    imageLeft = anchorCenterX + anchorWidth * targetCenterXOffsetRatio - variantCenterX * baseScale;
     imageTop = targetBottom - Number(variantBounds.bottom) * baseScale;
   } else if (profileId === "eyewear") {
-    let targetWidthRatio = coerceProfileNumber(fitProfile?.anchorWidthRatio, 0.68);
-    let targetCenterYRatio = coerceProfileNumber(fitProfile?.anchorCenterYRatio, 0.46);
+    let targetWidthRatio = coerceProfileNumber(
+      fitContract?.targetWidthRatio,
+      coerceProfileNumber(fitProfile?.anchorWidthRatio, 0.68)
+    );
+    let targetCenterYRatio = coerceProfileNumber(
+      fitContract?.targetCenterYRatio,
+      coerceProfileNumber(fitProfile?.anchorCenterYRatio, 0.46)
+    );
+    const targetCenterXOffsetRatio = coerceProfileNumber(fitContract?.targetCenterXOffsetRatio, 0);
     if (/(width of .*face|face width|span .*face|full .*face width|across .*face|edge to edge|ear to ear)/.test(loweredPrompt)) {
       targetWidthRatio = 0.9;
     } else if (/(wider|bigger|larger|broader|too small)/.test(loweredPrompt)) {
@@ -3045,26 +3820,105 @@ async function buildAnchorAwareLayerTransform(project, layer, variant, promptTex
     const targetWidth = anchorWidth * targetWidthRatio;
     baseScale = clampTransformNumber(targetWidth / variantWidth, defaultTransform.scale, 0.15, 1.25);
     const targetCenterY = Number(anchorBounds.top) + anchorHeight * targetCenterYRatio;
-    imageLeft = anchorCenterX - variantCenterX * baseScale;
+    imageLeft = anchorCenterX + anchorWidth * targetCenterXOffsetRatio - variantCenterX * baseScale;
     imageTop = targetCenterY - variantCenterY * baseScale;
   } else {
-    return null;
+    const targetWidthRatio = coerceStructuralOverlayFitNumber(
+      profileId,
+      fitContract?.targetWidthRatio,
+      coerceProfileNumber(fitProfile?.anchorWidthRatio, null),
+      0.2,
+      0.92
+    );
+    const targetHeightRatio = coerceStructuralOverlayFitNumber(
+      profileId,
+      fitContract?.targetHeightRatio,
+      coerceProfileNumber(fitProfile?.anchorHeightRatio, null),
+      0.2,
+      0.92
+    );
+    const targetCenterYRatio = coerceStructuralOverlayFitNumber(
+      profileId,
+      fitContract?.targetCenterYRatio,
+      coerceProfileNumber(fitProfile?.anchorCenterYRatio, null),
+      0.18,
+      0.82
+    );
+    const targetTopRatio = coerceStructuralOverlayFitNumber(
+      profileId,
+      fitContract?.targetTopRatio,
+      coerceProfileNumber(fitProfile?.anchorTopRatio, null),
+      0.02,
+      0.72
+    );
+    const targetCenterXOffsetRatio = coerceProfileNumber(
+      fitContract?.targetCenterXOffsetRatio,
+      coerceProfileNumber(fitProfile?.anchorCenterXOffsetRatio, 0)
+    );
+    if (targetWidthRatio === null && targetHeightRatio === null) {
+      return null;
+    }
+    const scaleCandidates = [];
+    if (targetWidthRatio !== null) {
+      scaleCandidates.push((anchorWidth * targetWidthRatio) / variantWidth);
+    }
+    if (targetHeightRatio !== null) {
+      scaleCandidates.push((anchorHeight * targetHeightRatio) / variantHeight);
+    }
+    if (!scaleCandidates.length) {
+      return null;
+    }
+    const averageScale = scaleCandidates.reduce((sum, value) => sum + Number(value || 0), 0) / scaleCandidates.length;
+    baseScale = clampTransformNumber(averageScale, defaultTransform.scale, 0.15, 1.8);
+    imageLeft = anchorCenterX + anchorWidth * targetCenterXOffsetRatio - variantCenterX * baseScale;
+    if (targetTopRatio !== null) {
+      const targetTop = Number(anchorBounds.top) + anchorHeight * targetTopRatio;
+      imageTop = targetTop - Number(variantBounds.top) * baseScale;
+    } else if (targetCenterYRatio !== null) {
+      const targetCenterY = Number(anchorBounds.top) + anchorHeight * targetCenterYRatio;
+      imageTop = targetCenterY - variantCenterY * baseScale;
+    } else {
+      return null;
+    }
   }
 
   const fittedTransform = normalizeLayerTransform({
     x: (imageLeft - (canvasWidth - imageWidth * baseScale) / 2) / canvasWidth,
     y: (imageTop - (canvasHeight - imageHeight * baseScale) / 2) / canvasHeight,
     scale: baseScale,
-    depthMode: cleanText(fitProfile?.clipStrategy) === "headwear_wrap" ? "headwear_wrap" : "flat",
-    backCutoff: coerceProfileNumber(fitProfile?.backCutoff, currentTransform.backCutoff),
-    frontStart: coerceProfileNumber(fitProfile?.frontStart, currentTransform.frontStart)
+    depthMode,
+    backCutoff: coerceProfileNumber(fitContract?.backCutoff, coerceProfileNumber(fitProfile?.backCutoff, currentTransform.backCutoff)),
+    frontStart: coerceProfileNumber(fitContract?.frontStart, coerceProfileNumber(fitProfile?.frontStart, currentTransform.frontStart))
   });
 
-  if (profileId === "eyewear") {
+  if (profileId === "eyewear" || profileId === "surface-overlay") {
     return fittedTransform;
   }
 
   return applyTransformResidual(fittedTransform, currentTransform, defaultTransform);
+}
+
+function shouldForceStructuralOverlayFitSeed(layer, source) {
+  if (cleanText(getLayerFitProfile(layer?.name)?.id) !== "surface-overlay") {
+    return false;
+  }
+
+  const lowered = [cleanText(source?.prompt), cleanText(source?.notes), cleanText(source?.name)].join(" ").toLowerCase();
+  return /(fit|fits|fitted|attach|attached|align|aligned|seat|seated|sit|sits|overlay|mapped|match|inside|recessed|middle|center(?:ed)?|flush|hinge|safe|vault|door|panel|plate)/.test(
+    lowered
+  );
+}
+
+function coerceStructuralOverlayFitNumber(profileId, primaryValue, fallbackValue, min, max) {
+  const primary = coerceProfileNumber(primaryValue, null);
+  if (profileId === "surface-overlay") {
+    if (primary !== null && primary >= min && primary <= max) {
+      return primary;
+    }
+    return coerceProfileNumber(fallbackValue, null);
+  }
+
+  return coerceProfileNumber(primaryValue, coerceProfileNumber(fallbackValue, null));
 }
 
 function applyTransformResidual(baselineTransform, currentTransform, defaultTransform) {
@@ -3310,32 +4164,89 @@ function buildLayerFitPromptGuidance(project, layer) {
   const anchor = getActiveAnchorLayer(project, layer);
   const anchorLabel = anchor?.layer?.name ? anchor.layer.name : "the active base construct";
   const fitProfile = getLayerFitProfile(layer?.name);
+  const fitContractGuidance = buildLayerFitContractSummary(layer, layer?.fitContract);
+
+  if (cleanText(fitProfile?.id) === "background-accent") {
+    return [
+      `Treat ${anchorLabel} as the foreground subject and keep this background accent as a supportive transparent effect behind the silhouette rather than the full painted scene.`,
+      fitContractGuidance
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  if (cleanText(fitProfile?.id) === "background") {
+    return [
+      `Treat ${anchorLabel} as the foreground subject and build this as the true background plate: full canvas, edge to edge, behind everything, and not just a halo or accent feature.`,
+      fitContractGuidance
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  if (cleanText(fitProfile?.id) === "surface-overlay") {
+    return [
+      `Fit this structural overlay to ${anchorLabel}: study the visible front face, opening, recess, or seat on the anchor construct and draw only the removable overlay piece shaped to sit on that surface.`,
+      `Match the anchor's contour, scale, curvature, edge spacing, and hinge alignment as closely as possible, but do not redraw the anchor body, casing, or any other base content into the trait.`,
+      fitContractGuidance
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
 
   if (fitProfile?.guidance) {
-    return `Fit profile ${fitProfile.label || fitProfile.id} for ${anchorLabel}: ${fitProfile.guidance}`;
+    return [`Fit profile ${fitProfile.label || fitProfile.id} for ${anchorLabel}: ${fitProfile.guidance}`, fitContractGuidance]
+      .filter(Boolean)
+      .join(" ");
   }
 
   if (/headwear|hat|crown|tiara/.test(lowered)) {
-    return `Keep this headwear sized and aligned for ${anchorLabel}: centered in the upper anchor region, stack-safe, and shaped to feel built for that character instead of a random standalone canvas.`;
+    return [
+      `Keep this headwear sized and aligned for ${anchorLabel}: centered in the upper anchor region, stack-safe, and shaped to feel built for that character instead of a random standalone canvas.`,
+      fitContractGuidance
+    ]
+      .filter(Boolean)
+      .join(" ");
   }
 
   if (/eyes|eyewear|glasses|shades/.test(lowered)) {
-    return `Keep this eyewear aligned to ${anchorLabel}: centered over the eye line, narrowed to the visible face width, stack-safe over the eyes, and never redrawing any head or face content into the trait.`;
+    return [
+      `Keep this eyewear aligned to ${anchorLabel}: centered over the eye line, narrowed to the visible face width, stack-safe over the eyes, and never redrawing any head or face content into the trait.`,
+      fitContractGuidance
+    ]
+      .filter(Boolean)
+      .join(" ");
   }
 
   if (/neckwear|necklace|chain|scarf|bow/.test(lowered)) {
-    return `Keep this neckwear aligned to ${anchorLabel}: centered around the neck/chest area with clean spacing and no body redraw.`;
+    return [`Keep this neckwear aligned to ${anchorLabel}: centered around the neck/chest area with clean spacing and no body redraw.`, fitContractGuidance]
+      .filter(Boolean)
+      .join(" ");
   }
 
   if (/handheld|weapon|sword|staff|wand|gun|tool|prop|item|orb|flower|cane|bat|microphone/.test(lowered)) {
-    return `Keep this handheld trait aligned to ${anchorLabel}: size it to the character and place it so it reads as being held by the visible hand or grip area instead of floating beside the body.`;
+    return [
+      `Keep this handheld trait aligned to ${anchorLabel}: size it to the character and place it so it reads as being held by the visible hand or grip area instead of floating beside the body.`,
+      fitContractGuidance
+    ]
+      .filter(Boolean)
+      .join(" ");
   }
 
   if (/background/.test(lowered)) {
-    return `Treat ${anchorLabel} as the foreground subject and keep this background supportive instead of overlapping the character silhouette.`;
+    return [
+      `Treat ${anchorLabel} as the foreground subject and keep this background supportive instead of overlapping the character silhouette.`,
+      fitContractGuidance
+    ]
+      .filter(Boolean)
+      .join(" ");
   }
 
-  return anchor ? `Fit this ${layer.name} asset so it stacks cleanly around ${anchorLabel} without redrawing the anchor layer.` : "";
+  return anchor
+    ? [`Fit this ${layer.name} asset so it stacks cleanly around ${anchorLabel} without redrawing the anchor layer.`, fitContractGuidance]
+        .filter(Boolean)
+        .join(" ")
+    : fitContractGuidance;
 }
 
 function getActiveAnchorLayer(project, targetLayer = null) {
@@ -3371,7 +4282,12 @@ async function getActiveAnchorReferenceAttachment(project, targetLayer, excludeU
       id: cleanText(anchor.variant.id) || createId("anchor"),
       name: cleanText(anchor.variant.name) || `${anchor.layer.name} anchor`,
       imageUrl,
-      dataUrl: `data:image/png;base64,${fileBuffer.toString("base64")}`
+      dataUrl: `data:image/png;base64,${fileBuffer.toString("base64")}`,
+      targetLayerName: cleanText(anchor.layer.name),
+      referenceType: "active-anchor",
+      sourceType: "active-anchor",
+      notes: cleanText(anchor.variant.notes),
+      prompt: cleanText(anchor.variant.prompt)
     };
   } catch {
     return null;
@@ -3547,13 +4463,20 @@ function buildPureTraitRegenerationPrompt(project, layer, sourceVariant, options
 
 function extractLayerLookupFromPrompt(promptText) {
   const lowered = cleanText(promptText).toLowerCase();
-  const match = lowered.match(/from\s+the\s+(.+?)\s+layer/);
-  if (match?.[1]) {
-    return match[1];
+  const patterns = [
+    /for\s+the\s+(.+?)\s+(?:layer|folder)/,
+    /from\s+the\s+(.+?)\s+(?:layer|folder)/,
+    /(?:from|on|into|to)\s+(.+?)\s+(?:layer|folder)/
+  ];
+
+  for (const pattern of patterns) {
+    const match = lowered.match(pattern);
+    if (match?.[1]) {
+      return match[1];
+    }
   }
 
-  const fallback = lowered.match(/(?:from|on)\s+(.+?)\s+layer/);
-  return fallback?.[1] || "";
+  return "";
 }
 
 function extractRemovalTargetFromPrompt(promptText) {
@@ -3608,7 +4531,7 @@ function isGenericTraitLayerName(layerName) {
 function extractFreshTraitName(promptText) {
   const cleaned = cleanText(promptText).replace(/[.!?]+$/g, "");
   const match = cleaned.match(
-    /(?:draw|make|create|generate|design|craft|show|give)\s+(?:me\s+)?(?:a\s+|an\s+|another\s+|new\s+)?(.+)/i
+    /(?:add|draw|make|create|generate|design|craft|show|give|build|draft)\s+(?:me\s+)?(?:a\s+|an\s+|another\s+|new\s+)?(.+)/i
   );
   if (!match?.[1]) {
     return "";
@@ -3628,6 +4551,14 @@ function extractFreshTraitName(promptText) {
 
 function buildGenericFreshLayerName(promptText, guessedLayerName) {
   const lowered = cleanText(promptText).toLowerCase();
+  if (isBackgroundAccentPrompt(lowered)) {
+    return "New Background Accent";
+  }
+
+  if (isTrueBackgroundPrompt(lowered)) {
+    return "New Background";
+  }
+
   if (/(crown|tiara)/.test(lowered)) {
     return "New Crown";
   }
@@ -3691,9 +4622,16 @@ async function resolveAttachments(ids) {
 
 async function extendAttachmentsWithChatContext(project, promptText, attachments) {
   const values = Array.isArray(attachments) ? [...attachments] : [];
+  const crossProjectReferences = await getCrossProjectReferenceAttachments(project, promptText, values);
+  if (crossProjectReferences.length) {
+    const baseValues = dedupeReferenceAttachments(values);
+    const roomForBase = Math.max(0, 6 - crossProjectReferences.length);
+    return dedupeReferenceAttachments([...baseValues.slice(0, roomForBase), ...crossProjectReferences]).slice(0, 6);
+  }
+
   const source = getLatestCommitSource(project, promptText);
   if (!source || !shouldUseLatestDraftAsReference(promptText)) {
-    return values;
+    return dedupeReferenceAttachments(values).slice(0, 6);
   }
 
   try {
@@ -3706,13 +4644,448 @@ async function extendAttachmentsWithChatContext(project, promptText, attachments
       width: Number(project.canvas?.width || 0),
       height: Number(project.canvas?.height || 0),
       imageUrl: source.imageUrl,
+      targetLayerName: cleanText(source.targetLayerName),
+      referenceType: "chat-history",
+      sourceType: cleanText(source.type) || "generated",
+      notes: cleanText(source.notes),
+      prompt: cleanText(source.prompt),
       dataUrl: `data:image/png;base64,${fileBuffer.toString("base64")}`
     });
   } catch {
-    return values;
+    return dedupeReferenceAttachments(values).slice(0, 6);
   }
 
-  return values.slice(0, 6);
+  return dedupeReferenceAttachments(values).slice(0, 6);
+}
+
+async function getCrossProjectReferenceAttachments(currentProject, promptText, existingAttachments = []) {
+  const matches = await findCrossProjectReferenceMatches(currentProject, promptText, 2);
+  if (!matches.length) {
+    return [];
+  }
+
+  const blocked = new Set(
+    (Array.isArray(existingAttachments) ? existingAttachments : [])
+      .map((item) => cleanText(item?.imageUrl) || cleanText(item))
+      .filter(Boolean)
+  );
+  const attachments = [];
+
+  for (const match of matches) {
+    const imageUrl = cleanText(match?.imageUrl);
+    if (!imageUrl || blocked.has(imageUrl)) {
+      continue;
+    }
+
+    try {
+      const absolutePath = publicAssetUrlToAbsolutePath(imageUrl);
+      const fileBuffer = await fs.readFile(absolutePath);
+      const meta = await assetToolService.inspectAttachmentBuffer(fileBuffer);
+      attachments.push({
+        id: cleanText(match.id) || createId("project-ref"),
+        name:
+          cleanText(match.name) ||
+          [cleanText(match.layerName), cleanText(match.sourceProjectTitle)].filter(Boolean).join(" ") ||
+          "Saved project reference",
+        mimeType: "image/png",
+        width: Number(meta.width || 0),
+        height: Number(meta.height || 0),
+        imageUrl,
+        dataUrl: `data:image/png;base64,${fileBuffer.toString("base64")}`,
+        targetLayerName: cleanText(match.layerName),
+        referenceType: "saved-project",
+        sourceType: cleanText(match.sourceType),
+        sourceProjectId: cleanText(match.sourceProjectId),
+        sourceProjectTitle: cleanText(match.sourceProjectTitle),
+        notes: cleanText(match.notes),
+        prompt: cleanText(match.prompt)
+      });
+      blocked.add(imageUrl);
+    } catch {
+      // Ignore missing or broken old generated assets from saved projects.
+    }
+  }
+
+  return attachments;
+}
+
+async function findCrossProjectReferenceMatches(currentProject, promptText, limit = 2) {
+  const referencedProjectName = extractProjectReferenceName(promptText);
+  if (!referencedProjectName) {
+    return [];
+  }
+
+  const projectMatches = await loadCrossProjectReferenceProjects(currentProject, referencedProjectName);
+  if (!projectMatches.length) {
+    return [];
+  }
+
+  const assetPromptText = stripProjectReferenceClause(promptText);
+  const assetTokens = extractProjectReferenceAssetTokens(assetPromptText);
+  const scoredMatches = [];
+
+  for (const projectMatch of projectMatches.slice(0, 3)) {
+    const imageCandidates = buildProjectReferenceImageCandidates(projectMatch.project);
+    for (const candidate of imageCandidates) {
+      const assetScore = scoreProjectReferenceImageCandidate(candidate, assetPromptText, assetTokens);
+      if (!assetScore && assetTokens.length) {
+        continue;
+      }
+
+      scoredMatches.push({
+        ...candidate,
+        score: projectMatch.score + assetScore,
+        projectUpdatedAt: cleanText(projectMatch.project.updatedAt)
+      });
+    }
+  }
+
+  if (!scoredMatches.length) {
+    const fallbackProject = projectMatches[0]?.project;
+    if (!fallbackProject) {
+      return [];
+    }
+    const fallbackCandidates = buildProjectReferenceImageCandidates(fallbackProject).sort((left, right) => {
+      return scoreFallbackProjectReferenceCandidate(right) - scoreFallbackProjectReferenceCandidate(left);
+    });
+    return fallbackCandidates.slice(0, limit);
+  }
+
+  return scoredMatches
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return new Date(right.projectUpdatedAt || 0) - new Date(left.projectUpdatedAt || 0);
+    })
+    .slice(0, limit);
+}
+
+async function loadCrossProjectReferenceProjects(currentProject, projectName) {
+  const query = cleanText(projectName);
+  if (!query) {
+    return [];
+  }
+
+  try {
+    const entries = await fs.readdir(projectsDir, { withFileTypes: true });
+    const matches = [];
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith(".json")) {
+        continue;
+      }
+
+      const projectId = path.basename(entry.name, ".json");
+      if (cleanText(currentProject?.id) && projectId === cleanText(currentProject.id)) {
+        continue;
+      }
+
+      const candidate = await projectService.readProject(projectId);
+      const score = scoreReferencedProject(candidate, query);
+      if (score > 0) {
+        matches.push({ project: candidate, score });
+      }
+    }
+
+    return matches.sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      return new Date(right.project.updatedAt || 0) - new Date(left.project.updatedAt || 0);
+    });
+  } catch {
+    return [];
+  }
+}
+
+function buildProjectReferenceImageCandidates(project) {
+  const candidates = [];
+
+  for (const layer of Array.isArray(project?.layers) ? project.layers : []) {
+    for (const variant of Array.isArray(layer?.variants) ? layer.variants : []) {
+      if (!cleanText(variant?.imageUrl)) {
+        continue;
+      }
+
+      candidates.push({
+        id: cleanText(variant.id) || createId("project-ref"),
+        name: cleanText(variant.name) || `${layer.name} reference`,
+        layerName: cleanText(layer.name),
+        notes: cleanText(variant.notes) || cleanText(layer.description),
+        prompt: cleanText(variant.prompt),
+        imageUrl: cleanText(variant.imageUrl),
+        sourceType: "layer-variant",
+        sourceProjectId: cleanText(project.id),
+        sourceProjectTitle: cleanText(project.title),
+        isSelected: cleanText(layer.selectedVariantId) === cleanText(variant.id),
+        createdAt: cleanText(variant.createdAt)
+      });
+    }
+  }
+
+  for (const draft of Array.isArray(project?.draftHistory) ? project.draftHistory : []) {
+    if (!cleanText(draft?.imageUrl)) {
+      continue;
+    }
+
+    candidates.push({
+      id: cleanText(draft.id) || createId("project-ref"),
+      name: cleanText(draft.name) || "Saved draft",
+      layerName: cleanText(draft.committedLayerName || draft.targetLayerName),
+      notes: cleanText(draft.notes),
+      prompt: cleanText(draft.prompt),
+      imageUrl: cleanText(draft.imageUrl),
+      sourceType: "draft",
+      sourceProjectId: cleanText(project.id),
+      sourceProjectTitle: cleanText(project.title),
+      isSelected: cleanText(draft.status) === "committed",
+      createdAt: cleanText(draft.updatedAt || draft.createdAt)
+    });
+  }
+
+  for (const preview of Array.isArray(project?.previewHistory) ? project.previewHistory : []) {
+    if (!cleanText(preview?.imageUrl)) {
+      continue;
+    }
+
+    candidates.push({
+      id: cleanText(preview.id) || createId("project-ref"),
+      name: cleanText(preview.name) || `${cleanText(project.title) || "Project"} Preview`,
+      layerName: "Preview",
+      notes: cleanText(preview.notes),
+      prompt: cleanText(preview.prompt),
+      imageUrl: cleanText(preview.imageUrl),
+      sourceType: "preview",
+      sourceProjectId: cleanText(project.id),
+      sourceProjectTitle: cleanText(project.title),
+      isSelected: cleanText(project.selectedPreviewId) === cleanText(preview.id),
+      createdAt: cleanText(preview.createdAt)
+    });
+  }
+
+  return candidates;
+}
+
+function scoreReferencedProject(project, query) {
+  const projectTitle = cleanText(project?.title).toLowerCase();
+  const projectSlug = slugify(project?.title);
+  const queryLower = cleanText(query).toLowerCase();
+  const querySlug = slugify(queryLower);
+  const tokens = extractProjectReferenceAssetTokens(queryLower);
+  let score = 0;
+
+  if (!queryLower) {
+    return 0;
+  }
+
+  if (projectTitle === queryLower || projectSlug === querySlug) {
+    score += 90;
+  }
+
+  if ((querySlug && projectSlug.includes(querySlug)) || projectTitle.includes(queryLower)) {
+    score += 60;
+  }
+
+  for (const token of tokens) {
+    if (projectTitle === token) {
+      score += 24;
+    } else if (projectTitle.includes(token)) {
+      score += 12;
+    }
+  }
+
+  return score;
+}
+
+function scoreProjectReferenceImageCandidate(candidate, assetPromptText, assetTokens = []) {
+  const lowered = cleanText(assetPromptText).toLowerCase();
+  const tokens = Array.isArray(assetTokens) ? assetTokens : extractProjectReferenceAssetTokens(assetPromptText);
+  const haystack = [
+    cleanText(candidate?.name).toLowerCase(),
+    cleanText(candidate?.layerName).toLowerCase(),
+    cleanText(candidate?.notes).toLowerCase(),
+    cleanText(candidate?.prompt).toLowerCase()
+  ].join(" ");
+  let score = 0;
+
+  if (!tokens.length) {
+    return scoreFallbackProjectReferenceCandidate(candidate);
+  }
+
+  for (const token of tokens) {
+    if (!token) {
+      continue;
+    }
+
+    if (cleanText(candidate?.name).toLowerCase() === token) {
+      score += 18;
+    } else if (cleanText(candidate?.name).toLowerCase().includes(token)) {
+      score += 12;
+    }
+
+    if (cleanText(candidate?.layerName).toLowerCase() === token) {
+      score += 16;
+    } else if (cleanText(candidate?.layerName).toLowerCase().includes(token)) {
+      score += 10;
+    }
+
+    if (haystack.includes(token)) {
+      score += 5;
+    }
+  }
+
+  if (/(background|backdrop|scene|canvas|full bleed)/.test(lowered) && /(background|backdrop|scene|canvas|full bleed)/.test(haystack)) {
+    score += 20;
+  }
+
+  if (/(accent|halo|aura|glow|ring|nebula)/.test(lowered) && /(accent|halo|aura|glow|ring|nebula)/.test(haystack)) {
+    score += 14;
+  }
+
+  if (/(crown|headwear|hat|tiara)/.test(lowered) && /(crown|headwear|hat|tiara)/.test(haystack)) {
+    score += 18;
+  }
+
+  if (/(glasses|eyewear|sunglasses|shades)/.test(lowered) && /(glasses|eyewear|sunglasses|shades)/.test(haystack)) {
+    score += 18;
+  }
+
+  if (/(cosmic|space|nebula|galaxy|star)/.test(lowered) && /(cosmic|space|nebula|galaxy|star)/.test(haystack)) {
+    score += 18;
+  }
+
+  if (candidate?.sourceType === "layer-variant") {
+    score += 4;
+  }
+
+  if (candidate?.isSelected) {
+    score += 4;
+  }
+
+  return score;
+}
+
+function scoreFallbackProjectReferenceCandidate(candidate) {
+  let score = 0;
+  if (candidate?.isSelected) {
+    score += 12;
+  }
+  if (cleanText(candidate?.sourceType) === "layer-variant") {
+    score += 8;
+  }
+  if (cleanText(candidate?.sourceType) === "preview") {
+    score += 6;
+  }
+  return score;
+}
+
+function extractProjectReferenceName(promptText) {
+  const lowered = cleanText(promptText).toLowerCase();
+  const explicitPatterns = [
+    /\b(?:from|using|use|same as|similar to|based on|match(?:ing)?|like)\s+(?:my\s+|the\s+)?([a-z0-9][a-z0-9\s-]{0,40}?)\s+project\b/i,
+    /\bin\s+(?:my\s+|the\s+)?([a-z0-9][a-z0-9\s-]{0,40}?)\s+project\b/i
+  ];
+
+  for (const pattern of explicitPatterns) {
+    const match = lowered.match(pattern);
+    if (match?.[1]) {
+      const cleaned = cleanProjectReferenceName(match[1]);
+      if (cleaned) {
+        return cleaned;
+      }
+    }
+  }
+
+  const tokens = lowered.split(/\s+/).map((token) => token.replace(/[^a-z0-9-]/g, ""));
+  const projectIndex = tokens.lastIndexOf("project");
+  if (projectIndex <= 0) {
+    return "";
+  }
+
+  const nameTokens = [];
+  for (let index = projectIndex - 1; index >= 0 && nameTokens.length < 4; index -= 1) {
+    const token = tokens[index];
+    if (!token || ["the", "my", "a", "an", "from", "in", "on", "like", "using", "use", "same", "as", "similar", "to", "based", "project"].includes(token)) {
+      break;
+    }
+    nameTokens.unshift(token);
+  }
+
+  return cleanProjectReferenceName(nameTokens.join(" "));
+}
+
+function cleanProjectReferenceName(value) {
+  return cleanText(value)
+    .replace(/\b(?:my|the|this|that)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripProjectReferenceClause(promptText) {
+  return cleanText(promptText)
+    .replace(/\b(?:from|using|use|same as|similar to|based on|match(?:ing)?|like|in)\s+(?:my\s+|the\s+)?[a-z0-9][a-z0-9\s-]{0,40}?\s+project\b/gi, " ")
+    .replace(/\b[a-z0-9][a-z0-9\s-]{0,40}?\s+project\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractProjectReferenceAssetTokens(promptText) {
+  return [...new Set(
+    stripProjectReferenceClause(promptText)
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(
+        (token) =>
+          token.length >= 3 &&
+          ![
+            "make",
+            "draw",
+            "create",
+            "generate",
+            "design",
+            "craft",
+            "show",
+            "give",
+            "looks",
+            "look",
+            "like",
+            "from",
+            "with",
+            "that",
+            "this",
+            "other",
+            "project",
+            "layer",
+            "folder",
+            "asset",
+            "trait",
+            "reference",
+            "matching",
+            "match",
+            "same",
+            "based",
+            "using",
+            "used"
+          ].includes(token)
+      )
+  )];
+}
+
+function dedupeReferenceAttachments(attachments) {
+  const seen = new Set();
+  const items = Array.isArray(attachments) ? attachments : [];
+  return items.filter((attachment) => {
+    const key =
+      cleanText(attachment?.imageUrl) ||
+      cleanText(attachment?.id) ||
+      (cleanText(attachment?.dataUrl) ? cleanText(attachment.dataUrl).slice(0, 120) : "");
+    if (!key || seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function shouldUseLatestDraftAsReference(promptText) {
@@ -3923,7 +5296,51 @@ function guessLayerNameFromPrompt(promptText) {
     return name.charAt(0).toUpperCase() + name.slice(1);
   }
 
-  const known = ["background", "body", "base cat", "cat base", "face", "eyes", "mouth", "hat", "headwear", "crown", "tiara", "clothes", "clothing", "fur", "weapon", "sword", "staff", "wand", "gun", "tool", "prop", "handheld", "accessory"];
+  if (isBackgroundAccentPrompt(lowered)) {
+    return "Background Accent";
+  }
+
+  if (isTrueBackgroundPrompt(lowered)) {
+    return "Background";
+  }
+
+  const known = [
+    "background",
+    "body",
+    "base safe",
+    "safe base",
+    "safe door",
+    "door panel",
+    "door face detail",
+    "face plate",
+    "faceplate",
+    "door",
+    "panel",
+    "plate",
+    "hatch",
+    "lid",
+    "base cat",
+    "cat base",
+    "face",
+    "eyes",
+    "mouth",
+    "hat",
+    "headwear",
+    "crown",
+    "tiara",
+    "clothes",
+    "clothing",
+    "fur",
+    "weapon",
+    "sword",
+    "staff",
+    "wand",
+    "gun",
+    "tool",
+    "prop",
+    "handheld",
+    "accessory"
+  ];
   const match = known.find((item) => lowered.includes(item));
   if (!match) {
     return "";
@@ -3935,6 +5352,14 @@ function guessLayerNameFromPrompt(promptText) {
 
   if (["headwear", "hat", "crown", "tiara"].includes(match)) {
     return "Headwear";
+  }
+
+  if (["base safe", "safe base"].includes(match)) {
+    return "Base Safe";
+  }
+
+  if (["safe door", "door panel", "door face detail", "face plate", "faceplate", "door", "panel", "plate", "hatch", "lid"].includes(match)) {
+    return "Safe Door";
   }
 
   if (["weapon", "sword", "staff", "wand", "gun", "tool", "prop", "handheld"].includes(match)) {
@@ -4243,6 +5668,8 @@ async function getPreviewCompositeSources(project) {
 
 async function buildCompositeLayers(source, width, height, baseSource = null) {
   const transform = normalizeLayerTransform(source.transform);
+  const fitProfile = getLayerFitProfile(source.layerName);
+  const clipStrategy = cleanText(fitProfile?.clipStrategy).toLowerCase();
   const metadata = await sharp(source.absolutePath).metadata();
   const baseWidth = Math.max(1, Number(metadata.width || width));
   const baseHeight = Math.max(1, Number(metadata.height || height));
@@ -4262,13 +5689,12 @@ async function buildCompositeLayers(source, width, height, baseSource = null) {
 
   const sourceIndex = Number.isFinite(source.layerIndex) ? Number(source.layerIndex) : -1;
   const baseIndex = Number.isFinite(baseSource?.layerIndex) ? Number(baseSource.layerIndex) : -1;
+  const isBehindBase = baseSource && sourceIndex !== -1 && baseIndex !== -1 && sourceIndex < baseIndex;
+  const isInFrontOfBase = baseSource && sourceIndex !== -1 && baseIndex !== -1 && sourceIndex > baseIndex;
   const shouldWrapBehindBase =
     transform.depthMode === "headwear_wrap" &&
     /headwear|hat|crown|tiara/.test(cleanText(source.layerName).toLowerCase()) &&
-    baseSource &&
-    sourceIndex !== -1 &&
-    baseIndex !== -1 &&
-    sourceIndex < baseIndex;
+    isBehindBase;
 
   if (shouldWrapBehindBase) {
     return [
@@ -4277,6 +5703,40 @@ async function buildCompositeLayers(source, width, height, baseSource = null) {
         left,
         top,
         stage: "headwear-wrap"
+      }
+    ];
+  }
+
+  if (isBehindBase) {
+    if (clipStrategy === "behind_anchor") {
+      const clippedInput = await buildBehindAnchorLayerInput(input, left, top, baseSource, width, height);
+      return [
+        {
+          input: clippedInput,
+          left: 0,
+          top: 0,
+          stage: "behind-base"
+        }
+      ];
+    }
+
+    return [
+      {
+        input,
+        left,
+        top,
+        stage: "behind-base"
+      }
+    ];
+  }
+
+  if (isInFrontOfBase) {
+    return [
+      {
+        input,
+        left,
+        top,
+        stage: "in-front-base"
       }
     ];
   }
@@ -4354,6 +5814,53 @@ async function buildAnchorOccluderPiece(sources, width, height) {
     top,
     stage: "anchor-occluder"
   };
+}
+
+async function buildBehindAnchorLayerInput(sourceInput, sourceLeft, sourceTop, baseSource, width, height) {
+  if (!baseSource?.absolutePath) {
+    return sourceInput;
+  }
+
+  const baseTransform = normalizeLayerTransform(baseSource.transform);
+  const baseMetadata = await sharp(baseSource.absolutePath).metadata();
+  const baseWidth = Math.max(1, Number(baseMetadata.width || width));
+  const baseHeight = Math.max(1, Number(baseMetadata.height || height));
+  const baseTargetWidth = Math.max(1, Math.round(baseWidth * baseTransform.scale));
+  const baseTargetHeight = Math.max(1, Math.round(baseHeight * baseTransform.scale));
+  const baseLeft = Math.round((width - baseTargetWidth) / 2 + baseTransform.x * width);
+  const baseTop = Math.round((height - baseTargetHeight) / 2 + baseTransform.y * height);
+  const baseInput = await sharp(baseSource.absolutePath)
+    .resize({
+      width: baseTargetWidth,
+      height: baseTargetHeight,
+      fit: "contain"
+    })
+    .png()
+    .toBuffer();
+
+  return sharp({
+    create: {
+      width,
+      height,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    }
+  })
+    .composite([
+      {
+        input: sourceInput,
+        left: sourceLeft,
+        top: sourceTop
+      },
+      {
+        input: baseInput,
+        left: baseLeft,
+        top: baseTop,
+        blend: "dest-out"
+      }
+    ])
+    .png()
+    .toBuffer();
 }
 
 function isPrimaryBaseLayerName(layerName) {

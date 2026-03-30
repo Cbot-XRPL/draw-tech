@@ -147,12 +147,33 @@
       "defaultTransform": { "x": 0.22, "y": 0.12, "scale": 0.34 }
     },
     {
-      "id": "background",
-      "label": "Background",
-      "layerKeywords": ["background", "bg", "scene", "backdrop"],
+      "id": "surface-overlay",
+      "label": "Surface Overlay",
+      "layerKeywords": ["safe door", "vault door", "door face detail", "door face", "door", "panel", "face plate", "faceplate", "cover plate", "front plate", "cover", "plate", "hatch", "lid", "window", "screen"],
+      "anchorRegion": "center_surface_region",
+      "clipStrategy": "flat",
+      "guidance": "Trait should map to the central visible front surface, opening, or seat on the active base construct so it reads as a removable overlay piece built for that object rather than a standalone body redraw.",
+      "anchorWidthRatio": 0.64,
+      "anchorHeightRatio": 0.64,
+      "anchorCenterYRatio": 0.5,
+      "defaultTransform": { "x": 0, "y": 0, "scale": 0.64 }
+    },
+    {
+      "id": "background-accent",
+      "label": "Background Accent",
+      "layerKeywords": ["background accent", "accent background", "halo", "aura", "ring", "burst", "glow"],
       "anchorRegion": "full_canvas_behind_subject",
       "clipStrategy": "behind_anchor",
-      "guidance": "Layer belongs behind the anchor construct and should not intrude into the main silhouette.",
+      "guidance": "Layer is a supportive transparent accent behind the anchor construct, not a full painted scene. It should avoid cutting into the main silhouette.",
+      "defaultTransform": { "x": 0, "y": 0, "scale": 1 }
+    },
+    {
+      "id": "background",
+      "label": "Background",
+      "layerKeywords": ["true background", "full background", "full canvas background", "background", "bg", "scene", "backdrop"],
+      "anchorRegion": "full_canvas_background_plate",
+      "clipStrategy": "full_canvas",
+      "guidance": "Layer is a full painted background plate that fills the entire canvas behind every other layer. It should read as the whole scene/background, not a small accent effect.",
       "defaultTransform": { "x": 0, "y": 0, "scale": 1 }
     }
   ]

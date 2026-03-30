@@ -93,7 +93,8 @@ export function createProjectService({ projectsDir }) {
       variantIdeas: Array.isArray(layer.variantIdeas) ? layer.variantIdeas.map(cleanText).filter(Boolean) : [],
       variants: Array.isArray(layer.variants) ? layer.variants : [],
       selectedVariantId: cleanText(layer.selectedVariantId) || null,
-      transform: typeof layer === "object" && layer?.transform ? layer.transform : null
+      transform: typeof layer === "object" && layer?.transform ? layer.transform : null,
+      fitContract: normalizeLayerFitContract(layer?.fitContract)
     };
   }
 
@@ -111,8 +112,52 @@ export function createProjectService({ projectsDir }) {
       variantIdeas: Array.isArray(layer?.variantIdeas) ? layer.variantIdeas.map(cleanText).filter(Boolean) : [],
       variants: Array.isArray(layer?.variants) ? layer.variants : [],
       selectedVariantId: cleanText(typeof layer === "object" ? layer?.selectedVariantId : "") || null,
-      transform: typeof layer === "object" && layer?.transform ? layer.transform : null
+      transform: typeof layer === "object" && layer?.transform ? layer.transform : null,
+      fitContract: normalizeLayerFitContract(typeof layer === "object" ? layer?.fitContract : null)
     };
+  }
+
+  function normalizeLayerFitContract(contract) {
+    if (!contract || typeof contract !== "object") {
+      return null;
+    }
+
+    const normalized = {
+      profileId: cleanText(contract.profileId),
+      profileLabel: cleanText(contract.profileLabel),
+      scope: cleanText(contract.scope) || "anchor",
+      anchorLayerId: cleanText(contract.anchorLayerId),
+      anchorLayerName: cleanText(contract.anchorLayerName),
+      anchorVariantId: cleanText(contract.anchorVariantId),
+      anchorVariantName: cleanText(contract.anchorVariantName),
+      referenceVariantId: cleanText(contract.referenceVariantId),
+      referenceVariantName: cleanText(contract.referenceVariantName),
+      targetWidthRatio: coerceNumber(contract.targetWidthRatio),
+      targetHeightRatio: coerceNumber(contract.targetHeightRatio),
+      targetCenterXOffsetRatio: coerceNumber(contract.targetCenterXOffsetRatio),
+      targetCenterYRatio: coerceNumber(contract.targetCenterYRatio),
+      targetTopRatio: coerceNumber(contract.targetTopRatio),
+      targetBottomRatio: coerceNumber(contract.targetBottomRatio),
+      canvasWidthRatio: coerceNumber(contract.canvasWidthRatio),
+      canvasHeightRatio: coerceNumber(contract.canvasHeightRatio),
+      canvasCenterXRatio: coerceNumber(contract.canvasCenterXRatio),
+      canvasCenterYRatio: coerceNumber(contract.canvasCenterYRatio),
+      canvasTopRatio: coerceNumber(contract.canvasTopRatio),
+      canvasBottomRatio: coerceNumber(contract.canvasBottomRatio),
+      depthMode: cleanText(contract.depthMode),
+      clipStrategy: cleanText(contract.clipStrategy),
+      backCutoff: coerceNumber(contract.backCutoff),
+      frontStart: coerceNumber(contract.frontStart),
+      summary: cleanText(contract.summary),
+      updatedAt: cleanText(contract.updatedAt)
+    };
+
+    return Object.values(normalized).some((value) => value !== "" && value !== null) ? normalized : null;
+  }
+
+  function coerceNumber(value) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   function normalizeCanvas(canvas) {
@@ -198,7 +243,8 @@ export function createProjectService({ projectsDir }) {
         variantIdeas: plannedLayer.variantIdeas || [],
         variants: current?.variants || [],
         selectedVariantId: current?.selectedVariantId || null,
-        transform: current?.transform || null
+        transform: current?.transform || null,
+        fitContract: current?.fitContract || null
       };
     });
   }

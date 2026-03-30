@@ -1,6 +1,10 @@
 const state = {
   project: null,
   config: null,
+  projects: [],
+  projectsLoading: false,
+  projectShelfVisible: false,
+  projectNameDraft: "",
   pendingAttachments: [],
   busy: false,
   fitDebugVisible: false,
@@ -18,11 +22,25 @@ const state = {
   }
 };
 
+const ACTIVE_PROJECT_STORAGE_KEY = "draw-tech-active-project-id";
+
 const elements = {
   apiKeyControls: document.getElementById("apiKeyControls"),
   apiKeyInput: document.getElementById("apiKeyInput"),
   saveKeyBtn: document.getElementById("saveKeyBtn"),
   keyStatus: document.getElementById("keyStatus"),
+  projectStatus: document.getElementById("projectStatus"),
+  saveProjectBtn: document.getElementById("saveProjectBtn"),
+  newProjectBtn: document.getElementById("newProjectBtn"),
+  toggleProjectShelfBtn: document.getElementById("toggleProjectShelfBtn"),
+  projectShelf: document.getElementById("projectShelf"),
+  closeProjectShelfBtn: document.getElementById("closeProjectShelfBtn"),
+  projectNameInput: document.getElementById("projectNameInput"),
+  projectCurrentMeta: document.getElementById("projectCurrentMeta"),
+  saveProjectShelfBtn: document.getElementById("saveProjectShelfBtn"),
+  newProjectShelfBtn: document.getElementById("newProjectShelfBtn"),
+  projectCountBadge: document.getElementById("projectCountBadge"),
+  projectList: document.getElementById("projectList"),
   canvasWidthInput: document.getElementById("canvasWidthInput"),
   canvasHeightInput: document.getElementById("canvasHeightInput"),
   imageUploadInput: document.getElementById("imageUploadInput"),
@@ -53,6 +71,7 @@ const elements = {
   fitDebugSummary: document.getElementById("fitDebugSummary"),
   fitDebugContent: document.getElementById("fitDebugContent"),
   layersPanel: document.getElementById("layersPanel"),
+  newLayerBtn: document.getElementById("newLayerBtn"),
   layerCount: document.getElementById("layerCount"),
   toast: document.getElementById("toast")
 };
@@ -85,6 +104,39 @@ elements.saveKeyBtn.addEventListener("click", async () => {
     render();
     showToast("Session key saved.");
   });
+});
+
+elements.toggleProjectShelfBtn.addEventListener("click", async () => {
+  state.projectShelfVisible = !state.projectShelfVisible;
+  if (state.projectShelfVisible) {
+    await loadProjects();
+  }
+  render();
+});
+
+elements.closeProjectShelfBtn.addEventListener("click", () => {
+  state.projectShelfVisible = false;
+  render();
+});
+
+elements.projectNameInput.addEventListener("input", () => {
+  state.projectNameDraft = elements.projectNameInput.value;
+});
+
+elements.saveProjectBtn.addEventListener("click", async () => {
+  await saveCurrentProject();
+});
+
+elements.saveProjectShelfBtn.addEventListener("click", async () => {
+  await saveCurrentProject();
+});
+
+elements.newProjectBtn.addEventListener("click", async () => {
+  await createNewProject();
+});
+
+elements.newProjectShelfBtn.addEventListener("click", async () => {
+  await createNewProject();
 });
 
 elements.attachImagesBtn.addEventListener("click", () => {
@@ -210,17 +262,163 @@ elements.downloadFitDebugBtn.addEventListener("click", async () => {
   }
 });
 
+elements.newLayerBtn.addEventListener("click", async () => {
+  if (!state.project?.id) {
+    showToast("Start a session first, then add folders.", true);
+    return;
+  }
+
+  const nextName = window.prompt("New layer folder name", "");
+  if (nextName === null) {
+    return;
+  }
+
+  const trimmedName = nextName.trim();
+  if (!trimmedName) {
+    return;
+  }
+
+  await withBusy(async () => {
+    const response = await api(`/api/projects/${state.project.id}/layers`, {
+      method: "POST",
+      body: {
+        name: trimmedName
+      }
+    });
+    await applyProject(response.project);
+    render();
+    showToast(`Created ${response.layer?.name || "new"} folder.`);
+  });
+});
+
 async function bootstrap() {
   await loadConfig();
-  if (state.config?.defaultProjectId) {
-    const response = await api(`/api/projects/${state.config.defaultProjectId}`);
-    await applyProject(response.project);
+  await loadProjects({ silent: true });
+
+  const storedProjectId = getStoredActiveProjectId();
+  const initialProjectId = storedProjectId || state.config?.defaultProjectId || state.projects[0]?.id || "";
+  if (initialProjectId) {
+    const loaded = await tryOpenProject(initialProjectId);
+    if (!loaded && state.config?.defaultProjectId && state.config.defaultProjectId !== initialProjectId) {
+      await tryOpenProject(state.config.defaultProjectId);
+    }
   }
   render();
 }
 
 async function loadConfig() {
   state.config = await api("/api/config");
+}
+
+async function loadProjects(options = {}) {
+  const silent = Boolean(options.silent);
+  state.projectsLoading = true;
+  if (!silent) {
+    renderProjectShelf();
+  }
+
+  try {
+    const response = await api("/api/projects");
+    state.projects = Array.isArray(response.projects) ? response.projects.slice() : [];
+    state.projects.sort((left, right) => new Date(right.updatedAt) - new Date(left.updatedAt));
+  } finally {
+    state.projectsLoading = false;
+    if (!silent) {
+      renderProjectShelf();
+    }
+  }
+}
+
+async function tryOpenProject(projectId) {
+  const targetId = String(projectId || "").trim();
+  if (!targetId) {
+    return false;
+  }
+
+  try {
+    const response = await api(`/api/projects/${targetId}`);
+    await applyProject(response.project);
+    upsertProjectSummary(response.project);
+    return true;
+  } catch (error) {
+    if (getStoredActiveProjectId() === targetId) {
+      clearStoredActiveProjectId();
+    }
+    return false;
+  }
+}
+
+async function openProject(projectId) {
+  await withBusy(async () => {
+    const response = await api(`/api/projects/${projectId}`);
+    state.pendingAttachments = [];
+    elements.promptInput.value = "";
+    await applyProject(response.project);
+    upsertProjectSummary(response.project);
+    state.projectShelfVisible = false;
+    render();
+    showToast(`Opened ${response.project.title || "project"}.`);
+  });
+}
+
+async function saveCurrentProject() {
+  await withBusy(async () => {
+    const title = normalizeProjectTitle(state.projectNameDraft || state.project?.title || "");
+    const canvas = readCanvas();
+    let response;
+
+    if (state.project?.id) {
+      response = await api(`/api/projects/${state.project.id}`, {
+        method: "PUT",
+        body: {
+          title,
+          canvas
+        }
+      });
+    } else {
+      response = await api("/api/projects", {
+        method: "POST",
+        body: {
+          title,
+          artDirection: "",
+          collectionGoal: "Layered NFT build session",
+          canvas,
+          layers: []
+        }
+      });
+    }
+
+    await applyProject(response.project);
+    upsertProjectSummary(response.project);
+    await loadProjects({ silent: true });
+    state.projectShelfVisible = true;
+    render();
+    showToast("Project saved.");
+  });
+}
+
+async function createNewProject() {
+  await withBusy(async () => {
+    const response = await api("/api/projects", {
+      method: "POST",
+      body: {
+        title: buildNewProjectTitle(),
+        artDirection: "",
+        collectionGoal: "Layered NFT build session",
+        canvas: readCanvas(),
+        layers: []
+      }
+    });
+
+    state.pendingAttachments = [];
+    elements.promptInput.value = "";
+    await applyProject(response.project);
+    upsertProjectSummary(response.project);
+    await loadProjects({ silent: true });
+    state.projectShelfVisible = true;
+    render();
+    showToast("New project ready.");
+  });
 }
 
 async function submitPrompt(options = {}) {
@@ -290,12 +488,81 @@ function render() {
   elements.projectTitle.textContent = state.project?.title || "New Session";
   elements.canvasBadge.textContent = formatCanvas(readCanvasFromState());
 
+  renderProjectShelf();
   renderPreview();
   renderPendingAttachments();
   renderChat();
   renderFitDebug();
   renderLayers();
   syncBusyState();
+}
+
+function renderProjectShelf() {
+  const currentProject = state.project;
+  const projectCount = state.projects.length;
+  const currentTitle = currentProject?.title || "";
+  const currentMeta = currentProject
+    ? `${currentProject.layers?.length || 0} folders • ${formatCanvas(currentProject.canvas)} • Auto-saves while you work`
+    : "Save the current build, then open another one whenever you want.";
+
+  elements.projectStatus.textContent = currentProject
+    ? `Project: ${summarizeDisplayText(currentTitle, 32) || "Untitled"}`
+    : "No saved project";
+  elements.projectStatus.className = `badge badge-project${currentProject ? "" : " badge-warn"}`;
+  elements.toggleProjectShelfBtn.classList.toggle("is-active", state.projectShelfVisible);
+  elements.projectShelf.classList.toggle("hidden", !state.projectShelfVisible);
+  elements.projectCurrentMeta.textContent = currentMeta;
+  elements.projectCountBadge.textContent = state.projectsLoading ? "Loading..." : `${projectCount} saved`;
+  elements.saveProjectBtn.textContent = currentProject ? "Save Project" : "Save New Project";
+  elements.saveProjectShelfBtn.textContent = currentProject ? "Save Project" : "Save New Project";
+
+  if (document.activeElement !== elements.projectNameInput) {
+    elements.projectNameInput.value = state.projectNameDraft || currentTitle || "";
+  }
+
+  if (state.projectsLoading) {
+    elements.projectList.className = "project-list empty-state";
+    elements.projectList.textContent = "Loading saved projects...";
+    return;
+  }
+
+  if (!state.projects.length) {
+    elements.projectList.className = "project-list empty-state";
+    elements.projectList.textContent = "Save a project to see it here.";
+    return;
+  }
+
+  elements.projectList.className = "project-list";
+  elements.projectList.innerHTML = state.projects
+    .map((project) => {
+      const active = project.id === currentProject?.id;
+      return `
+        <article class="project-card ${active ? "is-active" : ""}">
+          <div class="project-card-head">
+            <div>
+              <div class="project-card-title">${escapeHtml(project.title || "Untitled NFT Collection")}</div>
+              <div class="project-card-meta">
+                ${escapeHtml(`${project.layerCount || 0} folders • Updated ${formatProjectTimestamp(project.updatedAt)}`)}
+              </div>
+            </div>
+            <span class="badge ${active ? "project-card-badge-active" : ""}">${active ? "Open now" : "Saved"}</span>
+          </div>
+          <div class="project-card-actions">
+            <button
+              class="btn ${active ? "btn-primary" : "btn-ghost"}"
+              type="button"
+              data-action="open-project"
+              data-project-id="${escapeHtml(project.id)}"
+            >
+              ${active ? "Current Project" : "Open Project"}
+            </button>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+
+  bindProjectShelfActions();
 }
 
 function renderPreview() {
@@ -361,7 +628,9 @@ function renderChat() {
   elements.chatLog.className = "chat-log";
   elements.chatLog.innerHTML = messages
     .map(
-      (message) => `
+      (message) => {
+        const generatedTargetLayerName = resolveGeneratedTargetLayerName(message.generatedImage);
+        return `
         <article class="chat-entry ${message.role === "user" ? "user" : "assistant"}">
           <div class="chat-role">${escapeHtml(message.role === "draw-tech" ? "Draw-Tech" : message.role)}</div>
           <div class="chat-text">${escapeHtml(message.text)}</div>
@@ -384,9 +653,9 @@ function renderChat() {
                               class="btn btn-ghost"
                               data-action="commit-draft"
                               data-draft-id="${message.generatedImage.id}"
-                              data-layer-name="${escapeHtml(message.generatedImage.targetLayerName || "")}"
+                              data-layer-name="${escapeHtml(generatedTargetLayerName)}"
                             >
-                              Add To ${escapeHtml(message.generatedImage.targetLayerName || "Layer")}
+                              Add To ${escapeHtml(generatedTargetLayerName || "Layer")}
                             </button>`
                           : ""
                       }
@@ -407,7 +676,8 @@ function renderChat() {
               : ""
           }
         </article>
-      `
+      `;
+      }
     )
     .join("");
   bindChatActions();
@@ -929,6 +1199,20 @@ function bindChatActions() {
         render();
         showToast(`Draft added to ${response.layer?.name || "layer"}.`);
       });
+    });
+  });
+}
+
+function bindProjectShelfActions() {
+  elements.projectList.querySelectorAll("[data-action='open-project']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!button.dataset.projectId || button.dataset.projectId === state.project?.id) {
+        state.projectShelfVisible = false;
+        render();
+        return;
+      }
+
+      await openProject(button.dataset.projectId);
     });
   });
 }
@@ -1540,10 +1824,14 @@ async function withBusy(work) {
 
 async function applyProject(project) {
   state.project = project;
+  state.projectNameDraft = project?.title || "";
   state.fitDebugData = null;
   state.dragState = null;
+  state.dragSelection = null;
   state.pendingDragTransforms = {};
   state.folderDrag = null;
+  upsertProjectSummary(project);
+  storeActiveProjectId(project?.id || "");
   hydrateCanvasFromProject();
   if (state.fitDebugVisible && state.project?.id) {
     await loadFitDebug();
@@ -1594,6 +1882,81 @@ async function api(url, options = {}) {
   return data;
 }
 
+function normalizeProjectTitle(value) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text || "Untitled NFT Collection";
+}
+
+function buildNewProjectTitle() {
+  const untitledCount = state.projects.filter((project) =>
+    /^Untitled NFT Collection(?: \d+)?$/i.test(String(project.title || "").trim())
+  ).length;
+  return untitledCount ? `Untitled NFT Collection ${untitledCount + 1}` : "Untitled NFT Collection";
+}
+
+function summarizeProjectClient(project) {
+  return {
+    id: project.id,
+    title: project.title,
+    layerCount: Array.isArray(project.layers) ? project.layers.length : 0,
+    updatedAt: project.updatedAt,
+    createdAt: project.createdAt
+  };
+}
+
+function upsertProjectSummary(project) {
+  if (!project?.id) {
+    return;
+  }
+
+  const summary = summarizeProjectClient(project);
+  const existingIndex = state.projects.findIndex((item) => item.id === summary.id);
+  if (existingIndex >= 0) {
+    state.projects.splice(existingIndex, 1, summary);
+  } else {
+    state.projects.unshift(summary);
+  }
+  state.projects.sort((left, right) => new Date(right.updatedAt) - new Date(left.updatedAt));
+}
+
+function getStoredActiveProjectId() {
+  try {
+    return window.localStorage.getItem(ACTIVE_PROJECT_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function storeActiveProjectId(projectId) {
+  try {
+    if (projectId) {
+      window.localStorage.setItem(ACTIVE_PROJECT_STORAGE_KEY, String(projectId));
+    } else {
+      window.localStorage.removeItem(ACTIVE_PROJECT_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage issues in private or restricted browsers.
+  }
+}
+
+function clearStoredActiveProjectId() {
+  storeActiveProjectId("");
+}
+
+function formatProjectTimestamp(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) {
+    return "recently";
+  }
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(date);
+}
+
 function showToast(message, isError = false) {
   elements.toast.textContent = message;
   elements.toast.className = "toast";
@@ -1626,6 +1989,68 @@ function summarizeDisplayText(value, maxLength = 140) {
   }
 
   return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function resolveGeneratedTargetLayerName(image) {
+  if (!image) {
+    return "";
+  }
+
+  const explicit = String(image.targetLayerName || "").trim();
+  const combined = [image.name, image.notes, image.prompt].filter(Boolean).join(" ").toLowerCase();
+  if (isTrueBackgroundPromptText(combined)) {
+    return "Background";
+  }
+  if (explicit.toLowerCase() === "true background") {
+    return "Background";
+  }
+  if (explicit) {
+    return explicit;
+  }
+  if (isBackgroundAccentPromptText(combined)) {
+    return "Background Accent";
+  }
+  return "";
+}
+
+function isBackgroundAccentPromptText(value) {
+  const lowered = String(value || "").toLowerCase();
+  return (
+    /\bbackground accent\b/.test(lowered) ||
+    /\baccent background\b/.test(lowered) ||
+    /\bhalo\b/.test(lowered) ||
+    /\baura\b/.test(lowered) ||
+    /\bglow\b/.test(lowered) ||
+    /\bring\b/.test(lowered) ||
+    /\bburst\b/.test(lowered)
+  );
+}
+
+function isTrueBackgroundPromptText(value) {
+  const lowered = String(value || "").toLowerCase();
+  if (!/\bbackground\b|\bbg\b|\bbackdrop\b|\bscene\b/.test(lowered)) {
+    return false;
+  }
+
+  if (isBackgroundAccentPromptText(lowered)) {
+    return false;
+  }
+
+  return (
+    /\btrue background\b/.test(lowered) ||
+    /\bfull background\b/.test(lowered) ||
+    /\bfull paint background\b/.test(lowered) ||
+    /\bfull canvas background\b/.test(lowered) ||
+    /\bfull bleed\b/.test(lowered) ||
+    /\bfill(?:s|ing)? the canvas\b/.test(lowered) ||
+    /\bentire canvas\b/.test(lowered) ||
+    /\bwhole canvas\b/.test(lowered) ||
+    /\bedge to edge\b/.test(lowered) ||
+    /\bbehind everything\b/.test(lowered) ||
+    /\bsolid white\b/.test(lowered) ||
+    /\bsolid black\b/.test(lowered) ||
+    /\bsolid color\b/.test(lowered)
+  );
 }
 
 function buildAssetUrl(url, cacheKey = "") {

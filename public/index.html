@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=34" />
+    <link rel="stylesheet" href="/styles.css?v=37" />
   </head>
   <body>
     <div class="app-shell">
@@ -29,9 +29,53 @@
             <button id="saveKeyBtn" class="btn btn-primary">Use Key</button>
           </div>
           <span id="keyStatus" class="badge badge-warn">No key</span>
+          <span id="projectStatus" class="badge badge-project">No saved project</span>
+          <button id="saveProjectBtn" class="btn btn-ghost" type="button">Save Project</button>
+          <button id="newProjectBtn" class="btn btn-ghost" type="button">New Project</button>
+          <button id="toggleProjectShelfBtn" class="btn btn-ghost" type="button">Projects</button>
           <button id="downloadHashlipsBtn" class="btn btn-ghost">Download All Layers</button>
         </div>
       </header>
+
+      <section id="projectShelf" class="panel project-shelf hidden">
+        <div class="project-shelf-head">
+          <div>
+            <p class="eyebrow">Project Shelf</p>
+            <h2>Save And Reopen Builds</h2>
+          </div>
+          <button id="closeProjectShelfBtn" class="btn btn-ghost" type="button">Close</button>
+        </div>
+
+        <div class="project-shelf-grid">
+          <section class="project-current-card">
+            <p class="project-section-label">Current Project</p>
+            <label class="mini-field project-name-field">
+              <span>Project name</span>
+              <input id="projectNameInput" type="text" placeholder="Untitled NFT Collection" />
+            </label>
+            <div id="projectCurrentMeta" class="project-current-meta">
+              Save the current build, then open another one whenever you want.
+            </div>
+            <div class="project-current-actions">
+              <button id="saveProjectShelfBtn" class="btn btn-primary" type="button">Save Project</button>
+              <button id="newProjectShelfBtn" class="btn btn-ghost" type="button">New Project</button>
+            </div>
+          </section>
+
+          <section class="project-library-card">
+            <div class="project-library-head">
+              <div>
+                <p class="project-section-label">Saved Projects</p>
+                <p class="project-library-copy">Jump back into older builds anytime.</p>
+              </div>
+              <span id="projectCountBadge" class="badge">0 saved</span>
+            </div>
+            <div id="projectList" class="project-list empty-state">
+              Save a project to see it here.
+            </div>
+          </section>
+        </div>
+      </section>
 
       <section class="prompt-card">
         <div class="prompt-copy">
@@ -159,7 +203,10 @@
             <p class="eyebrow">Layer Breakout</p>
             <h2>Folders</h2>
           </div>
-          <span id="layerCount" class="badge">0 layers</span>
+          <div class="panel-head-actions">
+            <button id="newLayerBtn" class="btn btn-ghost" type="button">New Folder</button>
+            <span id="layerCount" class="badge">0 layers</span>
+          </div>
         </div>
         <div id="layersPanel" class="layer-folder-list empty-state">
           Layer folders will appear here after the first prompt.
@@ -167,7 +214,7 @@
       </section>
 
       <div id="toast" class="toast hidden"></div>
-      <script type="module" src="/app.js?v=34"></script>
+      <script type="module" src="/app.js?v=37"></script>
     </div>
   </body>
 </html>
