@@ -7,6 +7,8 @@ const state = {
   projectNameDraft: "",
   pendingAttachments: [],
   busy: false,
+  lastFailedPrompt: null,
+  hiddenLayers: new Set(),
   fitDebugVisible: false,
   fitDebugLoading: false,
   fitDebugData: null,
@@ -157,6 +159,19 @@ elements.sendPromptBtn.addEventListener("click", async () => {
   await submitPrompt();
 });
 
+document.addEventListener("keydown", async (e) => {
+  if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && document.activeElement === elements.promptInput) {
+    e.preventDefault();
+    await submitPrompt();
+  }
+  if (e.key === "Escape") {
+    if (state.projectShelfVisible) {
+      state.projectShelfVisible = false;
+      render();
+    }
+  }
+});
+
 elements.toggleFitDebugBtn.addEventListener("click", async () => {
   state.fitDebugVisible = !state.fitDebugVisible;
   if (state.fitDebugVisible && state.project?.id && !state.fitDebugData) {
@@ -200,7 +215,27 @@ elements.dragScaleUpBtn.addEventListener("click", () => {
 });
 
 elements.refreshPreviewBtn.addEventListener("click", async () => {
-  await submitPrompt({ rerunLatest: true, preservePrompt: true });
+  if (!state.project?.id) {
+    showToast("Save a project first.", true);
+    return;
+  }
+
+  const hasVariants = (state.project.layers || []).some((l) => l.variants && l.variants.length > 0);
+  if (!hasVariants) {
+    showToast("Generate some layer variants first.", true);
+    return;
+  }
+
+  await withBusy(async () => {
+    const response = await api(`/api/projects/${state.project.id}/shuffle`, {
+      method: "POST"
+    });
+
+    await applyProject(response.project);
+    render();
+    const picks = (response.shuffled || []).map((s) => s.variantName).join(", ");
+    showToast(picks ? `Shuffled: ${picks}` : "Shuffled variants.");
+  });
 });
 
 elements.stageLayerStack.addEventListener("pointerdown", handleStageLayerPointerDown);
@@ -429,23 +464,37 @@ async function submitPrompt(options = {}) {
   }
 
   await withBusy(async () => {
-    const response = await api("/api/chat", {
-      method: "POST",
-      body: {
-        projectId: state.project?.id || null,
-        prompt,
-        canvas: readCanvas(),
-        attachmentIds: state.pendingAttachments.map((item) => item.id)
-      }
-    });
+    showChatLoading(prompt);
+    try {
+      const response = await api("/api/chat", {
+        method: "POST",
+        body: {
+          projectId: state.project?.id || null,
+          prompt,
+          canvas: readCanvas(),
+          attachmentIds: state.pendingAttachments.map((item) => item.id)
+        }
+      });
 
-    await applyProject(response.project);
-    if (!options.preservePrompt) {
-      elements.promptInput.value = "";
+      state.lastFailedPrompt = null;
+      await applyProject(response.project);
+      if (!options.preservePrompt) {
+        elements.promptInput.value = "";
+      }
+      state.pendingAttachments = [];
+      render();
+
+      const warns = response.qualityWarnings || [];
+      if (warns.length) {
+        showToast(`${response.assistantReply || "Done."}\n⚠ ${warns.join(" • ")}`, true);
+      } else {
+        showToast(response.assistantReply || "Done.");
+      }
+    } catch (error) {
+      state.lastFailedPrompt = prompt;
+      hideChatLoading();
+      throw error;
     }
-    state.pendingAttachments = [];
-    render();
-    showToast(response.assistantReply || "Done.");
   });
 }
 
@@ -537,10 +586,16 @@ function renderProjectShelf() {
     .map((project) => {
       const active = project.id === currentProject?.id;
       return `
-        <article class="project-card ${active ? "is-active" : ""}">
+        <article class="project-card ${active ? "is-active" : ""}" data-card-id="${escapeHtml(project.id)}" data-action="open-project" data-project-id="${escapeHtml(project.id)}">
           <div class="project-card-head">
             <div>
               <div class="project-card-title">${escapeHtml(project.title || "Untitled NFT Collection")}</div>
+              <input
+                class="project-card-rename-input hidden"
+                type="text"
+                value="${escapeHtml(project.title || "Untitled NFT Collection")}"
+                data-project-id="${escapeHtml(project.id)}"
+              />
               <div class="project-card-meta">
                 ${escapeHtml(`${project.layerCount || 0} folders • Updated ${formatProjectTimestamp(project.updatedAt)}`)}
               </div>
@@ -549,12 +604,12 @@ function renderProjectShelf() {
           </div>
           <div class="project-card-actions">
             <button
-              class="btn ${active ? "btn-primary" : "btn-ghost"}"
+              class="btn btn-ghost btn-compact"
               type="button"
-              data-action="open-project"
+              data-action="rename-project"
               data-project-id="${escapeHtml(project.id)}"
             >
-              ${active ? "Current Project" : "Open Project"}
+              Rename
             </button>
           </div>
         </article>
@@ -619,9 +674,12 @@ function renderPreview() {
 
 function renderChat() {
   const messages = state.project?.chatHistory || [];
-  if (!messages.length) {
+  if (!messages.length && !state.busy) {
     elements.chatLog.className = "chat-log empty-state";
-    elements.chatLog.textContent = "Send a prompt to start the session.";
+    elements.chatLog.innerHTML = `<div class="chat-empty-guide">
+      <p>Send a prompt to start building.</p>
+      <p class="chat-empty-tips">Try something like:<br>"Make me a cyber frog NFT with layered traits"<br>"Generate a full preview of a pixel art robot collection"</p>
+    </div>`;
     return;
   }
 
@@ -630,9 +688,13 @@ function renderChat() {
     .map(
       (message) => {
         const generatedTargetLayerName = resolveGeneratedTargetLayerName(message.generatedImage);
+        const timestamp = message.createdAt ? formatChatTimestamp(message.createdAt) : "";
         return `
         <article class="chat-entry ${message.role === "user" ? "user" : "assistant"}">
-          <div class="chat-role">${escapeHtml(message.role === "draw-tech" ? "Draw-Tech" : message.role)}</div>
+          <div class="chat-entry-head">
+            <div class="chat-role">${escapeHtml(message.role === "draw-tech" ? "Draw-Tech" : message.role)}</div>
+            ${timestamp ? `<span class="chat-timestamp">${escapeHtml(timestamp)}</span>` : ""}
+          </div>
           <div class="chat-text">${escapeHtml(message.text)}</div>
           ${
             message.generatedImage?.imageUrl
@@ -680,13 +742,23 @@ function renderChat() {
       }
     )
     .join("");
+
+  if (state.lastFailedPrompt) {
+    elements.chatLog.insertAdjacentHTML("beforeend", `
+      <article class="chat-entry chat-entry-error">
+        <div class="chat-role">Error</div>
+        <div class="chat-text">Generation failed. <button class="btn btn-ghost btn-retry" data-action="retry-prompt">Retry</button></div>
+      </article>
+    `);
+  }
+
   bindChatActions();
 }
 
 function renderFitDebug() {
   const hasProject = Boolean(state.project?.id);
   elements.toggleFitDebugBtn.classList.toggle("is-active", state.fitDebugVisible);
-  elements.toggleFitDebugBtn.textContent = state.fitDebugVisible ? "Hide Fit Debug" : "Fit Debug";
+  elements.toggleFitDebugBtn.textContent = state.fitDebugVisible ? "Hide Inspector" : "Layer Inspector";
   elements.fitDebugPanel.classList.toggle("hidden", !state.fitDebugVisible || !hasProject);
 
   if (!state.fitDebugVisible || !hasProject) {
@@ -853,6 +925,15 @@ function renderLayers() {
               </div>
             </div>
             <div class="folder-actions">
+              <button
+                class="btn btn-ghost btn-visibility${state.hiddenLayers.has(layer.id) ? " is-hidden-layer" : ""}"
+                data-action="toggle-layer-visibility"
+                data-layer-id="${layer.id}"
+                title="${state.hiddenLayers.has(layer.id) ? "Show layer in preview" : "Hide layer from preview"}"
+                aria-label="Toggle ${escapeHtml(layer.name)} visibility"
+              >
+                ${state.hiddenLayers.has(layer.id) ? "Hidden" : "Visible"}
+              </button>
               <button
                 class="btn btn-ghost btn-stack"
                 data-action="move-layer-back"
@@ -1201,19 +1282,112 @@ function bindChatActions() {
       });
     });
   });
+
+  elements.chatLog.querySelectorAll("[data-action='retry-prompt']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!state.lastFailedPrompt) return;
+      const prompt = state.lastFailedPrompt;
+      state.lastFailedPrompt = null;
+      elements.promptInput.value = prompt;
+      await submitPrompt({ preservePrompt: true });
+    });
+  });
 }
 
 function bindProjectShelfActions() {
-  elements.projectList.querySelectorAll("[data-action='open-project']").forEach((button) => {
-    button.addEventListener("click", async () => {
-      if (!button.dataset.projectId || button.dataset.projectId === state.project?.id) {
+  elements.projectList.querySelectorAll(".project-card[data-action='open-project']").forEach((card) => {
+    card.addEventListener("click", async (e) => {
+      if (e.target.closest("[data-action='rename-project']") || e.target.closest("[data-action='confirm-rename']") || e.target.closest(".project-card-rename-input")) {
+        return;
+      }
+
+      const projectId = card.dataset.projectId;
+      if (!projectId || projectId === state.project?.id) {
         state.projectShelfVisible = false;
         render();
         return;
       }
 
-      await openProject(button.dataset.projectId);
+      await openProject(projectId);
     });
+  });
+
+  elements.projectList.querySelectorAll("[data-action='rename-project']").forEach((button) => {
+    button.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const projectId = button.dataset.projectId;
+      const card = elements.projectList.querySelector(`[data-card-id="${projectId}"]`);
+      if (!card) return;
+
+      const titleEl = card.querySelector(".project-card-title");
+      const inputEl = card.querySelector(".project-card-rename-input");
+      if (!titleEl || !inputEl) return;
+
+      titleEl.classList.add("hidden");
+      inputEl.classList.remove("hidden");
+      inputEl.focus();
+      inputEl.select();
+
+      button.textContent = "Save Name";
+      button.dataset.action = "confirm-rename";
+    });
+  });
+
+  elements.projectList.querySelectorAll("[data-action='confirm-rename']").forEach((button) => {
+    button.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const projectId = button.dataset.projectId;
+      const card = elements.projectList.querySelector(`[data-card-id="${projectId}"]`);
+      const inputEl = card?.querySelector(".project-card-rename-input");
+      if (inputEl) finishProjectRename(projectId, inputEl.value);
+    });
+  });
+
+  elements.projectList.querySelectorAll(".project-card-rename-input").forEach((inputEl) => {
+    inputEl.addEventListener("click", (e) => e.stopPropagation());
+
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        finishProjectRename(inputEl.dataset.projectId, inputEl.value);
+      }
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        render();
+      }
+    });
+
+    inputEl.addEventListener("blur", () => {
+      setTimeout(() => {
+        const card = inputEl.closest(".project-card");
+        if (card && card.querySelector("[data-action='confirm-rename']")) {
+          finishProjectRename(inputEl.dataset.projectId, inputEl.value);
+        }
+      }, 150);
+    });
+  });
+}
+
+async function finishProjectRename(projectId, rawTitle) {
+  const newTitle = normalizeProjectTitle(rawTitle);
+  if (!newTitle || !projectId) return;
+
+  await withBusy(async () => {
+    await api(`/api/projects/${projectId}`, {
+      method: "PUT",
+      body: { title: newTitle }
+    });
+
+    const entry = state.projects.find((p) => p.id === projectId);
+    if (entry) entry.title = newTitle;
+
+    if (state.project?.id === projectId) {
+      state.project.title = newTitle;
+      state.projectNameDraft = newTitle;
+    }
+
+    render();
+    showToast("Project renamed.");
   });
 }
 
@@ -1246,6 +1420,7 @@ function getSelectedPreview() {
 function getSelectedLayerEntries() {
   return (state.project?.layers || [])
     .map((layer, layerIndex) => {
+      if (state.hiddenLayers.has(layer.id)) return null;
       const variant = layer.variants.find((item) => item.id === layer.selectedVariantId);
       const usesCustomTransform = isVariantUsingCustomTransform(variant);
       return variant
@@ -1957,14 +2132,55 @@ function formatProjectTimestamp(value) {
   }).format(date);
 }
 
+function formatChatTimestamp(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return "";
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function showChatLoading(promptText) {
+  const el = document.getElementById("chatLoadingIndicator");
+  if (el) el.remove();
+  elements.chatLog.insertAdjacentHTML("beforeend", `
+    <article id="chatLoadingIndicator" class="chat-entry chat-entry-loading">
+      <div class="chat-role">Draw-Tech</div>
+      <div class="chat-text chat-loading-text">
+        <span class="chat-loading-dots"></span> Working on it...
+      </div>
+    </article>
+  `);
+  elements.chatLog.scrollTop = elements.chatLog.scrollHeight;
+}
+
+function hideChatLoading() {
+  const el = document.getElementById("chatLoadingIndicator");
+  if (el) el.remove();
+}
+
 function showToast(message, isError = false) {
   elements.toast.textContent = message;
   elements.toast.className = "toast";
-  elements.toast.style.borderColor = isError ? "rgba(255,120,120,0.4)" : "rgba(15,123,108,0.45)";
-  clearTimeout(showToast.timer);
-  showToast.timer = setTimeout(() => {
-    elements.toast.className = "toast hidden";
-  }, 3000);
+  if (isError) {
+    elements.toast.style.borderColor = "rgba(255,120,120,0.4)";
+    const dismiss = document.createElement("button");
+    dismiss.className = "toast-dismiss";
+    dismiss.textContent = "\u00d7";
+    dismiss.onclick = () => { elements.toast.className = "toast hidden"; };
+    elements.toast.appendChild(dismiss);
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => {
+      elements.toast.className = "toast hidden";
+    }, 10000);
+  } else {
+    elements.toast.style.borderColor = "rgba(15,123,108,0.45)";
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => {
+      elements.toast.className = "toast hidden";
+    }, 3000);
+  }
 }
 
 function getAspectRatio(canvas) {

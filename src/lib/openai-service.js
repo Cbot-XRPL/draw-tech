@@ -41,6 +41,8 @@ async function routeUserPrompt(apiKey, project, memory, brain, toolManifest, pro
     "For draft_variant, use variantNameHint to capture the specific fresh trait the user asked for.",
     "If an existing semantic folder clearly fits the draft, such as crowns or hats mapping to Headwear, prefer that folder name as targetLayerName unless the user explicitly asks for a separate folder or its own layer.",
     "variantDirection should capture the requested visual change in a short art-director style phrase.",
+    "If the user mentions a specific trait, accessory, or asset type (crown, hat, glasses, background, prop) even alongside overall scene language, prefer draft_variant over preview unless they explicitly say they want a full new collection preview.",
+    "If ambiguous between edit_layer_variant and transform_layer_variant, prefer transform when the user only mentions position words (move, shift, scale, center, lower, raise, nudge, resize) and prefer edit when they mention visual changes (recolor, remove feature, add detail, restyle).",
     "If the user is only changing the canvas, use update_canvas.",
     "Do not include markdown."
   ].join("\n");
@@ -135,7 +137,12 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory, bra
     "Trait assets like headwear, eyewear, neckwear, outfits, and accessories should be sized and composed to fit the active base construct immediately instead of assuming a blank canvas.",
     "If the target layer has an approved family fit contract, every new variant must preserve that same seat, overlap, and clipping pattern so swapping variants does not degrade stack quality.",
     "If a saved-project reference image is attached, use it as a visual example for the requested layer look, mood, or construction while still creating a fresh asset for the current project.",
-    "Make each new variant meaningfully different from earlier ones instead of tiny color drift."
+    "Make each new variant meaningfully different from earlier ones instead of tiny color drift.",
+    "Vary across multiple dimensions: silhouette shape, material or texture, color family, pattern, and theme.",
+    "Avoid producing two variants that only differ by hue shift or minor detail placement.",
+    `The project canvas is ${project.canvas?.width || 1024}x${project.canvas?.height || 1024} pixels (${project.canvas?.aspect || "square"}).`,
+    "Maintain consistent lighting direction (top-left soft light) and shadow style across all variants so layers composite naturally.",
+    "Every variant must match the same light source angle and shadow intensity established by the base/anchor layer."
   ].join("\n");
 
   const payload = {
@@ -296,10 +303,12 @@ function buildTransparentPrompt({ project, layer, promptText }) {
     activeConstruct,
     layerFitGuidance,
     "If an anchor or example reference image is attached, use it as a construction map for scale, curvature, seat geometry, edge spacing, and contact points while still outputting only the isolated requested trait.",
+    `Canvas: ${project.canvas?.width || 1024}x${project.canvas?.height || 1024} pixels, ${project.canvas?.aspect || "square"} aspect ratio.`,
     "Output a single isolated asset only.",
     "Transparent background.",
     "No mockup, no scene, no body parts from other layers, no labels, no watermark.",
-    "Centered composition, stack-friendly proportions, crisp edges, PNG-ready."
+    "Centered composition, stack-friendly proportions, crisp edges, PNG-ready.",
+    "Use consistent top-left soft lighting and matching shadow direction so this asset composites cleanly with other layers."
   ];
 
   return fragments.filter(Boolean).join(" ");
@@ -316,12 +325,15 @@ function buildFullCanvasBackgroundPrompt({ project, layer, promptText }) {
     layer.placementNotes ? `Placement notes: ${layer.placementNotes}.` : "",
     activeConstruct,
     layerFitGuidance,
+    `Canvas: ${project.canvas?.width || 1024}x${project.canvas?.height || 1024} pixels, ${project.canvas?.aspect || "square"} aspect ratio.`,
     "Output one full painted background plate only.",
     "Fill the entire canvas edge to edge behind every other layer.",
     "This is not a halo, accent ring, sticker, trait cutout, or floating object.",
     "No character, no crown, no glasses, no body part redraw, no isolated prop, no text, no watermark.",
     "Opaque full-canvas background allowed and preferred unless transparency is explicitly requested.",
-    "Leave readable breathing room for the foreground subject so the stack still reads clearly."
+    "Keep the center 60% of the canvas low-contrast or softly blurred so the foreground subject remains readable when stacked.",
+    "Push visual interest toward edges and corners so the subject silhouette pops clearly.",
+    "Use consistent top-left soft lighting direction to match the rest of the layer stack."
   ];
 
   return fragments.filter(Boolean).join(" ");

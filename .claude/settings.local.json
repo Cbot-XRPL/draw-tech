@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -c src/server.js)",
+      "Bash(node -c src/lib/openai-service.js)",
+      "Bash(node -c public/app.js)"
+    ]
+  }
+}

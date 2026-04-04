@@ -638,7 +638,10 @@ app.post("/api/chat", async (req, res, next) => {
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
 
-    res.json({ project, memory, action, assistantReply });
+    const latestDraft = (project.draftHistory || [])[0];
+    const qualitySource = latestDraft?.analysis ? latestDraft : null;
+    const qualityWarnings = buildQualityWarnings(qualitySource);
+    res.json({ project, memory, action, assistantReply, qualityWarnings });
   } catch (error) {
     next(error);
   }
@@ -791,21 +794,53 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
     const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
     await fs.mkdir(variantFolder, { recursive: true });
 
+    const isBackground = isFullCanvasBackgroundLayerName(layer.name);
+    const isBase = isPrimaryBaseLayerName(layer.name);
+    const backgroundMode = isBackground ? "opaque" : "transparent";
+    const anchorRef = (!isBackground && !isBase)
+      ? await getActiveAnchorReferenceAttachment(project, layer)
+      : null;
+
     const variants = [];
+    const warnings = [];
     for (const item of plan.variants) {
-      const imageAsset = await openaiService.generateImageAsset({
-        apiKey,
-        prompt: item.prompt,
-        size: project.canvas.generationSize,
-        background: "transparent"
-      });
+      let imageAsset;
+      if (anchorRef?.dataUrl) {
+        imageAsset = await openaiService.editImageAsset({
+          apiKey,
+          prompt: item.prompt,
+          images: [anchorRef.dataUrl],
+          background: backgroundMode,
+          inputFidelity: "low"
+        });
+      } else {
+        imageAsset = await openaiService.generateImageAsset({
+          apiKey,
+          prompt: item.prompt,
+          size: project.canvas.generationSize,
+          background: backgroundMode
+        });
+      }
+
+      const resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+      const analysis = await inspectVariantAgainstLayer(layer, resizedBuffer);
+
+      if (analysis.possibleDuplicate) {
+        warnings.push(`${item.name} looks very similar to ${analysis.strongestMatchName}`);
+      }
+      if (!isBackground && analysis.alphaCoverage === 1) {
+        warnings.push(`${item.name} has no transparency — may need a transparent background`);
+      }
+      if (!isBackground && !isBase && analysis.touchesEdge) {
+        warnings.push(`${item.name} bleeds to canvas edge — may not stack cleanly`);
+      }
+      if (analysis.emptyAlpha) {
+        warnings.push(`${item.name} appears completely empty/transparent`);
+      }
 
       const variantId = createId("variant");
       const filename = `${variantId}.png`;
-      await fs.writeFile(
-        path.join(variantFolder, filename),
-        await resizePng(imageAsset.buffer, project.canvas)
-      );
+      await fs.writeFile(path.join(variantFolder, filename), resizedBuffer);
 
       variants.push({
         id: variantId,
@@ -813,6 +848,7 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
         notes: item.notes,
         prompt: item.prompt,
         imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
+        analysis,
         createdAt: new Date().toISOString()
       });
     }
@@ -830,7 +866,7 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
       detail: variants.map((variant) => variant.name).join(", ")
     });
     memory = await refreshMemoryIfPossible(project, memory, apiKey);
-    res.json({ project, variants, memory });
+    res.json({ project, variants, warnings, memory });
   } catch (error) {
     next(error);
   }
@@ -937,6 +973,28 @@ app.get("/api/projects/:projectId/export/hashlips", async (req, res, next) => {
   }
 });
 
+app.post("/api/projects/:projectId/shuffle", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const shuffled = [];
+
+    for (const layer of project.layers) {
+      const variants = Array.isArray(layer.variants) ? layer.variants : [];
+      if (variants.length > 0) {
+        const pick = variants[Math.floor(Math.random() * variants.length)];
+        layer.selectedVariantId = pick.id;
+        shuffled.push({ layerName: layer.name, variantName: pick.name });
+      }
+    }
+
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    res.json({ project, shuffled });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/projects/:projectId/layers/:layerId/select", async (req, res, next) => {
   try {
     const project = await projectService.readProject(req.params.projectId);
@@ -996,7 +1054,7 @@ app.post("/api/projects/:projectId/layers/:layerId/transform", async (req, res, 
     }
 
     const requestedScope = cleanText(req.body?.scope).toLowerCase();
-    const useVariantTransform = requestedScope === "variant" || isVariantUsingCustomTransform(variant);
+    const useVariantTransform = requestedScope === "variant" || (requestedScope !== "layer" && isVariantUsingCustomTransform(variant));
     const currentTransform = useVariantTransform
       ? getVariantPlacementTransform(layer, variant)
       : getLayerPlacementTransform(layer, variant);
@@ -1553,7 +1611,8 @@ async function resizePng(buffer, canvas) {
     .resize({
       width: canvas.width,
       height: canvas.height,
-      fit: "fill"
+      fit: "contain",
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
     })
     .png()
     .toBuffer();
@@ -5114,6 +5173,33 @@ function toPublicAttachment(attachment) {
   };
 }
 
+function buildQualityWarnings(generatedImage) {
+  if (!generatedImage) return [];
+  const warnings = [];
+  const analysis = generatedImage.analysis || null;
+  const name = cleanText(generatedImage.name) || "Generated image";
+  const layerName = cleanText(generatedImage.targetLayerName);
+  const isBg = isFullCanvasBackgroundLayerName(layerName);
+  const isBase = isPrimaryBaseLayerName(layerName);
+
+  if (!analysis) return warnings;
+
+  if (analysis.possibleDuplicate && analysis.strongestMatchName) {
+    warnings.push(`${name} looks very similar to "${analysis.strongestMatchName}" — may be a near-duplicate.`);
+  }
+  if (!isBg && analysis.alphaCoverage === 1) {
+    warnings.push(`${name} has no transparency. Trait layers should have a transparent background.`);
+  }
+  if (!isBg && !isBase && analysis.touchesEdge) {
+    warnings.push(`${name} bleeds to the canvas edge — it may not stack cleanly with other layers.`);
+  }
+  if (analysis.emptyAlpha) {
+    warnings.push(`${name} appears completely empty or transparent.`);
+  }
+
+  return warnings;
+}
+
 function toAssistantGeneratedImage(item) {
   if (!item?.imageUrl) {
     return null;
@@ -5641,8 +5727,8 @@ async function getPreviewCompositeSources(project) {
         analysis: meta.analysis || null
       });
       seen.add(cleanUrl);
-    } catch {
-      // Ignore missing assets so one broken file does not stop the composite render.
+    } catch (err) {
+      console.warn(`[composite] Skipping missing asset: ${cleanUrl} — ${err.message || "file not found"}`);
     }
   };
 
