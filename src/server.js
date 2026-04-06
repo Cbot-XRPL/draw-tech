@@ -222,6 +222,98 @@ app.put("/api/projects/:projectId", async (req, res, next) => {
   }
 });
 
+app.delete("/api/projects/:projectId", async (req, res, next) => {
+  try {
+    const projectId = req.params.projectId;
+    const filePath = path.join(projectsDir, `${projectId}.json`);
+    await fs.unlink(filePath).catch(() => {});
+    const memoryPath = path.join(memoryDir, `${projectId}.json`);
+    await fs.unlink(memoryPath).catch(() => {});
+    res.json({ ok: true, deletedId: projectId });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/layers/:layerId/upload-variant", upload.single("image"), async (req, res, next) => {
+  try {
+    if (!req.file) { res.status(400).json({ error: "No image file provided." }); return; }
+    const project = await projectService.readProject(req.params.projectId);
+    const layer = project.layers.find((item) => item.id === req.params.layerId);
+    if (!layer) { res.status(404).json({ error: "Layer not found." }); return; }
+
+    const variantId = createId("variant");
+    const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
+    await fs.mkdir(variantFolder, { recursive: true });
+    const filename = `${variantId}.png`;
+    const buffer = await sharp(req.file.buffer).png().toBuffer();
+    const resized = await resizePng(buffer, project.canvas);
+    await fs.writeFile(path.join(variantFolder, filename), resized);
+
+    const variantName = cleanText(req.body?.name) || req.file.originalname?.replace(/\.[^.]+$/, "") || "Uploaded Variant";
+    const variant = {
+      id: variantId,
+      name: variantName,
+      notes: "Manually uploaded",
+      prompt: "",
+      imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
+      rarityWeight: 50,
+      createdAt: new Date().toISOString()
+    };
+    layer.variants.push(variant);
+    if (!layer.selectedVariantId) layer.selectedVariantId = variantId;
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    res.json({ project, layer, variant });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/approve-plan", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const proposed = Array.isArray(project.proposedLayers) ? project.proposedLayers : [];
+
+    if (!proposed.length) {
+      res.status(400).json({ error: "No proposed layers to approve." });
+      return;
+    }
+
+    project.layers = projectService.syncLayersFromPlan(project.layers, proposed);
+    project.proposedLayers = [];
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    const memory = await studioMemoryService.appendChangelog(project, {
+      type: "approve-plan",
+      title: "Approved layer plan",
+      detail: `Created ${project.layers.length} layer folders from proposed plan.`
+    });
+    res.json({ project, memory });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/lock-style", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const styleGuide = cleanText(req.body?.styleGuide) || project.styleGuide;
+    if (!styleGuide) { res.status(400).json({ error: "No style guide to lock." }); return; }
+    project.lockedStyleGuide = styleGuide;
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    const memory = await studioMemoryService.appendChangelog(project, {
+      type: "style-lock",
+      title: "Locked style guide",
+      detail: styleGuide
+    });
+    res.json({ project, memory });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/chat", async (req, res, next) => {
   try {
     const apiKey = getApiKey();
@@ -268,6 +360,14 @@ app.post("/api/chat", async (req, res, next) => {
     let assistantReply = route.assistantReply || "Working on that now.";
     let action = route.actionType;
     let assistantGenerated = null;
+
+    const hasProposedOnly = Array.isArray(project.proposedLayers) && project.proposedLayers.length > 0 &&
+      (!project.layers.length || project.layers.every((l) => !l.variants || l.variants.length === 0));
+    if (hasProposedOnly && ["edit_layer_variant", "transform_layer_variant", "draft_variant", "add_variant", "commit_draft"].includes(action)) {
+      action = "preview";
+      assistantReply = "The layers are still a proposal — no layer images exist yet. I'll regenerate the preview with your feedback. Approve the plan and hit Build All Layers when you're happy.";
+    }
+
     const forcedFreshDraft = shouldForceFreshTraitDraft(project, promptText, route);
     const freshDraftTargetLayerName = forcedFreshDraft ? resolveDraftTargetLayerName(project, promptText, route) : "";
     const forcedLayerEdit = forcedFreshDraft ? null : resolveLayerEditTarget(project, promptText, route);
@@ -618,6 +718,11 @@ app.post("/api/chat", async (req, res, next) => {
       project = previewResult.project;
       memory = previewResult.memory;
       assistantGenerated = toAssistantGeneratedImage(previewResult.preview);
+      const proposed = project.proposedLayers || [];
+      if (proposed.length) {
+        const layerList = proposed.map((l) => l.name).join(", ");
+        assistantReply = assistantReply || `Here's a preview. I'm proposing these layers: ${layerList}. Let me know if you want to add, remove, or change any before I build the folders.`;
+      }
     }
 
     project.chatHistory.push({
@@ -872,6 +977,31 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
   }
 });
 
+app.post("/api/projects/:projectId/apply-combo", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const picks = req.body?.picks;
+    if (!picks || typeof picks !== "object") {
+      res.status(400).json({ error: "Picks object is required." });
+      return;
+    }
+
+    for (const layer of project.layers) {
+      const pick = picks[layer.id];
+      if (pick?.variantId) {
+        const hasVariant = layer.variants.some((v) => v.id === pick.variantId);
+        if (hasVariant) layer.selectedVariantId = pick.variantId;
+      }
+    }
+
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    res.json({ project });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/projects/:projectId/preview/render", async (req, res, next) => {
   try {
     const project = await projectService.readProject(req.params.projectId);
@@ -990,6 +1120,35 @@ app.post("/api/projects/:projectId/shuffle", async (req, res, next) => {
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
     res.json({ project, shuffled });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/projects/:projectId/collection-grid", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const count = Math.max(1, Math.min(16, Number(req.query?.count) || 9));
+    const layersWithVariants = project.layers.filter((l) => l.variants && l.variants.length > 0);
+    const conflicts = {};
+    for (const layer of project.layers) {
+      if (Array.isArray(layer.conflicts) && layer.conflicts.length) {
+        conflicts[layer.id] = layer.conflicts;
+      }
+    }
+
+    const combos = [];
+    for (let i = 0; i < count; i++) {
+      const picks = {};
+      for (const layer of layersWithVariants) {
+        const pick = layer.variants[Math.floor(Math.random() * layer.variants.length)];
+        picks[layer.id] = { layerId: layer.id, layerName: layer.name, variantId: pick.id, variantName: pick.name };
+      }
+      combos.push(picks);
+    }
+
+    const supplyInfo = calculateSupplyInfo(project);
+    res.json({ combos, supplyInfo, layerCount: layersWithVariants.length });
   } catch (error) {
     next(error);
   }
@@ -1260,6 +1419,66 @@ app.post("/api/projects/:projectId/layers/:layerId/variants/:variantId/placement
       variant,
       mode: nextMode
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/layers/:layerId/variants/:variantId/weight", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const layer = project.layers.find((item) => item.id === req.params.layerId);
+    if (!layer) { res.status(404).json({ error: "Layer not found." }); return; }
+    const variant = (layer.variants || []).find((item) => item.id === req.params.variantId);
+    if (!variant) { res.status(404).json({ error: "Variant not found." }); return; }
+
+    const weight = Math.max(1, Math.min(1000, Math.round(Number(req.body?.weight) || 50)));
+    variant.rarityWeight = weight;
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    res.json({ project, layer, variant });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/layers/:layerId/conflicts", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    const layer = project.layers.find((item) => item.id === req.params.layerId);
+    if (!layer) { res.status(404).json({ error: "Layer not found." }); return; }
+
+    layer.conflicts = Array.isArray(req.body?.conflicts)
+      ? req.body.conflicts.map((c) => cleanText(c)).filter(Boolean).slice(0, 20)
+      : [];
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    res.json({ project, layer });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/clone", async (req, res, next) => {
+  try {
+    const source = await projectService.readProject(req.params.projectId);
+    const cloned = projectService.normalizeProjectInput({
+      title: `${source.title} (Copy)`,
+      artDirection: source.artDirection,
+      collectionGoal: source.collectionGoal,
+      canvas: source.canvas,
+      layers: source.layers.map((layer) => ({
+        name: layer.name,
+        description: layer.description,
+        placementNotes: layer.placementNotes,
+        variantIdeas: layer.variantIdeas,
+        conflicts: layer.conflicts
+      }))
+    });
+    cloned.styleGuide = source.styleGuide;
+    cloned.planSummary = source.planSummary;
+    await projectService.writeProject(cloned);
+    res.json({ project: cloned });
   } catch (error) {
     next(error);
   }
@@ -1654,7 +1873,13 @@ async function generatePreviewForProject(project, apiKey, attachments = []) {
   };
   project.previewHistory.unshift(previewEntry);
   project.selectedPreviewId = previewId;
-  project.layers = projectService.syncLayersFromPlan(project.layers, plan.layers);
+  project.proposedLayers = plan.layers.map((layer, index) => ({
+    id: layer.id || `layer-${index + 1}`,
+    name: cleanText(layer.name) || `Layer ${index + 1}`,
+    description: cleanText(layer.description),
+    placementNotes: cleanText(layer.placementNotes),
+    variantIdeas: Array.isArray(layer.variantIdeas) ? layer.variantIdeas : []
+  }));
   project.updatedAt = now;
 
   await projectService.writeProject(project);
@@ -5507,14 +5732,40 @@ function buildLockedDecisionTitle(promptText) {
   return "Remember this approved creative behavior";
 }
 
+function calculateSupplyInfo(project) {
+  const layers = (project.layers || []).filter((l) => l.variants && l.variants.length > 0);
+  if (!layers.length) return { totalCombos: 0, layers: [], hasConflicts: false };
+
+  let totalCombos = 1;
+  const layerInfo = layers.map((layer) => {
+    const count = layer.variants.length;
+    totalCombos *= count;
+    return {
+      name: layer.name,
+      variantCount: count,
+      variants: layer.variants.map((v) => ({
+        name: v.name,
+        weight: Number.isFinite(v.rarityWeight) ? v.rarityWeight : 50
+      }))
+    };
+  });
+
+  const hasConflicts = layers.some((l) => Array.isArray(l.conflicts) && l.conflicts.length > 0);
+  return { totalCombos, layers: layerInfo, hasConflicts };
+}
+
 function buildHashLipsLayerFolders(project) {
   return project.layers
     .map((layer, index) => {
-      const variants = (layer.variants || []).map((variant, variantIndex) => ({
-        ...variant,
-        absolutePath: publicAssetUrlToAbsolutePath(variant.imageUrl),
-        fileName: `${String(variantIndex + 1).padStart(2, "0")}_${sanitizeFileName(variant.name, "variant")}.png`
-      }));
+      const variants = (layer.variants || []).map((variant) => {
+        const weight = Number.isFinite(variant.rarityWeight) ? variant.rarityWeight : 50;
+        const safeName = sanitizeFileName(variant.name, "variant");
+        return {
+          ...variant,
+          absolutePath: publicAssetUrlToAbsolutePath(variant.imageUrl),
+          fileName: `${safeName}#${weight}.png`
+        };
+      });
 
       return {
         id: layer.id,

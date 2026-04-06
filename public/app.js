@@ -9,6 +9,10 @@ const state = {
   busy: false,
   lastFailedPrompt: null,
   hiddenLayers: new Set(),
+  undoStack: [],
+  redoStack: [],
+  collectionGridVisible: false,
+  collectionGridData: null,
   fitDebugVisible: false,
   fitDebugLoading: false,
   fitDebugData: null,
@@ -72,9 +76,26 @@ const elements = {
   downloadFitDebugBtn: document.getElementById("downloadFitDebugBtn"),
   fitDebugSummary: document.getElementById("fitDebugSummary"),
   fitDebugContent: document.getElementById("fitDebugContent"),
+  undoBtn: document.getElementById("undoBtn"),
+  redoBtn: document.getElementById("redoBtn"),
+  cloneProjectBtn: document.getElementById("cloneProjectBtn"),
+  toggleCollectionGridBtn: document.getElementById("toggleCollectionGridBtn"),
+  collectionGridPanel: document.getElementById("collectionGridPanel"),
+  collectionGrid: document.getElementById("collectionGrid"),
+  reshuffleGridBtn: document.getElementById("reshuffleGridBtn"),
+  closeCollectionGridBtn: document.getElementById("closeCollectionGridBtn"),
+  supplyBadge: document.getElementById("supplyBadge"),
+  supplyInfo: document.getElementById("supplyInfo"),
+  layerPresetSelect: document.getElementById("layerPresetSelect"),
+  proposedLayersPanel: document.getElementById("proposedLayersPanel"),
   layersPanel: document.getElementById("layersPanel"),
+  buildAllLayersBtn: document.getElementById("buildAllLayersBtn"),
   newLayerBtn: document.getElementById("newLayerBtn"),
   layerCount: document.getElementById("layerCount"),
+  confirmDialog: document.getElementById("confirmDialog"),
+  confirmDialogMessage: document.getElementById("confirmDialogMessage"),
+  confirmDialogYes: document.getElementById("confirmDialogYes"),
+  confirmDialogNo: document.getElementById("confirmDialogNo"),
   toast: document.getElementById("toast")
 };
 
@@ -164,12 +185,55 @@ document.addEventListener("keydown", async (e) => {
     e.preventDefault();
     await submitPrompt();
   }
+  if (e.key === "z" && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
+    e.preventDefault();
+    await undo();
+  }
+  if ((e.key === "y" && (e.ctrlKey || e.metaKey)) || (e.key === "z" && (e.ctrlKey || e.metaKey) && e.shiftKey)) {
+    e.preventDefault();
+    await redo();
+  }
   if (e.key === "Escape") {
-    if (state.projectShelfVisible) {
+    if (state.collectionGridVisible) {
+      state.collectionGridVisible = false;
+      render();
+    } else if (state.projectShelfVisible) {
       state.projectShelfVisible = false;
       render();
     }
   }
+});
+
+elements.undoBtn.addEventListener("click", () => undo());
+elements.redoBtn.addEventListener("click", () => redo());
+
+elements.cloneProjectBtn.addEventListener("click", async () => {
+  if (!state.project?.id) { showToast("Save a project first.", true); return; }
+  await withBusy(async () => {
+    const response = await api(`/api/projects/${state.project.id}/clone`, { method: "POST" });
+    await applyProject(response.project);
+    await loadProjects({ silent: true });
+    state.projectShelfVisible = true;
+    render();
+    showToast("Project cloned.");
+  });
+});
+
+elements.toggleCollectionGridBtn.addEventListener("click", async () => {
+  state.collectionGridVisible = !state.collectionGridVisible;
+  if (state.collectionGridVisible && state.project?.id) {
+    await loadCollectionGrid();
+  }
+  render();
+});
+
+elements.reshuffleGridBtn.addEventListener("click", async () => {
+  if (state.project?.id) await loadCollectionGrid();
+});
+
+elements.closeCollectionGridBtn.addEventListener("click", () => {
+  state.collectionGridVisible = false;
+  render();
 });
 
 elements.toggleFitDebugBtn.addEventListener("click", async () => {
@@ -295,6 +359,42 @@ elements.downloadFitDebugBtn.addEventListener("click", async () => {
   } catch (error) {
     showToast(error.message || "Could not download fit debug JSON.", true);
   }
+});
+
+elements.buildAllLayersBtn.addEventListener("click", async () => {
+  if (!state.project?.id) { showToast("No project open.", true); return; }
+  const emptyLayers = (state.project.layers || []).filter((l) => !l.variants || l.variants.length === 0);
+  const allLayers = state.project.layers || [];
+
+  if (!allLayers.length) {
+    showToast("Approve a layer plan first.", true);
+    return;
+  }
+
+  const target = emptyLayers.length > 0 ? emptyLayers : allLayers;
+  const confirmed = await confirmAction(
+    `Generate 2 variants for ${target.length} layer${target.length === 1 ? "" : "s"}${emptyLayers.length > 0 ? " (empty layers only)" : " (all layers)"}? This uses your API key and may take a while.`
+  );
+  if (!confirmed) return;
+
+  await withBusy(async () => {
+    let generated = 0;
+    for (const layer of target) {
+      try {
+        showToast(`Building ${layer.name}... (${generated + 1}/${target.length})`);
+        const response = await api(`/api/projects/${state.project.id}/layers/${layer.id}/variants`, {
+          method: "POST",
+          body: { count: 2 }
+        });
+        await applyProject(response.project);
+        generated++;
+      } catch (error) {
+        showToast(`Failed on ${layer.name}: ${error.message}`, true);
+      }
+    }
+    render();
+    showToast(`Built variants for ${generated} layer${generated === 1 ? "" : "s"}.`);
+  });
 });
 
 elements.newLayerBtn.addEventListener("click", async () => {
@@ -457,10 +557,19 @@ async function createNewProject() {
 }
 
 async function submitPrompt(options = {}) {
-  const prompt = resolvePromptForSubmit(options);
+  let prompt = resolvePromptForSubmit(options);
   if (!prompt) {
     showToast("Type a prompt first or rerun a previous one.", true);
     return;
+  }
+
+  const preset = elements.layerPresetSelect.value;
+  if (preset) {
+    const presetLayers = getPresetLayers(preset);
+    if (presetLayers) {
+      prompt += ` Use these layers in this order: ${presetLayers.join(", ")}.`;
+    }
+    elements.layerPresetSelect.value = "";
   }
 
   await withBusy(async () => {
@@ -537,11 +646,16 @@ function render() {
   elements.projectTitle.textContent = state.project?.title || "New Session";
   elements.canvasBadge.textContent = formatCanvas(readCanvasFromState());
 
+  elements.undoBtn.disabled = state.busy || !state.undoStack.length;
+  elements.redoBtn.disabled = state.busy || !state.redoStack.length;
+
   renderProjectShelf();
   renderPreview();
   renderPendingAttachments();
   renderChat();
   renderFitDebug();
+  renderCollectionGrid();
+  renderProposedLayers();
   renderLayers();
   syncBusyState();
 }
@@ -610,6 +724,15 @@ function renderProjectShelf() {
               data-project-id="${escapeHtml(project.id)}"
             >
               Rename
+            </button>
+            <button
+              class="btn btn-danger btn-compact"
+              type="button"
+              data-action="delete-project"
+              data-project-id="${escapeHtml(project.id)}"
+              data-project-title="${escapeHtml(project.title || "Untitled")}"
+            >
+              Delete
             </button>
           </div>
         </article>
@@ -709,6 +832,13 @@ function renderChat() {
                     >${escapeHtml(summarizeDisplayText(message.generatedImage.notes || message.generatedImage.prompt || "", 160))}</div>
                     <div class="generated-actions">
                       <span class="generated-status">${escapeHtml(message.generatedImage.status || "ready")}</span>
+                      <button
+                        class="btn btn-ghost"
+                        data-action="view-in-stage"
+                        data-image-url="${escapeHtml(message.generatedImage.imageUrl)}"
+                      >
+                        View Full
+                      </button>
                       ${
                         message.generatedImage.type === "draft" && message.generatedImage.status !== "committed"
                           ? `<button
@@ -896,9 +1026,151 @@ function renderPendingAttachments() {
   });
 }
 
+async function loadCollectionGrid() {
+  if (!state.project?.id) return;
+  try {
+    state.collectionGridData = await api(`/api/projects/${state.project.id}/collection-grid?count=9`);
+    render();
+  } catch (error) {
+    showToast(error.message || "Could not load grid.", true);
+  }
+}
+
+function renderCollectionGrid() {
+  elements.collectionGridPanel.classList.toggle("hidden", !state.collectionGridVisible);
+  if (!state.collectionGridVisible) return;
+
+  const data = state.collectionGridData;
+  if (!data || !data.combos?.length) {
+    elements.collectionGrid.innerHTML = `<p class="empty-state">Generate some layer variants first to see combos here.</p>`;
+    elements.supplyBadge.textContent = "0 combos";
+    elements.supplyInfo.innerHTML = "";
+    return;
+  }
+
+  const supply = data.supplyInfo || {};
+  elements.supplyBadge.textContent = `${supply.totalCombos?.toLocaleString() || 0} possible combos`;
+  elements.supplyInfo.innerHTML = (supply.layers || []).map((l) =>
+    `<span class="supply-layer-badge">${escapeHtml(l.name)}: ${l.variantCount}</span>`
+  ).join("");
+
+  elements.collectionGrid.innerHTML = data.combos.map((combo, i) => {
+    const picks = Object.values(combo);
+    return `
+      <div class="grid-combo-card">
+        <div class="grid-combo-number">#${i + 1}</div>
+        <div class="grid-combo-preview">
+          ${picks.map((p) => `<div class="grid-combo-trait">${escapeHtml(p.layerName)}: <strong>${escapeHtml(p.variantName)}</strong></div>`).join("")}
+        </div>
+        <button class="btn btn-ghost btn-compact" data-action="view-combo" data-combo-index="${i}">View Preview</button>
+      </div>
+    `;
+  }).join("");
+
+  bindCollectionGridActions();
+}
+
+function bindCollectionGridActions() {
+  elements.collectionGrid.querySelectorAll("[data-action='view-combo']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const index = Number(button.dataset.comboIndex);
+      const combo = state.collectionGridData?.combos?.[index];
+      if (!combo || !state.project?.id) return;
+
+      await withBusy(async () => {
+        const response = await api(`/api/projects/${state.project.id}/apply-combo`, {
+          method: "POST",
+          body: { picks: combo }
+        });
+        await applyProject(response.project);
+        state.collectionGridVisible = false;
+        render();
+        showToast("Preview updated with combo #" + (index + 1));
+      });
+    });
+  });
+}
+
+function renderProposedLayers() {
+  const proposed = state.project?.proposedLayers || [];
+
+  if (!proposed.length) {
+    elements.proposedLayersPanel.classList.add("hidden");
+    return;
+  }
+
+  elements.proposedLayersPanel.classList.remove("hidden");
+  elements.proposedLayersPanel.innerHTML = `
+    <div class="proposed-layers-head">
+      <div>
+        <p class="eyebrow">Layer Plan</p>
+        <h2>Proposed Layers</h2>
+        <p class="proposed-layers-copy">Review these layers before building. Keep chatting to add, remove, or change them.</p>
+      </div>
+    </div>
+    <div class="proposed-layers-list">
+      ${proposed.map((layer, i) => `
+        <div class="proposed-layer-card">
+          <div class="proposed-layer-info">
+            <strong>${escapeHtml(layer.name)}</strong>
+            ${layer.description ? `<p class="proposed-layer-desc">${escapeHtml(layer.description)}</p>` : ""}
+            ${layer.variantIdeas?.length ? `<p class="proposed-layer-ideas">Ideas: ${escapeHtml(layer.variantIdeas.join(", "))}</p>` : ""}
+          </div>
+          <button class="btn btn-ghost btn-compact" data-action="remove-proposed" data-index="${i}">Remove</button>
+        </div>
+      `).join("")}
+    </div>
+    <div class="proposed-layers-actions">
+      <button class="btn btn-primary" id="approvePlanBtn" type="button">Approve &amp; Build Layers</button>
+      ${state.project?.styleGuide && !state.project?.lockedStyleGuide
+        ? `<button class="btn btn-ghost" id="lockStyleBtn" type="button">Lock Style Guide</button>`
+        : state.project?.lockedStyleGuide
+          ? `<span class="badge">Style Locked</span>`
+          : ""}
+      <p class="proposed-layers-hint">Or keep chatting to adjust the plan first.</p>
+    </div>
+  `;
+
+  elements.proposedLayersPanel.querySelector("#approvePlanBtn")?.addEventListener("click", async () => {
+    if (!state.project?.id) return;
+    await withBusy(async () => {
+      const response = await api(`/api/projects/${state.project.id}/approve-plan`, {
+        method: "POST"
+      });
+      await applyProject(response.project);
+      render();
+      showToast(`Layer plan approved — ${response.project.layers.length} folders created.`);
+    });
+  });
+
+  elements.proposedLayersPanel.querySelector("#lockStyleBtn")?.addEventListener("click", async () => {
+    if (!state.project?.id || !state.project?.styleGuide) return;
+    await withBusy(async () => {
+      const response = await api(`/api/projects/${state.project.id}/lock-style`, {
+        method: "POST",
+        body: { styleGuide: state.project.styleGuide }
+      });
+      await applyProject(response.project);
+      render();
+      showToast("Style guide locked. All future generations will match this style.");
+    });
+  });
+
+  elements.proposedLayersPanel.querySelectorAll("[data-action='remove-proposed']").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = Number(btn.dataset.index);
+      if (!state.project?.proposedLayers) return;
+      state.project.proposedLayers.splice(idx, 1);
+      render();
+      showToast("Removed proposed layer.");
+    });
+  });
+}
+
 function renderLayers() {
   const layers = state.project?.layers || [];
   elements.layerCount.textContent = `${layers.length} layer${layers.length === 1 ? "" : "s"}`;
+  elements.buildAllLayersBtn.classList.toggle("hidden", !layers.length);
 
   if (!layers.length) {
     elements.layersPanel.className = "layer-folder-list empty-state";
@@ -916,7 +1188,7 @@ function renderLayers() {
       const isFrontmostLayer = actualIndex === layers.length - 1;
       const frontRank = layers.length - actualIndex;
       return `
-        <details class="layer-folder" open>
+        <details class="layer-folder${state.hiddenLayers.has(layer.id) ? " is-layer-hidden" : ""}" open>
           <summary>
             <div class="folder-title">
               <div class="folder-name">${escapeHtml(layer.name)}</div>
@@ -1022,6 +1294,16 @@ function renderLayers() {
                                   : ""
                               }
                             </div>
+                            <div class="variant-rarity">
+                              <label class="rarity-label">
+                                <span>Rarity #${Number.isFinite(variant.rarityWeight) ? variant.rarityWeight : 50}</span>
+                                <input type="range" min="1" max="200" value="${Number.isFinite(variant.rarityWeight) ? variant.rarityWeight : 50}"
+                                  data-action="set-weight"
+                                  data-layer-id="${layer.id}"
+                                  data-variant-id="${variant.id}"
+                                  class="rarity-slider" />
+                              </label>
+                            </div>
                           </div>
                         </article>
                       `
@@ -1029,6 +1311,13 @@ function renderLayers() {
                     .join("")
                 : `<div class="empty-state">No images in this layer folder yet.</div>`
             }
+            <div class="folder-footer">
+              <label class="btn btn-ghost btn-upload-variant">
+                Upload PNG
+                <input type="file" accept="image/png,image/webp,image/jpeg" class="hidden-file"
+                  data-action="upload-variant" data-layer-id="${layer.id}" />
+              </label>
+            </div>
           </div>
         </details>
       `;
@@ -1140,6 +1429,20 @@ function bindLayerActions() {
             : `${payload.variantName || "Layer image"} is already in ${response.targetLayer?.name || "that folder"}.`
         );
       });
+    });
+  });
+
+  elements.layersPanel.querySelectorAll("[data-action='toggle-layer-visibility']").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const layerId = button.dataset.layerId;
+      if (state.hiddenLayers.has(layerId)) {
+        state.hiddenLayers.delete(layerId);
+      } else {
+        state.hiddenLayers.add(layerId);
+      }
+      render();
     });
   });
 
@@ -1266,6 +1569,46 @@ function bindLayerActions() {
       });
     });
   });
+
+  elements.layersPanel.querySelectorAll("[data-action='set-weight']").forEach((slider) => {
+    let debounce = null;
+    slider.addEventListener("input", () => {
+      const label = slider.closest(".rarity-label")?.querySelector("span");
+      if (label) label.textContent = `Rarity #${slider.value}`;
+    });
+    slider.addEventListener("change", () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(async () => {
+        await api(
+          `/api/projects/${state.project.id}/layers/${slider.dataset.layerId}/variants/${slider.dataset.variantId}/weight`,
+          { method: "POST", body: { weight: Number(slider.value) } }
+        );
+      }, 300);
+    });
+  });
+
+  elements.layersPanel.querySelectorAll("[data-action='upload-variant']").forEach((input) => {
+    input.addEventListener("change", async () => {
+      const file = input.files?.[0];
+      if (!file) return;
+      const formData = new FormData();
+      formData.append("image", file);
+      formData.append("name", file.name.replace(/\.[^.]+$/, ""));
+
+      await withBusy(async () => {
+        const response = await fetch(
+          `/api/projects/${state.project.id}/layers/${input.dataset.layerId}/upload-variant`,
+          { method: "POST", body: formData }
+        );
+        const data = await response.json();
+        if (!response.ok) throw new Error(data?.error || "Upload failed.");
+        await applyProject(data.project);
+        render();
+        showToast(`Uploaded ${data.variant?.name || "variant"}.`);
+      });
+      input.value = "";
+    });
+  });
 }
 
 function bindChatActions() {
@@ -1292,12 +1635,28 @@ function bindChatActions() {
       await submitPrompt({ preservePrompt: true });
     });
   });
+
+  elements.chatLog.querySelectorAll("[data-action='view-in-stage']").forEach((button) => {
+    button.addEventListener("click", () => {
+      const imageUrl = button.dataset.imageUrl;
+      if (!imageUrl) return;
+      elements.previewImage.src = imageUrl;
+      elements.previewImage.style.display = "block";
+      elements.previewImage.classList.remove("hidden");
+      state.previewAsset.loaded = true;
+      state.previewAsset.failed = false;
+      state.previewAsset.requestKey = imageUrl;
+      elements.previewImage.dataset.requestKey = imageUrl;
+      elements.stageEmpty.textContent = "";
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    });
+  });
 }
 
 function bindProjectShelfActions() {
   elements.projectList.querySelectorAll(".project-card[data-action='open-project']").forEach((card) => {
     card.addEventListener("click", async (e) => {
-      if (e.target.closest("[data-action='rename-project']") || e.target.closest("[data-action='confirm-rename']") || e.target.closest(".project-card-rename-input")) {
+      if (e.target.closest("[data-action='rename-project']") || e.target.closest("[data-action='confirm-rename']") || e.target.closest("[data-action='delete-project']") || e.target.closest(".project-card-rename-input")) {
         return;
       }
 
@@ -1364,6 +1723,31 @@ function bindProjectShelfActions() {
           finishProjectRename(inputEl.dataset.projectId, inputEl.value);
         }
       }, 150);
+    });
+  });
+
+  elements.projectList.querySelectorAll("[data-action='delete-project']").forEach((button) => {
+    button.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const projectId = button.dataset.projectId;
+      const title = button.dataset.projectTitle || "this project";
+      const confirmed = await confirmAction(`Delete "${title}"? This cannot be undone. All layers, variants, and history will be permanently removed.`);
+      if (!confirmed) return;
+
+      await withBusy(async () => {
+        await api(`/api/projects/${projectId}`, { method: "DELETE" });
+        state.projects = state.projects.filter((p) => p.id !== projectId);
+        if (state.project?.id === projectId) {
+          state.project = null;
+          state.projectNameDraft = "";
+          state.undoStack = [];
+          state.redoStack = [];
+          clearStoredActiveProjectId();
+        }
+        await loadProjects({ silent: true });
+        render();
+        showToast(`"${title}" deleted.`);
+      });
     });
   });
 }
@@ -1997,7 +2381,12 @@ async function withBusy(work) {
   }
 }
 
-async function applyProject(project) {
+async function applyProject(project, { skipUndo = false } = {}) {
+  if (!skipUndo && state.project) {
+    state.undoStack.push(JSON.stringify(state.project));
+    if (state.undoStack.length > 30) state.undoStack.shift();
+    state.redoStack = [];
+  }
   state.project = project;
   state.projectNameDraft = project?.title || "";
   state.fitDebugData = null;
@@ -2011,6 +2400,30 @@ async function applyProject(project) {
   if (state.fitDebugVisible && state.project?.id) {
     await loadFitDebug();
   }
+}
+
+async function undo() {
+  if (!state.undoStack.length || !state.project?.id) return;
+  state.redoStack.push(JSON.stringify(state.project));
+  const prev = JSON.parse(state.undoStack.pop());
+  await withBusy(async () => {
+    await api(`/api/projects/${prev.id}`, { method: "PUT", body: { layers: prev.layers, title: prev.title, canvas: prev.canvas } });
+    await applyProject(prev, { skipUndo: true });
+    render();
+    showToast("Undone.");
+  });
+}
+
+async function redo() {
+  if (!state.redoStack.length || !state.project?.id) return;
+  state.undoStack.push(JSON.stringify(state.project));
+  const next = JSON.parse(state.redoStack.pop());
+  await withBusy(async () => {
+    await api(`/api/projects/${next.id}`, { method: "PUT", body: { layers: next.layers, title: next.title, canvas: next.canvas } });
+    await applyProject(next, { skipUndo: true });
+    render();
+    showToast("Redone.");
+  });
 }
 
 async function loadFitDebug() {
@@ -2130,6 +2543,32 @@ function formatProjectTimestamp(value) {
     hour: "numeric",
     minute: "2-digit"
   }).format(date);
+}
+
+function confirmAction(message) {
+  return new Promise((resolve) => {
+    elements.confirmDialogMessage.textContent = message;
+    elements.confirmDialog.classList.remove("hidden");
+    const cleanup = () => {
+      elements.confirmDialog.classList.add("hidden");
+      elements.confirmDialogYes.removeEventListener("click", onYes);
+      elements.confirmDialogNo.removeEventListener("click", onNo);
+    };
+    const onYes = () => { cleanup(); resolve(true); };
+    const onNo = () => { cleanup(); resolve(false); };
+    elements.confirmDialogYes.addEventListener("click", onYes);
+    elements.confirmDialogNo.addEventListener("click", onNo);
+  });
+}
+
+function getPresetLayers(preset) {
+  const presets = {
+    pfp: ["Background", "Body", "Outfit", "Headwear", "Eyewear", "Mouth", "Handheld"],
+    pixel: ["Background", "Base", "Hat", "Eyes", "Mouth", "Accessory"],
+    abstract: ["Background", "Shape Layer", "Texture", "Accent", "Overlay"],
+    animal: ["Background", "Body", "Fur Pattern", "Headwear", "Eyewear", "Neckwear"]
+  };
+  return presets[preset] || null;
 }
 
 function formatChatTimestamp(value) {

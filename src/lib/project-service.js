@@ -42,6 +42,7 @@ export function createProjectService({ projectsDir }) {
       draftHistory: [],
       previewHistory: [],
       selectedPreviewId: null,
+      proposedLayers: [],
       previewPrompt: "",
       planSummary: "",
       styleGuide: "",

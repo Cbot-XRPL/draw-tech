@@ -297,7 +297,9 @@ function buildTransparentPrompt({ project, layer, promptText }) {
   const fragments = [
     promptText,
     `Collection title: ${project.title}.`,
-    project.styleGuide ? `Style guide: ${project.styleGuide}.` : "",
+    project.lockedStyleGuide
+      ? `LOCKED STYLE (must match exactly): ${project.lockedStyleGuide}.`
+      : project.styleGuide ? `Style guide: ${project.styleGuide}.` : "",
     `Layer name: ${layer.name}.`,
     layer.placementNotes ? `Placement notes: ${layer.placementNotes}.` : "",
     activeConstruct,
@@ -320,7 +322,9 @@ function buildFullCanvasBackgroundPrompt({ project, layer, promptText }) {
   const fragments = [
     promptText,
     `Collection title: ${project.title}.`,
-    project.styleGuide ? `Style guide: ${project.styleGuide}.` : "",
+    project.lockedStyleGuide
+      ? `LOCKED STYLE (must match exactly): ${project.lockedStyleGuide}.`
+      : project.styleGuide ? `Style guide: ${project.styleGuide}.` : "",
     `Layer name: ${layer.name}.`,
     layer.placementNotes ? `Placement notes: ${layer.placementNotes}.` : "",
     activeConstruct,

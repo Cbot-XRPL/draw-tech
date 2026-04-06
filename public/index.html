@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=38" />
+    <link rel="stylesheet" href="/styles.css?v=39" />
   </head>
   <body>
     <div class="app-shell">
@@ -31,11 +31,19 @@
           <span id="keyStatus" class="badge badge-warn">No key</span>
           <span id="projectStatus" class="badge badge-project">No saved project</span>
           <div class="topbar-primary-actions">
+            <button id="undoBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Undo" title="Undo (Ctrl+Z)" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 14L4 9l5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 9h10a5 5 0 0 1 0 10H11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button id="redoBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Redo" title="Redo (Ctrl+Y)" disabled>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 14l5-5-5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 9H10a5 5 0 0 0 0 10h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
             <button id="saveProjectBtn" class="btn btn-ghost" type="button">Save Project</button>
             <button id="toggleProjectShelfBtn" class="btn btn-ghost" type="button">Projects</button>
           </div>
           <div class="topbar-secondary-actions">
             <button id="newProjectBtn" class="btn btn-ghost" type="button">New Project</button>
+            <button id="cloneProjectBtn" class="btn btn-ghost" type="button">Clone Project</button>
+            <button id="toggleCollectionGridBtn" class="btn btn-ghost" type="button">Collection Grid</button>
             <button id="downloadHashlipsBtn" class="btn btn-ghost">Export Layers</button>
           </div>
         </div>
@@ -113,6 +121,18 @@
               rows="3"
               placeholder="Describe what you want — a full collection preview, a new layer trait, or a tweak to an existing one. Press Ctrl+Enter to generate."
             ></textarea>
+          </div>
+          <div class="preset-row">
+            <label class="mini-field">
+              <span>Layer preset</span>
+              <select id="layerPresetSelect">
+                <option value="">None — AI decides layers</option>
+                <option value="pfp">PFP Character (Background, Body, Outfit, Headwear, Eyewear, Mouth, Handheld)</option>
+                <option value="pixel">Pixel Art (Background, Base, Hat, Eyes, Mouth, Accessory)</option>
+                <option value="abstract">Abstract (Background, Shape Layer, Texture, Accent, Overlay)</option>
+                <option value="animal">Animal PFP (Background, Body, Fur Pattern, Headwear, Eyewear, Neckwear)</option>
+              </select>
+            </label>
           </div>
           <div class="prompt-submit-row">
             <button id="sendPromptBtn" class="btn btn-primary btn-compact">Generate</button>
@@ -201,6 +221,24 @@
         <div id="fitDebugContent" class="fit-debug-grid"></div>
       </section>
 
+      <section id="collectionGridPanel" class="panel collection-grid-panel hidden">
+        <div class="panel-head">
+          <div>
+            <p class="eyebrow">Collection Preview</p>
+            <h2>Random Combos</h2>
+          </div>
+          <div class="panel-head-actions">
+            <span id="supplyBadge" class="badge">0 combos</span>
+            <button id="reshuffleGridBtn" class="btn btn-ghost" type="button">Reshuffle</button>
+            <button id="closeCollectionGridBtn" class="btn btn-ghost" type="button">Close</button>
+          </div>
+        </div>
+        <div id="supplyInfo" class="supply-info"></div>
+        <div id="collectionGrid" class="collection-grid"></div>
+      </section>
+
+      <section id="proposedLayersPanel" class="panel proposed-layers-panel hidden"></section>
+
       <section class="panel layers-panel-shell">
         <div class="panel-head">
           <div>
@@ -208,6 +246,7 @@
             <h2>Layers</h2>
           </div>
           <div class="panel-head-actions">
+            <button id="buildAllLayersBtn" class="btn btn-primary" type="button">Build All Layers</button>
             <button id="newLayerBtn" class="btn btn-ghost" type="button">Add Layer</button>
             <span id="layerCount" class="badge">0 layers</span>
           </div>
@@ -220,8 +259,17 @@
         </div>
       </section>
 
+      <div id="confirmDialog" class="confirm-dialog hidden">
+        <div class="confirm-dialog-box">
+          <p id="confirmDialogMessage">Are you sure?</p>
+          <div class="confirm-dialog-actions">
+            <button id="confirmDialogYes" class="btn btn-danger">Delete</button>
+            <button id="confirmDialogNo" class="btn btn-ghost">Cancel</button>
+          </div>
+        </div>
+      </div>
       <div id="toast" class="toast hidden"></div>
-      <script type="module" src="/app.js?v=38"></script>
+      <script type="module" src="/app.js?v=39"></script>
     </div>
   </body>
 </html>
