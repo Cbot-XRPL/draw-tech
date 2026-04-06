@@ -657,6 +657,83 @@ app.post("/api/chat", async (req, res, next) => {
             `I revised ${editResult.layer.name} so ${editTarget.removalTarget || "that feature"} is no longer baked into the base layer.`;
         }
       }
+    } else if (action === "restyle") {
+      const styleDir = cleanText(route.styleDirection) || cleanText(route.variantDirection) || "restyled";
+      const targetLayer = route.targetLayerName ? findLayer(project, route.targetLayerName) : null;
+
+      if (targetLayer) {
+        const variant = (targetLayer.variants || []).find((v) => v.id === targetLayer.selectedVariantId) || (targetLayer.variants || [])[0];
+        if (variant?.imageUrl) {
+          const sourceUrl = publicAssetUrlToAbsolutePath(variant.imageUrl);
+          const sourceBuffer = await fs.readFile(sourceUrl);
+          const sourceDataUrl = `data:image/png;base64,${sourceBuffer.toString("base64")}`;
+          const restylePrompt = `Redraw this exact image in ${styleDir} style. Keep the exact same subject, composition, pose, and content. Only change the rendering style to ${styleDir}. Preserve all details and proportions.`;
+          const isBackground = isFullCanvasBackgroundLayerName(targetLayer.name);
+          const imageAsset = await openaiService.editImageAsset({
+            apiKey,
+            prompt: restylePrompt,
+            images: [sourceDataUrl],
+            background: isBackground ? "opaque" : "transparent",
+            inputFidelity: "high"
+          });
+          const variantId = createId("variant");
+          const variantFolder = path.join(generatedDir, project.id, "layers", targetLayer.id);
+          await fs.mkdir(variantFolder, { recursive: true });
+          const filename = `${variantId}.png`;
+          const resized = await resizePng(imageAsset.buffer, project.canvas);
+          await fs.writeFile(path.join(variantFolder, filename), resized);
+          const newVariant = {
+            id: variantId,
+            name: `${variant.name} (${styleDir})`,
+            notes: `Restyled to ${styleDir}`,
+            prompt: restylePrompt,
+            imageUrl: `/generated/${project.id}/layers/${targetLayer.id}/${filename}`,
+            rarityWeight: 50,
+            createdAt: new Date().toISOString()
+          };
+          targetLayer.variants.push(newVariant);
+          targetLayer.selectedVariantId = variantId;
+          project.updatedAt = new Date().toISOString();
+          await projectService.writeProject(project);
+          memory = await studioMemoryService.appendChangelog(project, {
+            type: "restyle",
+            title: `Restyled ${targetLayer.name} to ${styleDir}`,
+            detail: promptText
+          });
+          assistantGenerated = toAssistantGeneratedImage(newVariant);
+          assistantReply = route.assistantReply || `I restyled ${targetLayer.name} in ${styleDir} style. The original variant is still there if you want to switch back.`;
+        } else {
+          assistantReply = `${targetLayer.name} has no image to restyle yet. Build the layer first.`;
+        }
+      } else {
+        const restylePrompt = `${project.previewPrompt || promptText} Render the entire scene in ${styleDir} style. Keep the exact same subjects, composition, and layout. Only change the rendering style.`;
+        const previewAsset = await openaiService.generateImageAsset({
+          apiKey,
+          prompt: restylePrompt,
+          size: project.canvas.generationSize,
+          background: "opaque"
+        });
+        const previewId = createId("preview");
+        const previewFolder = path.join(generatedDir, project.id, "preview");
+        await fs.mkdir(previewFolder, { recursive: true });
+        const previewFilename = `${previewId}.png`;
+        await fs.writeFile(path.join(previewFolder, previewFilename), await resizePng(previewAsset.buffer, project.canvas));
+        const previewNumber = (project.previewHistory || []).length + 1;
+        const previewEntry = {
+          id: previewId,
+          name: `Preview ${previewNumber} (${styleDir})`,
+          imageUrl: `/generated/${project.id}/preview/${previewFilename}`,
+          prompt: restylePrompt,
+          notes: `Restyled to ${styleDir}`,
+          createdAt: new Date().toISOString()
+        };
+        project.previewHistory.unshift(previewEntry);
+        project.selectedPreviewId = previewId;
+        project.updatedAt = new Date().toISOString();
+        await projectService.writeProject(project);
+        assistantGenerated = toAssistantGeneratedImage(previewEntry);
+        assistantReply = route.assistantReply || `Here's the collection restyled in ${styleDir}. The previous previews are still in history.`;
+      }
     } else if (action === "feedback") {
       const feedbackMode = detectFeedbackMode(promptText);
       if (!route.assistantReply) {
@@ -1864,8 +1941,10 @@ async function generatePreviewForProject(project, apiKey, attachments = []) {
   project.planSummary = plan.collectionSummary;
   project.styleGuide = plan.styleGuide;
   project.previewPrompt = plan.previewPrompt;
+  const previewNumber = (project.previewHistory || []).length + 1;
   const previewEntry = {
     id: previewId,
+    name: `Preview ${previewNumber}`,
     imageUrl: `/generated/${project.id}/preview/${previewFilename}`,
     prompt: plan.previewPrompt,
     notes: plan.collectionSummary,
