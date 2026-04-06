@@ -807,9 +807,13 @@ function renderChat() {
   }
 
   elements.chatLog.className = "chat-log";
+  let previewCounter = 0;
   elements.chatLog.innerHTML = messages
     .map(
       (message) => {
+        if (message.generatedImage?.type === "preview" || (!message.generatedImage?.type && !message.generatedImage?.targetLayerName && message.generatedImage?.imageUrl)) {
+          previewCounter++;
+        }
         const generatedTargetLayerName = resolveGeneratedTargetLayerName(message.generatedImage);
         const timestamp = message.createdAt ? formatChatTimestamp(message.createdAt) : "";
         return `
@@ -825,7 +829,7 @@ function renderChat() {
                 <div class="generated-card">
                   <img class="generated-preview" src="${message.generatedImage.imageUrl}" alt="${escapeHtml(message.generatedImage.name || "Generated image")}" />
                   <div class="generated-meta">
-                    <div class="generated-name">${escapeHtml(message.generatedImage.name || (message.generatedImage.type === "preview" ? "Preview" : "Draft"))}</div>
+                    <div class="generated-name">${escapeHtml(message.generatedImage.name || (message.generatedImage.type === "preview" ? `Preview ${previewCounter}` : "Draft"))}</div>
                     <div
                       class="generated-notes"
                       title="${escapeHtml(message.generatedImage.notes || message.generatedImage.prompt || "")}"
