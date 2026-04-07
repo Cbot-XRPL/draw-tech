@@ -1000,6 +1000,29 @@ textarea:focus {
   margin: 0;
 }
 
+.proposed-layer-prompt-details summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-top: 4px;
+}
+
+.proposed-layer-prompt {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  margin: 4px 0 0;
+  max-height: 120px;
+  overflow: auto;
+}
+
+.proposed-layer-region {
+  color: rgba(81, 153, 255, 0.7);
+  font-size: 0.78rem;
+  font-family: monospace;
+  margin: 0;
+}
+
 .proposed-layer-ideas {
   color: var(--muted);
   font-size: 0.82rem;
@@ -1115,6 +1138,26 @@ textarea:focus {
   display: flex;
   gap: 8px;
   padding-top: 8px;
+}
+
+.variation-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.variation-count-input {
+  width: 52px;
+  min-width: 52px;
+  padding: 8px 6px;
+  text-align: center;
+  border-radius: 12px;
+  font-size: 0.9rem;
+}
+
+.btn-gen-variants {
+  font-size: 0.85rem;
+  padding: 8px 14px;
 }
 
 .btn-upload-variant {

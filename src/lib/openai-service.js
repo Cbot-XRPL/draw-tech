@@ -5,6 +5,9 @@ export function createOpenAIService() {
     routeUserPrompt,
     createPreviewPlan,
     createLayerVariantPlan,
+    analyzePreviewForLayerPrompts,
+    createLayerMap,
+    buildLayerAssetPrompt,
     generateImageAsset,
     editImageAsset,
     refreshStudioMemory,
@@ -142,7 +145,8 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory, bra
     "Trait assets like headwear, eyewear, neckwear, outfits, and accessories should be sized and composed to fit the active base construct immediately instead of assuming a blank canvas.",
     "If the target layer has an approved family fit contract, every new variant must preserve that same seat, overlap, and clipping pattern so swapping variants does not degrade stack quality.",
     "If a saved-project reference image is attached, use it as a visual example for the requested layer look, mood, or construction while still creating a fresh asset for the current project.",
-    "Make each new variant meaningfully different from earlier ones instead of tiny color drift.",
+    "IMPORTANT: If a preview image exists for this project, the FIRST variant prompt must faithfully reproduce the exact element shown in the preview for this layer — same shape, size, position, material, and style. This is the canonical version that matches the approved preview.",
+    "Additional variants after the first should explore meaningful variations while keeping the same scale, position, and style family so they remain interchangeable in the stack.",
     "Vary across multiple dimensions: silhouette shape, material or texture, color family, pattern, and theme.",
     "Avoid producing two variants that only differ by hue shift or minor detail placement.",
     `The project canvas is ${project.canvas?.width || 1024}x${project.canvas?.height || 1024} pixels (${project.canvas?.aspect || "square"}).`,
@@ -192,6 +196,135 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory, bra
       })
     }))
   };
+}
+
+async function analyzePreviewForLayerPrompts(apiKey, previewDataUrl, layers, canvas) {
+  const prompt = [
+    "You are an expert art director analyzing a preview image to write EXTREMELY detailed image generation prompts.",
+    "Return JSON only.",
+    `The canvas is ${canvas.width}x${canvas.height} pixels.`,
+    "The JSON must have these keys: perspectiveNote (string), layers (array).",
+    "",
+    "FIRST: Analyze the GLOBAL 3D PERSPECTIVE of the entire composition.",
+    "perspectiveNote must describe: exact camera angle (e.g. 'three-quarter view turned 30 degrees left'), vertical tilt, depth/foreshortening, vanishing point direction.",
+    "This perspective note will be injected into EVERY layer prompt so they all match.",
+    "",
+    "layers must be an array with one entry per layer listed below.",
+    "Each entry must have: name, generationPrompt.",
+    "",
+    "generationPrompt must be an EXHAUSTIVELY detailed visual description of EXACTLY what that layer's element looks like in the preview image.",
+    "Study the preview image pixel by pixel for each layer. Your prompt will be used to regenerate this exact element.",
+    "",
+    "For EACH layer's generationPrompt, you MUST describe ALL of the following:",
+    "- EXACT 3D ORIENTATION matching the global perspective — if the subject is turned 30 degrees left, every layer must be turned 30 degrees left",
+    "- Exact shape and silhouette as seen from the specific camera angle in the preview",
+    "- Exact materials and textures (brushed steel, matte rubber, glossy chrome, weathered wood, etc.)",
+    "- Exact colors with specificity (not just 'blue' but 'deep navy blue with cyan edge highlights')",
+    "- Exact lighting (where highlights fall, shadow direction, rim light color, ambient occlusion)",
+    "- Exact surface details (scratches, bolts, rivets, seams, patterns, engravings, glow effects)",
+    "- Exact proportions relative to the canvas (how much of the canvas width/height it occupies)",
+    "- Exact position on the canvas (centered, upper-left, offset right, etc.)",
+    "- Exact rendering style (3D rendered, flat vector, painterly, cel-shaded, photorealistic, etc.)",
+    "- Any glow, emission, neon, or light effects with their exact colors",
+    "",
+    "CRITICAL 3D RULE: If the main subject is shown at an angle (e.g. three-quarter turn), EVERY trait layer must be drawn at that SAME angle.",
+    "A door face on a turned vault must show perspective foreshortening matching the vault's turn.",
+    "A handle on a turned vault must be positioned where it would appear at that viewing angle.",
+    "A topper on a turned vault must sit on the roof as seen from the same camera angle.",
+    "NEVER draw a trait flat/front-facing if the body it attaches to is turned.",
+    "",
+    "The prompt must be so detailed that someone who has NEVER seen the preview could generate an almost identical image.",
+    "Do NOT be vague. Do NOT use words like 'nice', 'cool', 'interesting'. Be CLINICAL and PRECISE.",
+    "Each prompt should be 150-300 words of pure visual description.",
+    "",
+    "For background layers: describe ONLY the background — gradients, particles, atmosphere, cosmic effects. NEVER include the main subject, vault, character, door, handle, or ANY foreground object.",
+    "For the base/body layer: describe the main subject WITHOUT any accessories, overlays, or removable parts. MUST match the exact 3D turn/angle from the preview.",
+    "For trait/accessory layers: describe ONLY that single element, isolated on transparent background, at the SAME 3D angle as the body. NEVER include the base body, other traits, or background.",
+    "CRITICAL: Each layer prompt must EXPLICITLY state what NOT to include — list the other layers by name as exclusions.",
+    "Do not include markdown fences."
+  ].join("\n");
+
+  const layerList = layers.map((l, i) => {
+    const regionStr = l.region ? ` [Region: ${l.region.x},${l.region.y} ${l.region.width}x${l.region.height}px]` : "";
+    return `${i + 1}. ${l.name}: ${l.description || l.placementNotes || "no description"}${regionStr}`;
+  });
+
+  const response = await callOpenAIJson(apiKey, {
+    model: "gpt-5.4",
+    input: [
+      { role: "system", content: [{ type: "input_text", text: prompt }] },
+      { role: "user", content: [
+        { type: "input_text", text: `Analyze this preview and write generation prompts for each layer:\n${layerList.join("\n")}` },
+        { type: "input_image", image_url: previewDataUrl, detail: "high" }
+      ]}
+    ]
+  });
+
+  const perspectiveNote = cleanText(response?.perspectiveNote);
+  const analyzed = Array.isArray(response?.layers) ? response.layers : [];
+  return analyzed.map((item) => {
+    const layerPrompt = cleanText(item?.generationPrompt);
+    const fullPrompt = perspectiveNote
+      ? `MANDATORY PERSPECTIVE: ${perspectiveNote}. ${layerPrompt}`
+      : layerPrompt;
+    return {
+      name: cleanText(item?.name),
+      generationPrompt: fullPrompt
+    };
+  });
+}
+
+async function createLayerMap(apiKey, previewDataUrl, layers, canvas) {
+  const prompt = [
+    "You are analyzing a preview image of a layered NFT collection.",
+    "Return JSON only.",
+    `The canvas is ${canvas.width}x${canvas.height} pixels.`,
+    "The JSON must have one key named layers.",
+    "layers must be an array with one entry per layer listed below.",
+    "Each entry must have: name, region, stackOrder, description.",
+    "region must have: x, y, width, height — all as pixel values (integers) relative to the canvas.",
+    "x and y are the top-left corner of where this layer's content sits in the preview image.",
+    "width and height are the pixel dimensions of the bounding box around that layer's content.",
+    "stackOrder is an integer: 0 = backmost (background), higher = closer to viewer.",
+    "Be PRECISE with the pixel coordinates. Study the image carefully.",
+    "For the background layer: region should be the full canvas {x:0, y:0, width:" + canvas.width + ", height:" + canvas.height + "}.",
+    "For the base/body layer: region should tightly bound the main subject.",
+    "For trait layers (accessories, overlays, details): region should tightly bound just that element.",
+    "If a layer's content overlaps another, that's fine — give each its own bounding box.",
+    "",
+    "IMPORTANT: If you see visual elements in the preview that are NOT covered by the listed layers, ADD them as new entries.",
+    "For example, if the preview has a cosmic glow behind the subject but no 'Background Accent' layer is listed, add one.",
+    "If the preview has a shadow, reflection, or ambient effect not covered, add a layer for it.",
+    "Mark any added layers with isNew: true so the system knows they were detected from the image.",
+    "Do not include markdown fences."
+  ].join("\n");
+
+  const layerList = layers.map((l, i) => `${i + 1}. ${l.name}: ${l.description || l.placementNotes || ""}`.trim());
+
+  const response = await callOpenAIJson(apiKey, {
+    model: "gpt-5.4",
+    input: [
+      { role: "system", content: [{ type: "input_text", text: prompt }] },
+      { role: "user", content: [
+        { type: "input_text", text: `Layers to map:\n${layerList.join("\n")}` },
+        { type: "input_image", image_url: previewDataUrl, detail: "high" }
+      ]}
+    ]
+  });
+
+  const mapped = Array.isArray(response?.layers) ? response.layers : [];
+  return mapped.map((item, index) => ({
+    name: cleanText(item?.name) || layers[index]?.name || `Layer ${index + 1}`,
+    region: {
+      x: Math.max(0, Math.round(Number(item?.region?.x) || 0)),
+      y: Math.max(0, Math.round(Number(item?.region?.y) || 0)),
+      width: Math.max(1, Math.min(canvas.width, Math.round(Number(item?.region?.width) || canvas.width))),
+      height: Math.max(1, Math.min(canvas.height, Math.round(Number(item?.region?.height) || canvas.height)))
+    },
+    stackOrder: Number.isFinite(Number(item?.stackOrder)) ? Number(item.stackOrder) : index,
+    description: cleanText(item?.description),
+    isNew: Boolean(item?.isNew)
+  }));
 }
 
 async function refreshStudioMemory(apiKey, project, memory, brain, toolManifest) {
@@ -371,7 +504,9 @@ function buildProjectPayload(project) {
     title: project.title,
     artDirection: project.artDirection,
     collectionGoal: project.collectionGoal,
-    styleGuide: project.styleGuide,
+    styleGuide: project.lockedStyleGuide || project.styleGuide,
+    previewPrompt: project.previewPrompt,
+    planSummary: project.planSummary,
     canvas: project.canvas,
     recentChat: (project.chatHistory || []).slice(-10).map((message) => ({
       role: cleanText(message.role),

@@ -246,7 +246,11 @@
             <h2>Layers</h2>
           </div>
           <div class="panel-head-actions">
-            <button id="buildAllLayersBtn" class="btn btn-primary" type="button">Build All Layers</button>
+            <div class="variation-controls">
+              <button id="buildAllLayersBtn" class="btn btn-primary" type="button">Generate Variations</button>
+              <input id="variationCountInput" type="number" min="1" max="20" value="1" class="variation-count-input" title="Variations per layer" />
+            </div>
+            <button id="resetAllPositionsBtn" class="btn btn-ghost" type="button">Fix Positions</button>
             <button id="newLayerBtn" class="btn btn-ghost" type="button">Add Layer</button>
             <span id="layerCount" class="badge">0 layers</span>
           </div>

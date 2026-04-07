@@ -235,6 +235,49 @@ app.delete("/api/projects/:projectId", async (req, res, next) => {
   }
 });
 
+app.post("/api/projects/:projectId/reset-positions", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    hydrateProjectLayerFitContracts(project);
+    const canvas = project.canvas || { width: 1024, height: 1024 };
+
+    for (const layer of project.layers) {
+      const transform = await computeLayerTransformFromContent(layer, canvas);
+      layer.transform = transform;
+      for (const variant of layer.variants || []) {
+        if (variant.customTransform) delete variant.customTransform;
+      }
+    }
+
+    const sortedLayers = sortLayersByType(project.layers);
+    project.layers = sortedLayers;
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    res.json({ project });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/layers/:layerId/reset-position", async (req, res, next) => {
+  try {
+    const project = await projectService.readProject(req.params.projectId);
+    hydrateProjectLayerFitContracts(project);
+    const layer = project.layers.find((item) => item.id === req.params.layerId);
+    if (!layer) { res.status(404).json({ error: "Layer not found." }); return; }
+    const canvas = project.canvas || { width: 1024, height: 1024 };
+    layer.transform = await computeLayerTransformFromContent(layer, canvas);
+    for (const variant of layer.variants || []) {
+      if (variant.customTransform) delete variant.customTransform;
+    }
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+    res.json({ project, layer });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/projects/:projectId/layers/:layerId/upload-variant", upload.single("image"), async (req, res, next) => {
   try {
     if (!req.file) { res.status(400).json({ error: "No image file provided." }); return; }
@@ -265,6 +308,96 @@ app.post("/api/projects/:projectId/layers/:layerId/upload-variant", upload.singl
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
     res.json({ project, layer, variant });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/projects/:projectId/rebuild-layers-from-preview", async (req, res, next) => {
+  try {
+    const apiKey = getApiKey();
+    const project = await projectService.readProject(req.params.projectId);
+    const previewId = cleanText(req.body?.previewId) || project.selectedPreviewId;
+    const preview = (project.previewHistory || []).find((p) => p.id === previewId);
+
+    if (!preview) {
+      res.status(404).json({ error: "Preview not found." });
+      return;
+    }
+
+    project.selectedPreviewId = previewId;
+    project.previewPrompt = preview.prompt || project.previewPrompt;
+
+    let memory = await studioMemoryService.getMemory(project);
+    const brain = await studioBrainService.getBrain();
+    const toolManifest = await studioBrainService.getToolManifest();
+    const plan = await openaiService.createPreviewPlan(apiKey, project, memory, brain, toolManifest, []);
+
+    project.planSummary = plan.collectionSummary;
+    project.styleGuide = plan.styleGuide;
+
+    const proposedLayers = plan.layers.map((layer, index) => ({
+      id: layer.id || `layer-${index + 1}`,
+      name: cleanText(layer.name) || `Layer ${index + 1}`,
+      description: cleanText(layer.description),
+      placementNotes: cleanText(layer.placementNotes),
+      variantIdeas: Array.isArray(layer.variantIdeas) ? layer.variantIdeas : []
+    }));
+
+    // Run layer map + detailed prompt analysis on the preview
+    try {
+      const previewAbsPath = publicAssetUrlToAbsolutePath(preview.imageUrl);
+      const previewBuffer = await fs.readFile(previewAbsPath);
+      const previewDataUrl = `data:image/png;base64,${previewBuffer.toString("base64")}`;
+
+      const layerMap = await openaiService.createLayerMap(apiKey, previewDataUrl, proposedLayers, project.canvas);
+      for (const mapped of layerMap) {
+        const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(mapped.name).toLowerCase());
+        if (match) {
+          match.region = mapped.region;
+          match.stackOrder = mapped.stackOrder;
+        } else if (mapped.isNew && mapped.name) {
+          proposedLayers.push({
+            id: `layer-${proposedLayers.length + 1}-${slugify(mapped.name)}`,
+            name: mapped.name,
+            description: mapped.description || "",
+            placementNotes: "",
+            variantIdeas: [],
+            region: mapped.region,
+            stackOrder: mapped.stackOrder
+          });
+        }
+      }
+      proposedLayers.sort((a, b) => (a.stackOrder || 0) - (b.stackOrder || 0));
+
+      const detailedPrompts = await openaiService.analyzePreviewForLayerPrompts(apiKey, previewDataUrl, proposedLayers, project.canvas);
+      for (const dp of detailedPrompts) {
+        const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(dp.name).toLowerCase());
+        if (match && dp.generationPrompt) {
+          match.previewGenerationPrompt = dp.generationPrompt;
+        }
+      }
+    } catch (analysisError) {
+      console.warn("[rebuild] Could not analyze preview:", analysisError.message);
+    }
+
+    const proposeOnly = Boolean(req.body?.proposeOnly);
+    if (proposeOnly) {
+      project.proposedLayers = proposedLayers;
+    } else {
+      project.layers = projectService.syncLayersFromPlan(project.layers, proposedLayers);
+      project.proposedLayers = [];
+    }
+    project.updatedAt = new Date().toISOString();
+    await projectService.writeProject(project);
+
+    memory = await studioMemoryService.appendChangelog(project, {
+      type: proposeOnly ? "propose-layers" : "rebuild-layers",
+      title: proposeOnly ? "Proposed layers from preview" : "Rebuilt layers from preview",
+      detail: `${proposeOnly ? "Proposed" : "Synced"} ${proposedLayers.length} layers from ${preview.name || previewId}.`
+    });
+
+    res.json({ project, memory, layerCount: proposedLayers.length });
   } catch (error) {
     next(error);
   }
@@ -361,11 +494,10 @@ app.post("/api/chat", async (req, res, next) => {
     let action = route.actionType;
     let assistantGenerated = null;
 
-    const hasProposedOnly = Array.isArray(project.proposedLayers) && project.proposedLayers.length > 0 &&
-      (!project.layers.length || project.layers.every((l) => !l.variants || l.variants.length === 0));
+    const hasProposedOnly = Array.isArray(project.proposedLayers) && project.proposedLayers.length > 0;
     if (hasProposedOnly && ["edit_layer_variant", "transform_layer_variant", "draft_variant", "add_variant", "commit_draft"].includes(action)) {
       action = "preview";
-      assistantReply = "The layers are still a proposal — no layer images exist yet. I'll regenerate the preview with your feedback. Approve the plan and hit Build All Layers when you're happy.";
+      assistantReply = "The layers are still proposed — approve the plan first to create the folders and draw the layers. I'll regenerate the preview with your feedback.";
     }
 
     const forcedFreshDraft = shouldForceFreshTraitDraft(project, promptText, route);
@@ -982,29 +1114,68 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
     const anchorRef = (!isBackground && !isBase)
       ? await getActiveAnchorReferenceAttachment(project, layer)
       : null;
+    const previewRef = await getSelectedPreviewReference(project);
+
+    const region = layer.region || null;
+    const canvasW = project.canvas?.width || 1024;
+    const canvasH = project.canvas?.height || 1024;
+
+    const previewPromptForLayer = cleanText(layer.previewGenerationPrompt);
 
     const variants = [];
     const warnings = [];
-    for (const item of plan.variants) {
+    for (let variantIndex = 0; variantIndex < plan.variants.length; variantIndex++) {
+      const item = plan.variants[variantIndex];
       let imageAsset;
-      if (anchorRef?.dataUrl) {
+
+      // First variant uses the detailed preview-analyzed prompt wrapped with isolation rules
+      const isFirstVariant = variantIndex === 0;
+      const basePrompt = (isFirstVariant && previewPromptForLayer)
+        ? openaiService.buildLayerAssetPrompt({ project, layer, promptText: previewPromptForLayer })
+        : item.prompt;
+
+      // Build exclusion list — what NOT to draw
+      const otherLayerNames = project.layers
+        .filter((l) => l.id !== layer.id)
+        .map((l) => l.name);
+      const exclusionPrompt = otherLayerNames.length
+        ? ` Do NOT draw any of these other layers: ${otherLayerNames.join(", ")}. This layer contains ONLY ${layer.name}.`
+        : "";
+
+      // Build region-aware prompt suffix
+      const regionPrompt = region && !isBackground
+        ? ` Place this element's content within the region: top-left (${region.x}, ${region.y}), size ${region.width}x${region.height} pixels on a ${canvasW}x${canvasH} canvas. The rest of the canvas must be transparent. Do not center the element — position it exactly in this region.`
+        : "";
+
+      const fullPrompt = basePrompt + exclusionPrompt + regionPrompt;
+
+      if (anchorRef?.dataUrl && !isBackground && !isBase) {
+        // Trait layers: use the body/anchor as reference so they fit perfectly
         imageAsset = await openaiService.editImageAsset({
           apiKey,
-          prompt: item.prompt,
+          prompt: fullPrompt,
           images: [anchorRef.dataUrl],
-          background: backgroundMode,
-          inputFidelity: "low"
+          background: "transparent",
+          inputFidelity: "high"
         });
       } else {
+        // Background, base, and layers without anchor: generate from prompt alone
+        // The detailed preview-analyzed prompt has all the visual info needed
         imageAsset = await openaiService.generateImageAsset({
           apiKey,
-          prompt: item.prompt,
+          prompt: fullPrompt,
           size: project.canvas.generationSize,
           background: backgroundMode
         });
       }
 
-      const resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+      let resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+
+      // Post-process: reposition content to match the target region from the layer map
+      if (region && !isBackground) {
+        resizedBuffer = await repositionLayerContent(resizedBuffer, region, canvasW, canvasH);
+      }
+
       const analysis = await inspectVariantAgainstLayer(layer, resizedBuffer);
 
       if (analysis.possibleDuplicate) {
@@ -1952,13 +2123,52 @@ async function generatePreviewForProject(project, apiKey, attachments = []) {
   };
   project.previewHistory.unshift(previewEntry);
   project.selectedPreviewId = previewId;
-  project.proposedLayers = plan.layers.map((layer, index) => ({
+  const proposedLayers = plan.layers.map((layer, index) => ({
     id: layer.id || `layer-${index + 1}`,
     name: cleanText(layer.name) || `Layer ${index + 1}`,
     description: cleanText(layer.description),
     placementNotes: cleanText(layer.placementNotes),
     variantIdeas: Array.isArray(layer.variantIdeas) ? layer.variantIdeas : []
   }));
+
+  // Analyze preview image: get bounding boxes AND detailed generation prompts for each layer
+  try {
+    const previewDataUrl = `data:image/png;base64,${previewBuffer.toString("base64")}`;
+
+    // Step 1: Get pixel-precise bounding boxes + detect missing layers
+    const layerMap = await openaiService.createLayerMap(apiKey, previewDataUrl, proposedLayers, project.canvas);
+    for (const mapped of layerMap) {
+      const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(mapped.name).toLowerCase());
+      if (match) {
+        match.region = mapped.region;
+        match.stackOrder = mapped.stackOrder;
+      } else if (mapped.isNew && mapped.name) {
+        proposedLayers.push({
+          id: `layer-${proposedLayers.length + 1}-${slugify(mapped.name)}`,
+          name: mapped.name,
+          description: mapped.description || "",
+          placementNotes: "",
+          variantIdeas: [],
+          region: mapped.region,
+          stackOrder: mapped.stackOrder
+        });
+      }
+    }
+    proposedLayers.sort((a, b) => (a.stackOrder || 0) - (b.stackOrder || 0));
+
+    // Step 2: Get hyper-detailed generation prompts by studying the preview
+    const detailedPrompts = await openaiService.analyzePreviewForLayerPrompts(apiKey, previewDataUrl, proposedLayers, project.canvas);
+    for (const dp of detailedPrompts) {
+      const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(dp.name).toLowerCase());
+      if (match && dp.generationPrompt) {
+        match.previewGenerationPrompt = dp.generationPrompt;
+      }
+    }
+  } catch (mapError) {
+    console.warn("[layer-analysis] Could not fully analyze preview:", mapError.message);
+  }
+
+  project.proposedLayers = proposedLayers;
   project.updatedAt = now;
 
   await projectService.writeProject(project);
@@ -4455,11 +4665,8 @@ function inferTransformPatchFromPrompt(layer, promptText, currentTransform = nul
 }
 
 function getDefaultTransformForLayer(layerName) {
-  const fitProfile = getLayerFitProfile(layerName);
-  if (fitProfile?.defaultTransform) {
-    return normalizeLayerTransform(fitProfile.defaultTransform);
-  }
-
+  // Generated layers are full canvas size with content already positioned.
+  // Always default to identity transform — no offset, no scaling.
   return { x: 0, y: 0, scale: 1 };
 }
 
@@ -4629,6 +4836,22 @@ function getActiveAnchorLayer(project, targetLayer = null) {
   }
 
   return null;
+}
+
+async function getSelectedPreviewReference(project) {
+  const selectedPreview = (project.previewHistory || []).find(
+    (p) => p.id === project.selectedPreviewId
+  );
+  const imageUrl = cleanText(selectedPreview?.imageUrl);
+  if (!imageUrl) return null;
+
+  try {
+    const absolutePath = publicAssetUrlToAbsolutePath(imageUrl);
+    const buffer = await fs.readFile(absolutePath);
+    return `data:image/png;base64,${buffer.toString("base64")}`;
+  } catch {
+    return null;
+  }
 }
 
 async function getActiveAnchorReferenceAttachment(project, targetLayer, excludeUrls = []) {
@@ -5809,6 +6032,138 @@ function buildLockedDecisionTitle(promptText) {
   }
 
   return "Remember this approved creative behavior";
+}
+
+async function repositionLayerContent(buffer, targetRegion, canvasW, canvasH) {
+  // Analyze where the generated content actually is
+  const analysis = await assetToolService.inspectPngBuffer(buffer);
+  if (!analysis.bounds || analysis.emptyAlpha) return buffer;
+
+  const actual = analysis.bounds;
+  const actualCenterX = (actual.left + actual.right) / 2;
+  const actualCenterY = (actual.top + actual.bottom) / 2;
+  const actualW = actual.right - actual.left + 1;
+  const actualH = actual.bottom - actual.top + 1;
+
+  // Target center from the region map
+  const targetCenterX = targetRegion.x + targetRegion.width / 2;
+  const targetCenterY = targetRegion.y + targetRegion.height / 2;
+
+  // How much to shift
+  const shiftX = Math.round(targetCenterX - actualCenterX);
+  const shiftY = Math.round(targetCenterY - actualCenterY);
+
+  // Scale if the content is much bigger/smaller than the target region
+  const scaleX = targetRegion.width / actualW;
+  const scaleY = targetRegion.height / actualH;
+  const scale = Math.min(scaleX, scaleY, 1.5); // Don't upscale more than 1.5x
+
+  if (Math.abs(shiftX) < 5 && Math.abs(shiftY) < 5 && Math.abs(scale - 1) < 0.05) {
+    return buffer; // Close enough, don't reprocess
+  }
+
+  // Extract the content, resize if needed, place on fresh canvas at target position
+  const contentBuffer = await sharp(buffer)
+    .extract({
+      left: actual.left,
+      top: actual.top,
+      width: actualW,
+      height: actualH
+    })
+    .png()
+    .toBuffer();
+
+  const newW = Math.max(1, Math.round(actualW * scale));
+  const newH = Math.max(1, Math.round(actualH * scale));
+  const scaledContent = await sharp(contentBuffer)
+    .resize({ width: newW, height: newH, fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png()
+    .toBuffer();
+
+  const placeLeft = Math.max(0, Math.min(canvasW - newW, Math.round(targetCenterX - newW / 2)));
+  const placeTop = Math.max(0, Math.min(canvasH - newH, Math.round(targetCenterY - newH / 2)));
+
+  return sharp({
+    create: {
+      width: canvasW,
+      height: canvasH,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 }
+    }
+  })
+    .composite([{ input: scaledContent, left: placeLeft, top: placeTop }])
+    .png()
+    .toBuffer();
+}
+
+async function computeLayerTransformFromContent(layer, canvas) {
+  // Generated layers are already full-canvas PNGs (same size as the canvas) with
+  // content positioned where it belongs. The composite renderer centers them and
+  // applies scale/offset from the transform. So the correct default for all
+  // generated layers is identity: no offset, no scaling — just stack them as-is.
+  // Only apply fit-profile defaults for layers that were NOT generated from the
+  // preview (i.e. they have no variants yet or were manually uploaded at a
+  // different resolution).
+
+  const variant = (layer.variants || []).find((v) => v.id === layer.selectedVariantId) || (layer.variants || [])[0];
+  if (!variant?.imageUrl) return { x: 0, y: 0, scale: 1 };
+
+  try {
+    const absolutePath = publicAssetUrlToAbsolutePath(variant.imageUrl);
+    const metadata = await sharp(absolutePath).metadata();
+    const canvasW = canvas.width || 1024;
+    const canvasH = canvas.height || 1024;
+    const imgW = metadata.width || canvasW;
+    const imgH = metadata.height || canvasH;
+
+    // If the layer image matches the canvas size, it was generated to fit —
+    // use identity transform so it composites exactly where the content sits.
+    if (imgW === canvasW && imgH === canvasH) {
+      return { x: 0, y: 0, scale: 1 };
+    }
+
+    // If the image is a different size (e.g. manually uploaded), scale to fit.
+    const scale = Math.min(canvasW / imgW, canvasH / imgH);
+    return normalizeLayerTransform({ x: 0, y: 0, scale: Number(scale.toFixed(3)) });
+  } catch {
+    return { x: 0, y: 0, scale: 1 };
+  }
+}
+
+function sortLayersByType(layers) {
+  const order = [
+    "background", "background-accent", "base", "body", "character", "avatar",
+    "outfit", "neckwear", "mouth", "eyewear", "headwear",
+    "handheld", "surface-overlay"
+  ];
+
+  return [...layers].sort((a, b) => {
+    const aIdx = getLayerSortIndex(a.name, order);
+    const bIdx = getLayerSortIndex(b.name, order);
+    return aIdx - bIdx;
+  });
+}
+
+function getLayerSortIndex(layerName, order) {
+  const lowered = cleanText(layerName).toLowerCase();
+
+  if (isFullCanvasBackgroundLayerName(lowered)) return 0;
+  if (isBackgroundAccentLayerName(lowered)) return 1;
+  if (isPrimaryBaseLayerName(lowered)) return 2;
+
+  const fitProfile = getLayerFitProfile(layerName);
+  const profileId = cleanText(fitProfile?.id).toLowerCase();
+  const idx = order.indexOf(profileId);
+  if (idx !== -1) return idx;
+
+  if (/outfit|shirt|hoodie|jacket/.test(lowered)) return 5;
+  if (/neck|chain|scarf/.test(lowered)) return 6;
+  if (/mouth|smile|teeth/.test(lowered)) return 7;
+  if (/eye|glasses|shades/.test(lowered)) return 8;
+  if (/head|hat|crown|tiara/.test(lowered)) return 9;
+  if (/hand|weapon|sword|prop/.test(lowered)) return 10;
+
+  return 50;
 }
 
 function calculateSupplyInfo(project) {

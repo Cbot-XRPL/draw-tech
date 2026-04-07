@@ -244,8 +244,11 @@ export function createProjectService({ projectsDir }) {
         variantIdeas: plannedLayer.variantIdeas || [],
         variants: current?.variants || [],
         selectedVariantId: current?.selectedVariantId || null,
-        transform: current?.transform || null,
-        fitContract: current?.fitContract || null
+        transform: current?.transform || { x: 0, y: 0, scale: 1 },
+        fitContract: current?.fitContract || null,
+        region: plannedLayer.region || current?.region || null,
+        stackOrder: plannedLayer.stackOrder != null ? plannedLayer.stackOrder : (current?.stackOrder != null ? current.stackOrder : index),
+        previewGenerationPrompt: plannedLayer.previewGenerationPrompt || current?.previewGenerationPrompt || ""
       };
     });
   }

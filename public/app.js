@@ -90,6 +90,8 @@ const elements = {
   proposedLayersPanel: document.getElementById("proposedLayersPanel"),
   layersPanel: document.getElementById("layersPanel"),
   buildAllLayersBtn: document.getElementById("buildAllLayersBtn"),
+  variationCountInput: document.getElementById("variationCountInput"),
+  resetAllPositionsBtn: document.getElementById("resetAllPositionsBtn"),
   newLayerBtn: document.getElementById("newLayerBtn"),
   layerCount: document.getElementById("layerCount"),
   confirmDialog: document.getElementById("confirmDialog"),
@@ -363,7 +365,6 @@ elements.downloadFitDebugBtn.addEventListener("click", async () => {
 
 elements.buildAllLayersBtn.addEventListener("click", async () => {
   if (!state.project?.id) { showToast("No project open.", true); return; }
-  const emptyLayers = (state.project.layers || []).filter((l) => !l.variants || l.variants.length === 0);
   const allLayers = state.project.layers || [];
 
   if (!allLayers.length) {
@@ -371,29 +372,58 @@ elements.buildAllLayersBtn.addEventListener("click", async () => {
     return;
   }
 
-  const target = emptyLayers.length > 0 ? emptyLayers : allLayers;
+  const count = Math.max(1, Math.min(20, Number(elements.variationCountInput.value) || 1));
   const confirmed = await confirmAction(
-    `Generate 2 variants for ${target.length} layer${target.length === 1 ? "" : "s"}${emptyLayers.length > 0 ? " (empty layers only)" : " (all layers)"}? This uses your API key and may take a while.`
+    `Generate ${count} new variation${count === 1 ? "" : "s"} for each of ${allLayers.length} layers? This uses your API key and may take a while.`,
+    { confirmLabel: "Generate", confirmClass: "btn-primary" }
+  );
+  if (!confirmed) return;
+
+  state.busy = true;
+  syncBusyState();
+  let generated = 0;
+  const errors = [];
+  const layerIds = allLayers.map((l) => ({ id: l.id, name: l.name }));
+  for (const { id, name } of layerIds) {
+    try {
+      showToast(`Generating ${name} variations... (${generated + 1}/${layerIds.length})`);
+      const response = await api(`/api/projects/${state.project.id}/layers/${id}/variants`, {
+        method: "POST",
+        body: { count }
+      });
+      await applyProject(response.project);
+      render();
+      generated++;
+    } catch (error) {
+      errors.push(`${name}: ${error.message}`);
+      showToast(`Failed on ${name}: ${error.message}`, true);
+    }
+  }
+  state.busy = false;
+  syncBusyState();
+  render();
+  if (errors.length && !generated) {
+    showToast(`All layers failed. ${errors[0]}`, true);
+  } else if (errors.length) {
+    showToast(`Generated for ${generated} layer${generated === 1 ? "" : "s"}, ${errors.length} failed.`, true);
+  } else {
+    showToast(`Generated ${count} variation${count === 1 ? "" : "s"} for ${generated} layers.`);
+  }
+});
+
+elements.resetAllPositionsBtn.addEventListener("click", async () => {
+  if (!state.project?.id) { showToast("No project open.", true); return; }
+  const confirmed = await confirmAction(
+    "Reset all layers to their default positions and sizes based on layer type? This fixes headwear, eyewear, etc. to their expected placement.",
+    { confirmLabel: "Fix All", confirmClass: "btn-primary" }
   );
   if (!confirmed) return;
 
   await withBusy(async () => {
-    let generated = 0;
-    for (const layer of target) {
-      try {
-        showToast(`Building ${layer.name}... (${generated + 1}/${target.length})`);
-        const response = await api(`/api/projects/${state.project.id}/layers/${layer.id}/variants`, {
-          method: "POST",
-          body: { count: 2 }
-        });
-        await applyProject(response.project);
-        generated++;
-      } catch (error) {
-        showToast(`Failed on ${layer.name}: ${error.message}`, true);
-      }
-    }
+    const response = await api(`/api/projects/${state.project.id}/reset-positions`, { method: "POST" });
+    await applyProject(response.project);
     render();
-    showToast(`Built variants for ${generated} layer${generated === 1 ? "" : "s"}.`);
+    showToast("All layer positions reset to defaults.");
   });
 });
 
@@ -844,6 +874,17 @@ function renderChat() {
                         View Full
                       </button>
                       ${
+                        message.generatedImage.type === "preview" || (!message.generatedImage.targetLayerName && message.generatedImage.imageUrl?.includes("/preview/"))
+                          ? `<button
+                              class="btn btn-ghost"
+                              data-action="rebuild-from-preview"
+                              data-preview-id="${escapeHtml(message.generatedImage.id)}"
+                            >
+                              Rebuild Layers
+                            </button>`
+                          : ""
+                      }
+                      ${
                         message.generatedImage.type === "draft" && message.generatedImage.status !== "committed"
                           ? `<button
                               class="btn btn-ghost"
@@ -1119,13 +1160,15 @@ function renderProposedLayers() {
             <strong>${escapeHtml(layer.name)}</strong>
             ${layer.description ? `<p class="proposed-layer-desc">${escapeHtml(layer.description)}</p>` : ""}
             ${layer.variantIdeas?.length ? `<p class="proposed-layer-ideas">Ideas: ${escapeHtml(layer.variantIdeas.join(", "))}</p>` : ""}
+            ${layer.region ? `<p class="proposed-layer-region">Region: ${layer.region.x},${layer.region.y} ${layer.region.width}x${layer.region.height}px • Stack #${layer.stackOrder ?? i}</p>` : ""}
+            ${layer.previewGenerationPrompt ? `<details class="proposed-layer-prompt-details"><summary>Generation Prompt</summary><p class="proposed-layer-prompt">${escapeHtml(layer.previewGenerationPrompt)}</p></details>` : ""}
           </div>
           <button class="btn btn-ghost btn-compact" data-action="remove-proposed" data-index="${i}">Remove</button>
         </div>
       `).join("")}
     </div>
     <div class="proposed-layers-actions">
-      <button class="btn btn-primary" id="approvePlanBtn" type="button">Approve &amp; Build Layers</button>
+      <button class="btn btn-primary" id="approvePlanBtn" type="button">Approve &amp; Build All Layers</button>
       ${state.project?.styleGuide && !state.project?.lockedStyleGuide
         ? `<button class="btn btn-ghost" id="lockStyleBtn" type="button">Lock Style Guide</button>`
         : state.project?.lockedStyleGuide
@@ -1137,14 +1180,56 @@ function renderProposedLayers() {
 
   elements.proposedLayersPanel.querySelector("#approvePlanBtn")?.addEventListener("click", async () => {
     if (!state.project?.id) return;
-    await withBusy(async () => {
-      const response = await api(`/api/projects/${state.project.id}/approve-plan`, {
-        method: "POST"
-      });
-      await applyProject(response.project);
+
+    const layerCount = (state.project.proposedLayers || []).length;
+    const confirmed = await confirmAction(
+      `Approve ${layerCount} layers and draw 1 image for each from the preview? This uses your API key.`,
+      { confirmLabel: "Approve & Build", confirmClass: "btn-primary" }
+    );
+    if (!confirmed) return;
+
+    state.busy = true;
+    syncBusyState();
+    try {
+      const approveResponse = await api(`/api/projects/${state.project.id}/approve-plan`, { method: "POST" });
+      await applyProject(approveResponse.project);
       render();
-      showToast(`Layer plan approved — ${response.project.layers.length} folders created.`);
-    });
+      showToast("Plan approved. Drawing all layers from preview...");
+
+      const layers = sortLayersForBuild(state.project.layers || []);
+      const layerIds = layers.map((l) => ({ id: l.id, name: l.name }));
+      let generated = 0;
+      const errors = [];
+
+      for (const { id, name } of layerIds) {
+        try {
+          showToast(`Drawing ${name}... (${generated + 1}/${layerIds.length})`);
+          const response = await api(`/api/projects/${state.project.id}/layers/${id}/variants`, {
+            method: "POST",
+            body: { count: 1 }
+          });
+          await applyProject(response.project);
+          render();
+          generated++;
+        } catch (error) {
+          errors.push(`${name}: ${error.message}`);
+        }
+      }
+
+      if (errors.length && !generated) {
+        showToast(`Failed to draw layers. ${errors[0]}`, true);
+      } else if (errors.length) {
+        showToast(`Drew ${generated} layers, ${errors.length} failed.`, true);
+      } else {
+        showToast(`All ${generated} layers drawn from preview.`);
+      }
+    } catch (error) {
+      showToast(error.message || "Failed to approve plan.", true);
+    } finally {
+      state.busy = false;
+      syncBusyState();
+      render();
+    }
   });
 
   elements.proposedLayersPanel.querySelector("#lockStyleBtn")?.addEventListener("click", async () => {
@@ -1175,10 +1260,28 @@ function renderLayers() {
   const layers = state.project?.layers || [];
   elements.layerCount.textContent = `${layers.length} layer${layers.length === 1 ? "" : "s"}`;
   elements.buildAllLayersBtn.classList.toggle("hidden", !layers.length);
+  elements.resetAllPositionsBtn.classList.toggle("hidden", !layers.length);
 
   if (!layers.length) {
+    const hasPreview = state.project?.previewHistory?.length > 0;
+    const hasProposed = state.project?.proposedLayers?.length > 0;
     elements.layersPanel.className = "layer-folder-list empty-state";
-    elements.layersPanel.textContent = "Layer folders will appear here after the first prompt.";
+    if (hasProposed) {
+      elements.layersPanel.innerHTML = `<div class="layers-empty-guide">
+        <p>You have proposed layers waiting.</p>
+        <p class="layers-empty-tip">Scroll up to the Layer Plan and click "Approve &amp; Build All Layers" to create the folders.</p>
+      </div>`;
+    } else if (hasPreview) {
+      elements.layersPanel.innerHTML = `<div class="layers-empty-guide">
+        <p>No layer folders yet.</p>
+        <p class="layers-empty-tip">Generate a new preview to get a fresh layer plan, or add layers manually.</p>
+      </div>`;
+    } else {
+      elements.layersPanel.innerHTML = `<div class="layers-empty-guide">
+        <p>No layers yet.</p>
+        <p class="layers-empty-tip">Generate a preview first, then layers will appear here automatically. You can also add layers manually.</p>
+      </div>`;
+    }
     return;
   }
 
@@ -1237,6 +1340,14 @@ function renderLayers() {
                 data-layer-name="${escapeHtml(layer.name)}"
               >
                 Rename
+              </button>
+              <button
+                class="btn btn-ghost"
+                data-action="reset-layer-position"
+                data-layer-id="${layer.id}"
+                title="Reset to default position/size for this layer type"
+              >
+                Fix Position
               </button>
               <button class="btn btn-danger" data-action="remove-layer" data-layer-id="${layer.id}">Remove Layer</button>
             </div>
@@ -1316,6 +1427,14 @@ function renderLayers() {
                 : `<div class="empty-state">No images in this layer folder yet.</div>`
             }
             <div class="folder-footer">
+              <button
+                class="btn btn-primary btn-gen-variants"
+                data-action="generate-layer-variants"
+                data-layer-id="${layer.id}"
+                data-layer-name="${escapeHtml(layer.name)}"
+              >
+                Generate Variants
+              </button>
               <label class="btn btn-ghost btn-upload-variant">
                 Upload PNG
                 <input type="file" accept="image/png,image/webp,image/jpeg" class="hidden-file"
@@ -1591,6 +1710,50 @@ function bindLayerActions() {
     });
   });
 
+  elements.layersPanel.querySelectorAll("[data-action='reset-layer-position']").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      await withBusy(async () => {
+        const response = await api(`/api/projects/${state.project.id}/layers/${button.dataset.layerId}/reset-position`, { method: "POST" });
+        await applyProject(response.project);
+        render();
+        showToast("Layer position reset.");
+      });
+    });
+  });
+
+  elements.layersPanel.querySelectorAll("[data-action='generate-layer-variants']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const layerId = button.dataset.layerId;
+      const layerName = button.dataset.layerName || "layer";
+      const count = Math.max(1, Math.min(20, Number(elements.variationCountInput.value) || 1));
+      const confirmed = await confirmAction(
+        `Generate ${count} new variation${count === 1 ? "" : "s"} for ${layerName}? This uses your API key.`,
+        { confirmLabel: "Generate", confirmClass: "btn-primary" }
+      );
+      if (!confirmed) return;
+
+      state.busy = true;
+      syncBusyState();
+      try {
+        showToast(`Generating ${layerName} variations...`);
+        const response = await api(`/api/projects/${state.project.id}/layers/${layerId}/variants`, {
+          method: "POST",
+          body: { count }
+        });
+        await applyProject(response.project);
+        render();
+        showToast(`Generated ${response.variants?.length || 0} ${layerName} variants.`);
+      } catch (error) {
+        showToast(`Failed: ${error.message}`, true);
+      } finally {
+        state.busy = false;
+        syncBusyState();
+      }
+    });
+  });
+
   elements.layersPanel.querySelectorAll("[data-action='upload-variant']").forEach((input) => {
     input.addEventListener("change", async () => {
       const file = input.files?.[0];
@@ -1637,6 +1800,32 @@ function bindChatActions() {
       state.lastFailedPrompt = null;
       elements.promptInput.value = prompt;
       await submitPrompt({ preservePrompt: true });
+    });
+  });
+
+  elements.chatLog.querySelectorAll("[data-action='rebuild-from-preview']").forEach((button) => {
+    button.addEventListener("click", async () => {
+      if (!state.project?.id) return;
+      const previewId = button.dataset.previewId;
+
+      await withBusy(async () => {
+        // Set this preview as active
+        await api(`/api/projects/${state.project.id}`, {
+          method: "PUT",
+          body: { selectedPreviewId: previewId }
+        });
+
+        // Rebuild the layer plan from this preview — puts them in proposedLayers for review
+        showToast("Rebuilding layer plan from preview...");
+        const response = await api(`/api/projects/${state.project.id}/rebuild-layers-from-preview`, {
+          method: "POST",
+          body: { previewId, proposeOnly: true }
+        });
+        await applyProject(response.project);
+        render();
+        showToast("Layer plan ready for review. Approve to build.");
+        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      });
     });
   });
 
@@ -2549,9 +2738,11 @@ function formatProjectTimestamp(value) {
   }).format(date);
 }
 
-function confirmAction(message) {
+function confirmAction(message, { confirmLabel = "Delete", confirmClass = "btn-danger" } = {}) {
   return new Promise((resolve) => {
     elements.confirmDialogMessage.textContent = message;
+    elements.confirmDialogYes.textContent = confirmLabel;
+    elements.confirmDialogYes.className = `btn ${confirmClass}`;
     elements.confirmDialog.classList.remove("hidden");
     const cleanup = () => {
       elements.confirmDialog.classList.add("hidden");
@@ -2562,6 +2753,17 @@ function confirmAction(message) {
     const onNo = () => { cleanup(); resolve(false); };
     elements.confirmDialogYes.addEventListener("click", onYes);
     elements.confirmDialogNo.addEventListener("click", onNo);
+  });
+}
+
+function sortLayersForBuild(layers) {
+  const lowName = (l) => (l.name || "").toLowerCase();
+  return [...layers].sort((a, b) => {
+    const aName = lowName(a);
+    const bName = lowName(b);
+    const aScore = /background/.test(aName) ? 0 : /(base|body|character|avatar)/.test(aName) ? 1 : 2;
+    const bScore = /background/.test(bName) ? 0 : /(base|body|character|avatar)/.test(bName) ? 1 : 2;
+    return aScore - bScore;
   });
 }
 
