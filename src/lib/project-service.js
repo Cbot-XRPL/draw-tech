@@ -248,7 +248,12 @@ export function createProjectService({ projectsDir }) {
         fitContract: current?.fitContract || null,
         region: plannedLayer.region || current?.region || null,
         stackOrder: plannedLayer.stackOrder != null ? plannedLayer.stackOrder : (current?.stackOrder != null ? current.stackOrder : index),
-        previewGenerationPrompt: plannedLayer.previewGenerationPrompt || current?.previewGenerationPrompt || ""
+        previewGenerationPrompt: plannedLayer.previewGenerationPrompt || current?.previewGenerationPrompt || "",
+        parentLayer: plannedLayer.parentLayer || current?.parentLayer || null,
+        attachmentType: plannedLayer.attachmentType || current?.attachmentType || null,
+        edgeRules: plannedLayer.edgeRules || current?.edgeRules || null,
+        zOrderNote: plannedLayer.zOrderNote || current?.zOrderNote || null,
+        interactionDescription: plannedLayer.interactionDescription || current?.interactionDescription || null
       };
     });
   }

@@ -6,6 +6,7 @@ export function createOpenAIService() {
     createPreviewPlan,
     createLayerVariantPlan,
     analyzePreviewForLayerPrompts,
+    createLayerRelationships,
     createLayerMap,
     buildLayerAssetPrompt,
     generateImageAsset,
@@ -272,6 +273,67 @@ async function analyzePreviewForLayerPrompts(apiKey, previewDataUrl, layers, can
       generationPrompt: fullPrompt
     };
   });
+}
+
+async function createLayerRelationships(apiKey, previewDataUrl, layers, canvas) {
+  const prompt = [
+    "You are analyzing how layers in an NFT preview INTERACT with each other spatially.",
+    "Return JSON only.",
+    `Canvas: ${canvas.width}x${canvas.height} pixels.`,
+    "The JSON must have one key named layers, an array with one entry per layer.",
+    "Each entry must have: name, parentLayer, attachmentType, edgeRules, zOrderNote, interactionDescription.",
+    "",
+    "parentLayer: the name of the layer this element CLIPS TO or MOUNTS ON. null if it's the background or base body.",
+    "",
+    "attachmentType: how this element connects to its parent. One of:",
+    "  - 'surface-mounted' (sits flat on a surface, like a decal on a door)",
+    "  - 'hanging' (dangles from a point on the parent, like a charm on a handle)",
+    "  - 'sitting-on-top' (rests on the top surface, like a topper on a roof)",
+    "  - 'inset' (recessed into the parent surface, like a lock in a door)",
+    "  - 'wrapping' (wraps around the parent, like a chain around the body)",
+    "  - 'floating-near' (floats near but doesn't physically touch, like an aura)",
+    "  - 'background' (behind everything)",
+    "  - 'base' (the main subject everything attaches to)",
+    "",
+    "edgeRules: an object with:",
+    "  - clipToParentEdges: boolean — should this element's edges align with the parent's edges?",
+    "  - overlapParent: 'none' | 'partial' | 'full' — how much of the parent does it cover?",
+    "  - mustTouchEdge: string or null — which edge of the parent it must touch ('top', 'left', 'center', 'bottom-left', etc.)",
+    "  - allowBleed: boolean — can this element extend beyond the parent's boundaries?",
+    "",
+    "zOrderNote: where this layer sits in depth relative to its parent and siblings.",
+    "  e.g. 'behind handle but in front of body', 'on top of door surface', 'behind body'",
+    "",
+    "interactionDescription: 1-2 sentences describing EXACTLY how this element physically connects to its parent.",
+    "  e.g. 'The charm hangs from the bottom of the handle via a small chain link. It should dangle behind the handle ring but in front of the vault body.'",
+    "  e.g. 'The door face plate sits flush inside the door frame recess. Its circular edges must align with the door opening exactly.'",
+    "",
+    "Be EXTREMELY precise about spatial relationships. Study the preview carefully.",
+    "Do not include markdown fences."
+  ].join("\n");
+
+  const layerList = layers.map((l, i) => `${i + 1}. ${l.name}: ${l.description || ""}`.trim());
+
+  const response = await callOpenAIJson(apiKey, {
+    model: "gpt-5.4",
+    input: [
+      { role: "system", content: [{ type: "input_text", text: prompt }] },
+      { role: "user", content: [
+        { type: "input_text", text: `Analyze layer relationships:\n${layerList.join("\n")}` },
+        { type: "input_image", image_url: previewDataUrl, detail: "high" }
+      ]}
+    ]
+  });
+
+  const mapped = Array.isArray(response?.layers) ? response.layers : [];
+  return mapped.map((item) => ({
+    name: cleanText(item?.name),
+    parentLayer: cleanText(item?.parentLayer) || null,
+    attachmentType: cleanText(item?.attachmentType) || "base",
+    edgeRules: item?.edgeRules || {},
+    zOrderNote: cleanText(item?.zOrderNote),
+    interactionDescription: cleanText(item?.interactionDescription)
+  }));
 }
 
 async function createLayerMap(apiKey, previewDataUrl, layers, canvas) {

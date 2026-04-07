@@ -370,11 +370,26 @@ app.post("/api/projects/:projectId/rebuild-layers-from-preview", async (req, res
       }
       proposedLayers.sort((a, b) => (a.stackOrder || 0) - (b.stackOrder || 0));
 
+      const relationships = await openaiService.createLayerRelationships(apiKey, previewDataUrl, proposedLayers, project.canvas);
+      for (const rel of relationships) {
+        const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(rel.name).toLowerCase());
+        if (match) {
+          match.parentLayer = rel.parentLayer;
+          match.attachmentType = rel.attachmentType;
+          match.edgeRules = rel.edgeRules;
+          match.zOrderNote = rel.zOrderNote;
+          match.interactionDescription = rel.interactionDescription;
+        }
+      }
+
       const detailedPrompts = await openaiService.analyzePreviewForLayerPrompts(apiKey, previewDataUrl, proposedLayers, project.canvas);
       for (const dp of detailedPrompts) {
         const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(dp.name).toLowerCase());
         if (match && dp.generationPrompt) {
-          match.previewGenerationPrompt = dp.generationPrompt;
+          const relContext = match.interactionDescription
+            ? ` SPATIAL RELATIONSHIP: ${match.interactionDescription}${match.parentLayer ? ` This element attaches to ${match.parentLayer} via ${match.attachmentType}.` : ""}${match.zOrderNote ? ` Z-order: ${match.zOrderNote}.` : ""}`
+            : "";
+          match.previewGenerationPrompt = dp.generationPrompt + relContext;
         }
       }
     } catch (analysisError) {
@@ -2156,12 +2171,29 @@ async function generatePreviewForProject(project, apiKey, attachments = []) {
     }
     proposedLayers.sort((a, b) => (a.stackOrder || 0) - (b.stackOrder || 0));
 
-    // Step 2: Get hyper-detailed generation prompts by studying the preview
+    // Step 2: Get layer relationships (what clips to what, edge rules, z-order)
+    const relationships = await openaiService.createLayerRelationships(apiKey, previewDataUrl, proposedLayers, project.canvas);
+    for (const rel of relationships) {
+      const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(rel.name).toLowerCase());
+      if (match) {
+        match.parentLayer = rel.parentLayer;
+        match.attachmentType = rel.attachmentType;
+        match.edgeRules = rel.edgeRules;
+        match.zOrderNote = rel.zOrderNote;
+        match.interactionDescription = rel.interactionDescription;
+      }
+    }
+
+    // Step 3: Get hyper-detailed generation prompts by studying the preview
     const detailedPrompts = await openaiService.analyzePreviewForLayerPrompts(apiKey, previewDataUrl, proposedLayers, project.canvas);
     for (const dp of detailedPrompts) {
       const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(dp.name).toLowerCase());
       if (match && dp.generationPrompt) {
-        match.previewGenerationPrompt = dp.generationPrompt;
+        // Inject relationship context into the generation prompt
+        const relContext = match.interactionDescription
+          ? ` SPATIAL RELATIONSHIP: ${match.interactionDescription}${match.parentLayer ? ` This element attaches to ${match.parentLayer} via ${match.attachmentType}.` : ""}${match.zOrderNote ? ` Z-order: ${match.zOrderNote}.` : ""}`
+          : "";
+        match.previewGenerationPrompt = dp.generationPrompt + relContext;
       }
     }
   } catch (mapError) {
