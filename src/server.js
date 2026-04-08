@@ -942,10 +942,31 @@ app.post("/api/chat", async (req, res, next) => {
       project = previewResult.project;
       memory = previewResult.memory;
       assistantGenerated = toAssistantGeneratedImage(previewResult.preview);
+
+      // Draw 1 image per empty layer immediately (build order: bg, base, then traits)
+      const sortedLayers = [...project.layers].sort((a, b) => {
+        const aName = cleanText(a.name).toLowerCase();
+        const bName = cleanText(b.name).toLowerCase();
+        const aScore = /background/.test(aName) ? 0 : /(base|body|character|avatar)/.test(aName) ? 1 : 2;
+        const bScore = /background/.test(bName) ? 0 : /(base|body|character|avatar)/.test(bName) ? 1 : 2;
+        return aScore - bScore;
+      });
+      for (const layer of sortedLayers) {
+        if (layer.variants && layer.variants.length > 0) continue;
+        try {
+          // Use the same logic as the /variants endpoint (with regions, prompts, repositioning)
+          project = await drawLayerVariantWithFullContext(project, layer.id, 1, apiKey);
+        } catch (variantError) {
+          console.warn(`[preview-draw] Failed to draw ${layer.name}:`, variantError.message);
+        }
+      }
+      await projectService.writeProject(project);
+
       const proposed = project.proposedLayers || [];
+      const drawnCount = project.layers.filter((l) => l.variants && l.variants.length > 0).length;
       if (proposed.length) {
         const layerList = proposed.map((l) => l.name).join(", ");
-        assistantReply = assistantReply || `Here's a preview. I'm proposing these layers: ${layerList}. Let me know if you want to add, remove, or change any before I build the folders.`;
+        assistantReply = assistantReply || `Here's a preview with ${drawnCount} layers drawn: ${layerList}. Review the layer plan below — you can rebuild or adjust.`;
       }
     }
 
@@ -1154,24 +1175,22 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
         .filter((l) => l.id !== layer.id)
         .map((l) => l.name);
       const exclusionPrompt = otherLayerNames.length
-        ? ` Do NOT draw any of these other layers: ${otherLayerNames.join(", ")}. This layer contains ONLY ${layer.name}.`
+        ? ` STRICT RULE: Output ONLY the ${layer.name} element. Do NOT draw, include, or reproduce ANY of these: ${otherLayerNames.join(", ")}. The reference image is ONLY for understanding scale, position, and perspective — do NOT copy its content. Draw ONLY ${layer.name} on a transparent background.`
         : "";
 
-      // Build region-aware prompt suffix
       const regionPrompt = region && !isBackground
-        ? ` Place this element's content within the region: top-left (${region.x}, ${region.y}), size ${region.width}x${region.height} pixels on a ${canvasW}x${canvasH} canvas. The rest of the canvas must be transparent. Do not center the element — position it exactly in this region.`
+        ? ` Target region on the ${canvasW}x${canvasH} canvas: approximately centered around (${Math.round(region.x + region.width / 2)}, ${Math.round(region.y + region.height / 2)}) at roughly ${region.width}x${region.height} pixels.`
         : "";
 
       const fullPrompt = basePrompt + exclusionPrompt + regionPrompt;
 
       if (anchorRef?.dataUrl && !isBackground && !isBase) {
-        // Trait layers: use the body/anchor as reference so they fit perfectly
         imageAsset = await openaiService.editImageAsset({
           apiKey,
           prompt: fullPrompt,
           images: [anchorRef.dataUrl],
           background: "transparent",
-          inputFidelity: "high"
+          inputFidelity: "low"
         });
       } else {
         // Background, base, and layers without anchor: generate from prompt alone
@@ -1186,9 +1205,12 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
 
       let resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
 
-      // Post-process: reposition content to match the target region from the layer map
+      // Reposition content to match the target region from preview analysis
       if (region && !isBackground) {
-        resizedBuffer = await repositionLayerContent(resizedBuffer, region, canvasW, canvasH);
+        resizedBuffer = await repositionLayerContent(resizedBuffer, region, canvasW, canvasH, {
+          attachmentType: layer.attachmentType || null,
+          edgeRules: layer.edgeRules || null
+        });
       }
 
       const analysis = await inspectVariantAgainstLayer(layer, resizedBuffer);
@@ -1486,6 +1508,13 @@ app.post("/api/projects/:projectId/layers/:layerId/transform", async (req, res, 
     if (!useVariantTransform) {
       refreshLayerFitContract(project, layer, variant, { force: true });
     }
+
+    // Update the layer region to match the new transform so future variant
+    // generations position content at the user's adjusted location
+    if (!useVariantTransform) {
+      layer.region = computeRegionFromTransform(nextTransform, variant, project.canvas);
+    }
+
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
     const memory = await studioMemoryService.appendChangelog(project, {
@@ -2200,6 +2229,8 @@ async function generatePreviewForProject(project, apiKey, attachments = []) {
     console.warn("[layer-analysis] Could not fully analyze preview:", mapError.message);
   }
 
+  // Create layer folders immediately AND keep proposedLayers for UI review
+  project.layers = projectService.syncLayersFromPlan(project.layers, proposedLayers);
   project.proposedLayers = proposedLayers;
   project.updatedAt = now;
 
@@ -2709,6 +2740,7 @@ async function updateLayerVariantTransform(project, layer, options = {}) {
   layer.selectedVariantId = variant.id;
   if (!useVariantTransform) {
     refreshLayerFitContract(project, layer, variant, { force: true });
+    layer.region = computeRegionFromTransform(nextTransform, variant, project.canvas);
   }
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
@@ -6066,7 +6098,75 @@ function buildLockedDecisionTitle(promptText) {
   return "Remember this approved creative behavior";
 }
 
-async function repositionLayerContent(buffer, targetRegion, canvasW, canvasH) {
+async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) {
+  hydrateProjectLayerFitContracts(project);
+  const layer = project.layers.find((item) => item.id === layerId);
+  if (!layer) throw new Error(`Layer ${layerId} not found.`);
+
+  const brain = await studioBrainService.getBrain();
+  const toolManifest = await studioBrainService.getToolManifest();
+  const memory = await studioMemoryService.getMemory(project);
+  const plan = await openaiService.createLayerVariantPlan(apiKey, project, layer, count, memory, brain, toolManifest);
+
+  const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
+  await fs.mkdir(variantFolder, { recursive: true });
+
+  const isBackground = isFullCanvasBackgroundLayerName(layer.name);
+  const isBase = isPrimaryBaseLayerName(layer.name);
+  const backgroundMode = isBackground ? "opaque" : "transparent";
+  const anchorRef = (!isBackground && !isBase) ? await getActiveAnchorReferenceAttachment(project, layer) : null;
+  const region = layer.region || null;
+  const canvasW = project.canvas?.width || 1024;
+  const canvasH = project.canvas?.height || 1024;
+  const previewPromptForLayer = cleanText(layer.previewGenerationPrompt);
+  const otherLayerNames = project.layers.filter((l) => l.id !== layer.id).map((l) => l.name);
+
+  for (let vi = 0; vi < plan.variants.length; vi++) {
+    const item = plan.variants[vi];
+    const isFirst = vi === 0;
+    const basePrompt = (isFirst && previewPromptForLayer)
+      ? openaiService.buildLayerAssetPrompt({ project, layer, promptText: previewPromptForLayer })
+      : item.prompt;
+    const exclusionPrompt = otherLayerNames.length
+      ? ` STRICT RULE: Output ONLY the ${layer.name} element. Do NOT draw, include, or reproduce ANY of these: ${otherLayerNames.join(", ")}. The reference image is ONLY for understanding scale, position, and perspective — do NOT copy its content. Draw ONLY ${layer.name} on a transparent background.`
+      : "";
+    const regionPrompt = region && !isBackground
+      ? ` Target region on the ${canvasW}x${canvasH} canvas: approximately centered around (${Math.round(region.x + region.width / 2)}, ${Math.round(region.y + region.height / 2)}) at roughly ${region.width}x${region.height} pixels.`
+      : "";
+    const fullPrompt = basePrompt + exclusionPrompt + regionPrompt;
+
+    let imageAsset;
+    if (anchorRef?.dataUrl && !isBackground && !isBase) {
+      // Use LOW fidelity so DALL-E uses anchor for scale/position reference only, not copying its content
+      imageAsset = await openaiService.editImageAsset({ apiKey, prompt: fullPrompt, images: [anchorRef.dataUrl], background: "transparent", inputFidelity: "low" });
+    } else {
+      imageAsset = await openaiService.generateImageAsset({ apiKey, prompt: fullPrompt, size: project.canvas.generationSize, background: backgroundMode });
+    }
+
+    const resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+
+    const variantId = createId("variant");
+    const filename = `${variantId}.png`;
+    await fs.writeFile(path.join(variantFolder, filename), resizedBuffer);
+
+    layer.variants.push({
+      id: variantId,
+      name: item.name,
+      notes: item.notes,
+      prompt: item.prompt,
+      imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
+      createdAt: new Date().toISOString()
+    });
+
+    if (!layer.selectedVariantId) layer.selectedVariantId = variantId;
+  }
+
+  project.updatedAt = new Date().toISOString();
+  await projectService.writeProject(project);
+  return project;
+}
+
+async function repositionLayerContent(buffer, targetRegion, canvasW, canvasH, layerContext = {}) {
   // Analyze where the generated content actually is
   const analysis = await assetToolService.inspectPngBuffer(buffer);
   if (!analysis.bounds || analysis.emptyAlpha) return buffer;
@@ -6077,20 +6177,40 @@ async function repositionLayerContent(buffer, targetRegion, canvasW, canvasH) {
   const actualW = actual.right - actual.left + 1;
   const actualH = actual.bottom - actual.top + 1;
 
-  // Target center from the region map
-  const targetCenterX = targetRegion.x + targetRegion.width / 2;
-  const targetCenterY = targetRegion.y + targetRegion.height / 2;
+  // Structural parts (inset, surface-mounted) need to fit strictly INSIDE their
+  // target region with padding so they don't bleed past parent edges.
+  const attachment = cleanText(layerContext.attachmentType).toLowerCase();
+  const edgeRules = layerContext.edgeRules || {};
+  const isInsetOrMounted = ["inset", "surface-mounted"].includes(attachment);
+  const mustClipToParent = edgeRules.clipToParentEdges === true;
+  const needsStrictContainment = isInsetOrMounted || mustClipToParent;
+
+  // Inset padding: shrink the effective target region so content sits cleanly inside
+  const insetRatio = needsStrictContainment ? 0.04 : 0;
+  const effectiveTarget = {
+    x: targetRegion.x + targetRegion.width * insetRatio,
+    y: targetRegion.y + targetRegion.height * insetRatio,
+    width: targetRegion.width * (1 - insetRatio * 2),
+    height: targetRegion.height * (1 - insetRatio * 2)
+  };
+
+  // Target center from the (possibly inset) region
+  const targetCenterX = effectiveTarget.x + effectiveTarget.width / 2;
+  const targetCenterY = effectiveTarget.y + effectiveTarget.height / 2;
+
+  // Scale to fit within the effective target region
+  const scaleX = effectiveTarget.width / actualW;
+  const scaleY = effectiveTarget.height / actualH;
+  // Always scale DOWN to fit if content is larger than target; cap upscale at 1.5x
+  const scale = needsStrictContainment
+    ? Math.min(scaleX, scaleY, 1.5)                    // strict: must fit inside both axes
+    : Math.min(scaleX, scaleY, 1.5);
 
   // How much to shift
   const shiftX = Math.round(targetCenterX - actualCenterX);
   const shiftY = Math.round(targetCenterY - actualCenterY);
 
-  // Scale if the content is much bigger/smaller than the target region
-  const scaleX = targetRegion.width / actualW;
-  const scaleY = targetRegion.height / actualH;
-  const scale = Math.min(scaleX, scaleY, 1.5); // Don't upscale more than 1.5x
-
-  if (Math.abs(shiftX) < 5 && Math.abs(shiftY) < 5 && Math.abs(scale - 1) < 0.05) {
+  if (Math.abs(shiftX) < 5 && Math.abs(shiftY) < 5 && Math.abs(scale - 1) < 0.03) {
     return buffer; // Close enough, don't reprocess
   }
 
@@ -6112,8 +6232,22 @@ async function repositionLayerContent(buffer, targetRegion, canvasW, canvasH) {
     .png()
     .toBuffer();
 
-  const placeLeft = Math.max(0, Math.min(canvasW - newW, Math.round(targetCenterX - newW / 2)));
-  const placeTop = Math.max(0, Math.min(canvasH - newH, Math.round(targetCenterY - newH / 2)));
+  let placeLeft = Math.round(targetCenterX - newW / 2);
+  let placeTop = Math.round(targetCenterY - newH / 2);
+
+  // Clamp to canvas bounds
+  placeLeft = Math.max(0, Math.min(canvasW - newW, placeLeft));
+  placeTop = Math.max(0, Math.min(canvasH - newH, placeTop));
+
+  // For strict containment, also clamp to the target region boundaries
+  if (needsStrictContainment) {
+    const regionLeft = Math.round(effectiveTarget.x);
+    const regionTop = Math.round(effectiveTarget.y);
+    const regionRight = Math.round(effectiveTarget.x + effectiveTarget.width);
+    const regionBottom = Math.round(effectiveTarget.y + effectiveTarget.height);
+    placeLeft = Math.max(regionLeft, Math.min(regionRight - newW, placeLeft));
+    placeTop = Math.max(regionTop, Math.min(regionBottom - newH, placeTop));
+  }
 
   return sharp({
     create: {
@@ -6126,6 +6260,29 @@ async function repositionLayerContent(buffer, targetRegion, canvasW, canvasH) {
     .composite([{ input: scaledContent, left: placeLeft, top: placeTop }])
     .png()
     .toBuffer();
+}
+
+function computeRegionFromTransform(transform, variant, canvas) {
+  const canvasW = Math.max(1, Number(canvas?.width || 1024));
+  const canvasH = Math.max(1, Number(canvas?.height || 1024));
+  const t = normalizeLayerTransform(transform);
+
+  // The variant PNG is generated at canvas size. The composite renderer applies
+  // scale and offset: targetW = canvasW * scale, left = (canvasW - targetW)/2 + x * canvasW
+  // We also need to account for the actual content bounds within the variant image.
+  // For simplicity, use the full canvas dimensions as the base — the repositioner
+  // will refine from the actual content bounds at generation time.
+  const regionW = Math.round(canvasW * t.scale);
+  const regionH = Math.round(canvasH * t.scale);
+  const regionX = Math.round((canvasW - regionW) / 2 + t.x * canvasW);
+  const regionY = Math.round((canvasH - regionH) / 2 + t.y * canvasH);
+
+  return {
+    x: Math.max(0, regionX),
+    y: Math.max(0, regionY),
+    width: Math.min(regionW, canvasW - Math.max(0, regionX)),
+    height: Math.min(regionH, canvasH - Math.max(0, regionY))
+  };
 }
 
 async function computeLayerTransformFromContent(layer, canvas) {

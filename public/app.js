@@ -1168,7 +1168,7 @@ function renderProposedLayers() {
       `).join("")}
     </div>
     <div class="proposed-layers-actions">
-      <button class="btn btn-primary" id="approvePlanBtn" type="button">Approve &amp; Build All Layers</button>
+      <button class="btn btn-primary" id="approvePlanBtn" type="button">Redraw All Layers</button>
       ${state.project?.styleGuide && !state.project?.lockedStyleGuide
         ? `<button class="btn btn-ghost" id="lockStyleBtn" type="button">Lock Style Guide</button>`
         : state.project?.lockedStyleGuide
@@ -1181,10 +1181,10 @@ function renderProposedLayers() {
   elements.proposedLayersPanel.querySelector("#approvePlanBtn")?.addEventListener("click", async () => {
     if (!state.project?.id) return;
 
-    const layerCount = (state.project.proposedLayers || []).length;
+    const allLayers = state.project.layers || [];
     const confirmed = await confirmAction(
-      `Approve ${layerCount} layers and draw 1 image for each from the preview? This uses your API key.`,
-      { confirmLabel: "Approve & Build", confirmClass: "btn-primary" }
+      `Redraw all ${allLayers.length} layers from the preview? This uses your API key.`,
+      { confirmLabel: "Redraw All", confirmClass: "btn-primary" }
     );
     if (!confirmed) return;
 
@@ -1194,7 +1194,7 @@ function renderProposedLayers() {
       const approveResponse = await api(`/api/projects/${state.project.id}/approve-plan`, { method: "POST" });
       await applyProject(approveResponse.project);
       render();
-      showToast("Plan approved. Drawing all layers from preview...");
+      showToast("Redrawing all layers from preview...");
 
       const layers = sortLayersForBuild(state.project.layers || []);
       const layerIds = layers.map((l) => ({ id: l.id, name: l.name }));
@@ -1808,24 +1808,57 @@ function bindChatActions() {
       if (!state.project?.id) return;
       const previewId = button.dataset.previewId;
 
-      await withBusy(async () => {
-        // Set this preview as active
-        await api(`/api/projects/${state.project.id}`, {
-          method: "PUT",
-          body: { selectedPreviewId: previewId }
-        });
-
-        // Rebuild the layer plan from this preview — puts them in proposedLayers for review
+      state.busy = true;
+      syncBusyState();
+      try {
+        // Step 1: Rebuild plan + create folders from this preview
         showToast("Rebuilding layer plan from preview...");
         const response = await api(`/api/projects/${state.project.id}/rebuild-layers-from-preview`, {
           method: "POST",
-          body: { previewId, proposeOnly: true }
+          body: { previewId, proposeOnly: false }
         });
         await applyProject(response.project);
         render();
-        showToast("Layer plan ready for review. Approve to build.");
-        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-      });
+
+        // Step 2: Draw 1 image per layer
+        const layers = sortLayersForBuild(state.project.layers || []);
+        const layerIds = layers.map((l) => ({ id: l.id, name: l.name }));
+        let drawn = 0;
+
+        for (const { id, name } of layerIds) {
+          try {
+            showToast(`Drawing ${name}... (${drawn + 1}/${layerIds.length})`);
+            const varResponse = await api(`/api/projects/${state.project.id}/layers/${id}/variants`, {
+              method: "POST",
+              body: { count: 1 }
+            });
+            await applyProject(varResponse.project);
+            render();
+            drawn++;
+          } catch (err) {
+            console.warn(`Failed to draw ${name}:`, err.message);
+          }
+        }
+
+        // Step 3: Re-read project to get proposedLayers back for display
+        const freshProject = await api(`/api/projects/${state.project.id}`);
+        await applyProject(freshProject.project || freshProject);
+        // Restore proposedLayers for the UI panel (they got cleared by rebuild)
+        if (!(state.project.proposedLayers || []).length) {
+          state.project.proposedLayers = layers.map((l) => ({
+            name: l.name, description: l.description, region: l.region,
+            stackOrder: l.stackOrder, previewGenerationPrompt: l.previewGenerationPrompt,
+            parentLayer: l.parentLayer, interactionDescription: l.interactionDescription
+          }));
+        }
+        render();
+        showToast(`Rebuilt ${drawn} layers from preview.`);
+      } catch (error) {
+        showToast(error.message || "Rebuild failed.", true);
+      } finally {
+        state.busy = false;
+        syncBusyState();
+      }
     });
   });
 
