@@ -7,7 +7,8 @@
       "Bash(node -c src/lib/project-service.js)",
       "Bash(node -e \"const p = require\\('c:/Users/codyr/OneDrive/Desktop/Code/draw-tech/data/projects/project-mnmk43zt-ofmva.json'\\); p.layers.forEach\\(l => console.log\\(l.name, '| region:', JSON.stringify\\(l.region\\)\\)\\)\")",
       "Bash(node -e ':*)",
-      "Bash(node --check src/server.js)"
+      "Bash(node --check src/server.js)",
+      "Bash(node --check src/lib/openai-service.js)"
     ]
   }
 }

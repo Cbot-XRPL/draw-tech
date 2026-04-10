@@ -63,6 +63,10 @@ const elements = {
   dragScaleDownBtn: document.getElementById("dragScaleDownBtn"),
   dragScaleReadout: document.getElementById("dragScaleReadout"),
   dragScaleUpBtn: document.getElementById("dragScaleUpBtn"),
+  dragRotateControls: document.getElementById("dragRotateControls"),
+  dragRotateLeftBtn: document.getElementById("dragRotateLeftBtn"),
+  dragRotateReadout: document.getElementById("dragRotateReadout"),
+  dragRotateRightBtn: document.getElementById("dragRotateRightBtn"),
   refreshPreviewBtn: document.getElementById("refreshPreviewBtn"),
   downloadHashlipsBtn: document.getElementById("downloadHashlipsBtn"),
   projectTitle: document.getElementById("projectTitle"),
@@ -252,11 +256,19 @@ elements.toggleDragModeBtn.addEventListener("click", () => {
   }
 
   if (state.dragMode && hasPendingDragTransforms()) {
-    state.pendingDragTransforms = {};
-    state.dragSelection = null;
-    state.dragMode = false;
+    // Undo the last pending transform instead of discarding all at once
+    const keys = Object.keys(state.pendingDragTransforms);
+    if (keys.length > 0) {
+      delete state.pendingDragTransforms[keys[keys.length - 1]];
+    }
+    if (!hasPendingDragTransforms()) {
+      state.dragSelection = null;
+      state.dragMode = false;
+      showToast("All moves undone. Drag mode off.");
+    } else {
+      showToast(`Undid last move. ${Object.keys(state.pendingDragTransforms).length} pending.`);
+    }
     render();
-    showToast("Drag mode off. Unsaved layer moves were discarded.");
     return;
   }
 
@@ -278,6 +290,14 @@ elements.dragScaleDownBtn.addEventListener("click", () => {
 
 elements.dragScaleUpBtn.addEventListener("click", () => {
   adjustSelectedLayerScale(0.05);
+});
+
+elements.dragRotateLeftBtn.addEventListener("click", () => {
+  adjustSelectedLayerRotation(-15);
+});
+
+elements.dragRotateRightBtn.addEventListener("click", () => {
+  adjustSelectedLayerRotation(15);
 });
 
 elements.refreshPreviewBtn.addEventListener("click", async () => {
@@ -794,6 +814,10 @@ function renderPreview() {
   elements.dragScaleReadout.textContent = activeDragEntry
     ? `Scale ${Math.round(getEntryDisplayTransform(activeDragEntry).scale * 100)}%`
     : "Scale 100%";
+  elements.dragRotateControls.classList.toggle("hidden", !state.dragMode || !activeDragEntry);
+  elements.dragRotateReadout.textContent = activeDragEntry
+    ? `${Math.round(getEntryDisplayTransform(activeDragEntry).rotation || 0)}\u00B0`
+    : "0\u00B0";
   elements.previewImage.decoding = "sync";
   elements.previewImage.loading = "eager";
   elements.previewImage.style.display = "none";
@@ -2102,7 +2126,7 @@ function renderStageLayerStack(selectedEntries) {
           class="stage-drag-layer ${active ? "is-active" : ""} ${selected ? "is-selected" : ""}"
           data-layer-id="${entry.layerId}"
           data-variant-id="${entry.id}"
-          style="left:${formatPercent(layout.leftPercent)}%;top:${formatPercent(layout.topPercent)}%;width:${formatPercent(layout.widthPercent)}%;height:${formatPercent(layout.heightPercent)}%;z-index:${entry.layerIndex + 1};"
+          style="left:${formatPercent(layout.leftPercent)}%;top:${formatPercent(layout.topPercent)}%;width:${formatPercent(layout.widthPercent)}%;height:${formatPercent(layout.heightPercent)}%;z-index:${entry.layerIndex + 1};${layout.rotation ? `transform:rotate(${layout.rotation}deg);` : ""}"
         >
           <img
             class="stage-drag-image"
@@ -2150,6 +2174,7 @@ function computeStageLayerLayout(entry, transformOverride = null) {
     topPercent: (top / canvasHeight) * 100,
     widthPercent: (scaledWidth / canvasWidth) * 100,
     heightPercent: (scaledHeight / canvasHeight) * 100,
+    rotation: transform.rotation || 0,
     hitLeftPercent: (Number(bounds.left) / imageWidth) * 100,
     hitTopPercent: (Number(bounds.top) / imageHeight) * 100,
     hitWidthPercent: (hitWidth / imageWidth) * 100,
@@ -2158,10 +2183,13 @@ function computeStageLayerLayout(entry, transformOverride = null) {
 }
 
 function normalizeClientTransform(transform) {
+  const rawRotation = Number(transform?.rotation);
+  const rotation = Number.isFinite(rawRotation) ? ((rawRotation % 360) + 360) % 360 : 0;
   return {
     x: clampClientNumber(transform?.x, 0, -0.45, 0.45),
     y: clampClientNumber(transform?.y, 0, -0.45, 0.45),
     scale: clampClientNumber(transform?.scale, 1, 0.15, 1.8),
+    rotation,
     depthMode: String(transform?.depthMode || "").toLowerCase() === "headwear_wrap" ? "headwear_wrap" : "flat",
     backCutoff: clampClientNumber(transform?.backCutoff, 0.6, 0.2, 0.9),
     frontStart: clampClientNumber(transform?.frontStart, 0.56, 0.1, 0.95)
@@ -2430,6 +2458,39 @@ function adjustSelectedLayerScale(delta) {
   const nextTransform = normalizeClientTransform({
     ...currentTransform,
     scale: currentTransform.scale + delta
+  });
+
+  const key = createDragTransformKey(activeEntry);
+  state.pendingDragTransforms[key] = {
+    layerId: activeEntry.layerId,
+    variantId: activeEntry.id,
+    scope: activeEntry.transformScope || "layer",
+    transform: nextTransform
+  };
+  state.dragSelection = {
+    layerId: activeEntry.layerId,
+    variantId: activeEntry.id
+  };
+  render();
+}
+
+function adjustSelectedLayerRotation(delta) {
+  if (!state.dragMode || state.busy) {
+    return;
+  }
+
+  const selectedEntries = getSelectedLayerEntries();
+  syncDragSelection(selectedEntries);
+  const activeEntry = getActiveDragEntry(selectedEntries);
+  if (!activeEntry) {
+    showToast("Select a layer on the canvas first.", true);
+    return;
+  }
+
+  const currentTransform = getEntryDisplayTransform(activeEntry);
+  const nextTransform = normalizeClientTransform({
+    ...currentTransform,
+    rotation: (currentTransform.rotation || 0) + delta
   });
 
   const key = createDragTransformKey(activeEntry);

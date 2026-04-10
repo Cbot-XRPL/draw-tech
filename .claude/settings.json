@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout:*)",
+      "Bash(cat data/generated/*/layers/*/*.png)",
+      "Bash(node -e 'const d=require\\('\\\\''./__TRACKED_VAR__'\\\\''\\); console.log\\(d.title, d.layers?.map\\(l=>l.name\\)\\)')",
+      "Read(//c/Users/codyr/OneDrive/Desktop/Code/draw-tech/src/**)",
+      "Bash(grep -n \"function normalizeLayerTransform\\\\|function getDefaultTransformForLayer\\\\|function mergeLayerTransform\" \"/c/Users/codyr/OneDrive/Desktop/Code/draw-tech/src/\"*.js)",
+      "Bash(node --check public/app.js)"
+    ]
+  }
+}

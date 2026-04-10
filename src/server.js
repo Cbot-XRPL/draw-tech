@@ -336,13 +336,36 @@ app.post("/api/projects/:projectId/rebuild-layers-from-preview", async (req, res
     project.planSummary = plan.collectionSummary;
     project.styleGuide = plan.styleGuide;
 
-    const proposedLayers = plan.layers.map((layer, index) => ({
-      id: layer.id || `layer-${index + 1}`,
-      name: cleanText(layer.name) || `Layer ${index + 1}`,
-      description: cleanText(layer.description),
-      placementNotes: cleanText(layer.placementNotes),
-      variantIdeas: Array.isArray(layer.variantIdeas) ? layer.variantIdeas : []
-    }));
+    // Prefer existing project layers as the starting point so we don't lose
+    // layers the user already has (e.g. Background Accent) or invent spurious
+    // ones (e.g. Ground Shadow). Only fall back to the AI plan when the project
+    // has no layers yet.
+    const existingLayers = Array.isArray(project.layers) ? project.layers.filter((l) => l.name) : [];
+    const proposedLayers = existingLayers.length > 0
+      ? existingLayers.map((layer) => ({
+          id: layer.id,
+          name: layer.name,
+          description: layer.description || "",
+          placementNotes: layer.placementNotes || "",
+          variantIdeas: Array.isArray(layer.variantIdeas) ? layer.variantIdeas : [],
+          transform: layer.transform,
+          fitContract: layer.fitContract,
+          previewGenerationPrompt: layer.previewGenerationPrompt || "",
+          region: layer.region || null,
+          stackOrder: layer.stackOrder,
+          attachmentType: layer.attachmentType || null,
+          edgeRules: layer.edgeRules || null,
+          parentLayer: layer.parentLayer || null,
+          zOrderNote: layer.zOrderNote || null,
+          interactionDescription: layer.interactionDescription || null
+        }))
+      : plan.layers.map((layer, index) => ({
+          id: layer.id || `layer-${index + 1}`,
+          name: cleanText(layer.name) || `Layer ${index + 1}`,
+          description: cleanText(layer.description),
+          placementNotes: cleanText(layer.placementNotes),
+          variantIdeas: Array.isArray(layer.variantIdeas) ? layer.variantIdeas : []
+        }));
 
     // Run layer map + detailed prompt analysis on the preview
     try {
@@ -350,13 +373,29 @@ app.post("/api/projects/:projectId/rebuild-layers-from-preview", async (req, res
       const previewBuffer = await fs.readFile(previewAbsPath);
       const previewDataUrl = `data:image/png;base64,${previewBuffer.toString("base64")}`;
 
+      // Fuzzy layer name matching — GPT sometimes returns slightly different names
+      // (e.g. "Door" vs "Vault Door"). Try exact match first, then slug match,
+      // then substring containment, then positional fallback.
+      const findLayerMatch = (name, index) => {
+        const target = cleanText(name).toLowerCase();
+        const targetSlug = slugify(name);
+        return proposedLayers.find((l) => cleanText(l.name).toLowerCase() === target)
+          || proposedLayers.find((l) => slugify(l.name) === targetSlug)
+          || proposedLayers.find((l) => target.includes(cleanText(l.name).toLowerCase()) || cleanText(l.name).toLowerCase().includes(target))
+          || (Number.isFinite(index) ? proposedLayers[index] : null);
+      };
+
       const layerMap = await openaiService.createLayerMap(apiKey, previewDataUrl, proposedLayers, project.canvas);
-      for (const mapped of layerMap) {
-        const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(mapped.name).toLowerCase());
+      for (let mi = 0; mi < layerMap.length; mi++) {
+        const mapped = layerMap[mi];
+        const match = findLayerMatch(mapped.name, mi);
         if (match) {
           match.region = mapped.region;
           match.stackOrder = mapped.stackOrder;
-        } else if (mapped.isNew && mapped.name) {
+        } else if (mapped.isNew && mapped.name && !existingLayers.length) {
+          // Only add new layers when building from scratch (no existing layers).
+          // When rebuilding with existing layers, the user's layer list is the
+          // source of truth — don't add AI-hallucinated extras.
           proposedLayers.push({
             id: `layer-${proposedLayers.length + 1}-${slugify(mapped.name)}`,
             name: mapped.name,
@@ -371,8 +410,9 @@ app.post("/api/projects/:projectId/rebuild-layers-from-preview", async (req, res
       proposedLayers.sort((a, b) => (a.stackOrder || 0) - (b.stackOrder || 0));
 
       const relationships = await openaiService.createLayerRelationships(apiKey, previewDataUrl, proposedLayers, project.canvas);
-      for (const rel of relationships) {
-        const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(rel.name).toLowerCase());
+      for (let ri = 0; ri < relationships.length; ri++) {
+        const rel = relationships[ri];
+        const match = findLayerMatch(rel.name, ri);
         if (match) {
           match.parentLayer = rel.parentLayer;
           match.attachmentType = rel.attachmentType;
@@ -383,8 +423,9 @@ app.post("/api/projects/:projectId/rebuild-layers-from-preview", async (req, res
       }
 
       const detailedPrompts = await openaiService.analyzePreviewForLayerPrompts(apiKey, previewDataUrl, proposedLayers, project.canvas);
-      for (const dp of detailedPrompts) {
-        const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(dp.name).toLowerCase());
+      for (let di = 0; di < detailedPrompts.length; di++) {
+        const dp = detailedPrompts[di];
+        const match = findLayerMatch(dp.name, di);
         if (match && dp.generationPrompt) {
           const relContext = match.interactionDescription
             ? ` SPATIAL RELATIONSHIP: ${match.interactionDescription}${match.parentLayer ? ` This element attaches to ${match.parentLayer} via ${match.attachmentType}.` : ""}${match.zOrderNote ? ` Z-order: ${match.zOrderNote}.` : ""}`
@@ -1146,17 +1187,49 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
 
     const isBackground = isFullCanvasBackgroundLayerName(layer.name);
     const isBase = isPrimaryBaseLayerName(layer.name);
+    const isBgAccent = isBackgroundAccentLayerName(layer.name);
     const backgroundMode = isBackground ? "opaque" : "transparent";
-    const anchorRef = (!isBackground && !isBase)
+    const anchorRef = (!isBackground && !isBase && !isBgAccent)
       ? await getActiveAnchorReferenceAttachment(project, layer)
       : null;
-    const previewRef = await getSelectedPreviewReference(project);
-
     const region = layer.region || null;
     const canvasW = project.canvas?.width || 1024;
     const canvasH = project.canvas?.height || 1024;
 
     const previewPromptForLayer = cleanText(layer.previewGenerationPrompt);
+
+    // Look up parent layer's actual drawn bounds for clip-aware child placement.
+    // The parent (usually the body/base) was generated in a previous sequential
+    // call and its variant is already on disk.
+    let parentBounds = null;
+    if (layer.parentLayer && !isBackground && !isBase) {
+      const parentLayer = project.layers.find((l) =>
+        cleanText(l.name).toLowerCase() === cleanText(layer.parentLayer).toLowerCase()
+        || slugify(l.name) === slugify(layer.parentLayer)
+      );
+      if (parentLayer) {
+        const parentVariant = (parentLayer.variants || []).find((v) => v.id === parentLayer.selectedVariantId) || (parentLayer.variants || [])[0];
+        if (parentVariant?.imageUrl) {
+          try {
+            const parentPath = publicAssetUrlToAbsolutePath(parentVariant.imageUrl);
+            const parentBuffer = await fs.readFile(parentPath);
+            const parentAnalysis = await assetToolService.inspectPngBuffer(parentBuffer);
+            if (parentAnalysis.bounds) {
+              const parentRegion = parentLayer.region;
+              parentBounds = {
+                ...parentAnalysis.bounds,
+                estimatedX: parentRegion?.x || 0,
+                estimatedY: parentRegion?.y || 0,
+                estimatedW: parentRegion?.width || canvasW,
+                estimatedH: parentRegion?.height || canvasH
+              };
+            }
+          } catch (e) {
+            console.warn(`[variants] Could not read parent layer bounds: ${e.message}`);
+          }
+        }
+      }
+    }
 
     const variants = [];
     const warnings = [];
@@ -1182,7 +1255,16 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
         ? ` Target region on the ${canvasW}x${canvasH} canvas: approximately centered around (${Math.round(region.x + region.width / 2)}, ${Math.round(region.y + region.height / 2)}) at roughly ${region.width}x${region.height} pixels.`
         : "";
 
-      const fullPrompt = basePrompt + exclusionPrompt + regionPrompt;
+      // For child assets, reinforce that they MUST match the base body's 3D
+      // camera angle shown in the reference image. The reference is always the
+      // base/body layer, so we reference it directly regardless of the child's
+      // immediate parent in the layer hierarchy.
+      const anchorLayerName = anchorRef?.targetLayerName || "base body";
+      const perspectivePrompt = (!isBackground && !isBase && anchorRef)
+        ? ` CRITICAL 3D RULE: The reference image shows the ${anchorLayerName} at a specific 3D camera angle. This ${layer.name} sits on that same construct and MUST be drawn at the EXACT same camera angle. Study the reference — match its perspective foreshortening, vanishing point direction, and surface angles precisely. If the ${anchorLayerName} is turned, this ${layer.name} must show the same turn on the surface where it attaches. NEVER draw this element flat, front-facing, or leaning away from the reference's angle.`
+        : "";
+
+      const fullPrompt = basePrompt + exclusionPrompt + regionPrompt + perspectivePrompt;
 
       if (anchorRef?.dataUrl && !isBackground && !isBase) {
         imageAsset = await openaiService.editImageAsset({
@@ -1190,7 +1272,7 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
           prompt: fullPrompt,
           images: [anchorRef.dataUrl],
           background: "transparent",
-          inputFidelity: "low"
+          inputFidelity: "high"
         });
       } else {
         // Background, base, and layers without anchor: generate from prompt alone
@@ -1205,12 +1287,12 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
 
       let resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
 
-      // Reposition content to match the target region from preview analysis
-      if (region && !isBackground) {
-        resizedBuffer = await repositionLayerContent(resizedBuffer, region, canvasW, canvasH, {
-          attachmentType: layer.attachmentType || null,
-          edgeRules: layer.edgeRules || null
-        });
+      // Fit CHILD layers to their target region. The base/body layer is the
+      // anchor — it renders at whatever size DALL-E chose, unmodified. Only
+      // trait/accessory layers get fitted to their region relative to the
+      // parent's actual drawn bounds.
+      if (region && !isBackground && !isBase) {
+        resizedBuffer = await fitLayerToRegion(resizedBuffer, region, canvasW, canvasH, parentBounds, layer.name);
       }
 
       const analysis = await inspectVariantAgainstLayer(layer, resizedBuffer);
@@ -2179,11 +2261,22 @@ async function generatePreviewForProject(project, apiKey, attachments = []) {
   try {
     const previewDataUrl = `data:image/png;base64,${previewBuffer.toString("base64")}`;
 
+    // Fuzzy layer name matching for GPT analysis results
+    const findProposedMatch = (name, index) => {
+      const target = cleanText(name).toLowerCase();
+      const targetSlug = slugify(name);
+      return proposedLayers.find((l) => cleanText(l.name).toLowerCase() === target)
+        || proposedLayers.find((l) => slugify(l.name) === targetSlug)
+        || proposedLayers.find((l) => target.includes(cleanText(l.name).toLowerCase()) || cleanText(l.name).toLowerCase().includes(target))
+        || (Number.isFinite(index) ? proposedLayers[index] : null);
+    };
+
     // Step 1: Get pixel-precise bounding boxes + detect missing layers
     const layerMap = await openaiService.createLayerMap(apiKey, previewDataUrl, proposedLayers, project.canvas);
-    for (const mapped of layerMap) {
-      const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(mapped.name).toLowerCase());
-      if (match) {
+    for (let mi = 0; mi < layerMap.length; mi++) {
+      const mapped = layerMap[mi];
+      const match = findProposedMatch(mapped.name, mi);
+      if (match && !mapped.isNew) {
         match.region = mapped.region;
         match.stackOrder = mapped.stackOrder;
       } else if (mapped.isNew && mapped.name) {
@@ -2202,8 +2295,9 @@ async function generatePreviewForProject(project, apiKey, attachments = []) {
 
     // Step 2: Get layer relationships (what clips to what, edge rules, z-order)
     const relationships = await openaiService.createLayerRelationships(apiKey, previewDataUrl, proposedLayers, project.canvas);
-    for (const rel of relationships) {
-      const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(rel.name).toLowerCase());
+    for (let ri = 0; ri < relationships.length; ri++) {
+      const rel = relationships[ri];
+      const match = findProposedMatch(rel.name, ri);
       if (match) {
         match.parentLayer = rel.parentLayer;
         match.attachmentType = rel.attachmentType;
@@ -2215,8 +2309,9 @@ async function generatePreviewForProject(project, apiKey, attachments = []) {
 
     // Step 3: Get hyper-detailed generation prompts by studying the preview
     const detailedPrompts = await openaiService.analyzePreviewForLayerPrompts(apiKey, previewDataUrl, proposedLayers, project.canvas);
-    for (const dp of detailedPrompts) {
-      const match = proposedLayers.find((l) => cleanText(l.name).toLowerCase() === cleanText(dp.name).toLowerCase());
+    for (let di = 0; di < detailedPrompts.length; di++) {
+      const dp = detailedPrompts[di];
+      const match = findProposedMatch(dp.name, di);
       if (match && dp.generationPrompt) {
         // Inject relationship context into the generation prompt
         const relContext = match.interactionDescription
@@ -3590,10 +3685,13 @@ function shouldRestoreAccessoryLayerFromCleanSource(layer, promptText, removalTa
 }
 
 function normalizeLayerTransform(transform) {
+  const rawRotation = Number(transform?.rotation);
+  const rotation = Number.isFinite(rawRotation) ? ((rawRotation % 360) + 360) % 360 : 0;
   return {
     x: clampTransformNumber(transform?.x, 0, -0.45, 0.45),
     y: clampTransformNumber(transform?.y, 0, -0.45, 0.45),
     scale: clampTransformNumber(transform?.scale, 1, 0.15, 1.8),
+    rotation,
     depthMode: cleanText(transform?.depthMode).toLowerCase() === "headwear_wrap" ? "headwear_wrap" : "flat",
     backCutoff: clampTransformNumber(transform?.backCutoff, 0.6, 0.2, 0.9),
     frontStart: clampTransformNumber(transform?.frontStart, 0.56, 0.1, 0.95)
@@ -3912,6 +4010,7 @@ function mergeLayerTransform(current, patch) {
     x: patch.x ?? current.x,
     y: patch.y ?? current.y,
     scale: patch.scale ?? current.scale,
+    rotation: patch.rotation ?? current.rotation,
     depthMode: patch.depthMode ?? current.depthMode,
     backCutoff: patch.backCutoff ?? current.backCutoff,
     frontStart: patch.frontStart ?? current.frontStart
@@ -6113,13 +6212,45 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
 
   const isBackground = isFullCanvasBackgroundLayerName(layer.name);
   const isBase = isPrimaryBaseLayerName(layer.name);
+  const isBgAccent = isBackgroundAccentLayerName(layer.name);
   const backgroundMode = isBackground ? "opaque" : "transparent";
-  const anchorRef = (!isBackground && !isBase) ? await getActiveAnchorReferenceAttachment(project, layer) : null;
+  const anchorRef = (!isBackground && !isBase && !isBgAccent) ? await getActiveAnchorReferenceAttachment(project, layer) : null;
   const region = layer.region || null;
   const canvasW = project.canvas?.width || 1024;
   const canvasH = project.canvas?.height || 1024;
   const previewPromptForLayer = cleanText(layer.previewGenerationPrompt);
   const otherLayerNames = project.layers.filter((l) => l.id !== layer.id).map((l) => l.name);
+
+  // Look up parent layer's actual drawn bounds for child placement
+  let parentBounds = null;
+  if (layer.parentLayer && !isBackground && !isBase) {
+    const parentLayer = project.layers.find((l) =>
+      cleanText(l.name).toLowerCase() === cleanText(layer.parentLayer).toLowerCase()
+      || slugify(l.name) === slugify(layer.parentLayer)
+    );
+    if (parentLayer) {
+      const parentVariant = (parentLayer.variants || []).find((v) => v.id === parentLayer.selectedVariantId) || (parentLayer.variants || [])[0];
+      if (parentVariant?.imageUrl) {
+        try {
+          const parentPath = publicAssetUrlToAbsolutePath(parentVariant.imageUrl);
+          const parentBuffer = await fs.readFile(parentPath);
+          const parentAnalysis = await assetToolService.inspectPngBuffer(parentBuffer);
+          if (parentAnalysis.bounds) {
+            const parentRegion = parentLayer.region;
+            parentBounds = {
+              ...parentAnalysis.bounds,
+              estimatedX: parentRegion?.x || 0,
+              estimatedY: parentRegion?.y || 0,
+              estimatedW: parentRegion?.width || canvasW,
+              estimatedH: parentRegion?.height || canvasH
+            };
+          }
+        } catch (e) {
+          console.warn(`[drawLayer] Could not read parent layer bounds: ${e.message}`);
+        }
+      }
+    }
+  }
 
   for (let vi = 0; vi < plan.variants.length; vi++) {
     const item = plan.variants[vi];
@@ -6133,17 +6264,24 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
     const regionPrompt = region && !isBackground
       ? ` Target region on the ${canvasW}x${canvasH} canvas: approximately centered around (${Math.round(region.x + region.width / 2)}, ${Math.round(region.y + region.height / 2)}) at roughly ${region.width}x${region.height} pixels.`
       : "";
-    const fullPrompt = basePrompt + exclusionPrompt + regionPrompt;
+    const anchorLayerName = anchorRef?.targetLayerName || "base body";
+    const perspectivePrompt = (!isBackground && !isBase && anchorRef)
+      ? ` CRITICAL 3D RULE: The reference image shows the ${anchorLayerName} at a specific 3D camera angle. This ${layer.name} sits on that same construct and MUST be drawn at the EXACT same camera angle. Study the reference — match its perspective foreshortening, vanishing point direction, and surface angles precisely. If the ${anchorLayerName} is turned, this ${layer.name} must show the same turn on the surface where it attaches. NEVER draw this element flat, front-facing, or leaning away from the reference's angle.`
+      : "";
+    const fullPrompt = basePrompt + exclusionPrompt + regionPrompt + perspectivePrompt;
 
     let imageAsset;
     if (anchorRef?.dataUrl && !isBackground && !isBase) {
-      // Use LOW fidelity so DALL-E uses anchor for scale/position reference only, not copying its content
-      imageAsset = await openaiService.editImageAsset({ apiKey, prompt: fullPrompt, images: [anchorRef.dataUrl], background: "transparent", inputFidelity: "low" });
+      imageAsset = await openaiService.editImageAsset({ apiKey, prompt: fullPrompt, images: [anchorRef.dataUrl], background: "transparent", inputFidelity: "high" });
     } else {
       imageAsset = await openaiService.generateImageAsset({ apiKey, prompt: fullPrompt, size: project.canvas.generationSize, background: backgroundMode });
     }
 
-    const resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+    let resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+
+    if (region && !isBackground && !isBase) {
+      resizedBuffer = await fitLayerToRegion(resizedBuffer, region, canvasW, canvasH, parentBounds);
+    }
 
     const variantId = createId("variant");
     const filename = `${variantId}.png`;
@@ -6166,98 +6304,94 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
   return project;
 }
 
-async function repositionLayerContent(buffer, targetRegion, canvasW, canvasH, layerContext = {}) {
-  // Analyze where the generated content actually is
+async function fitLayerToRegion(buffer, targetRegion, canvasW, canvasH, parentBounds, layerName) {
+  // Deterministic post-processing: extract DALL-E's opaque content, scale it
+  // to fit the target region from the preview analysis, and place it at the
+  // exact pixel position.
+  //
+  // parentBounds (optional): the actual opaque bounds of the parent layer. When
+  // provided, the target region is refined to align with where the parent was
+  // actually drawn, not just where the AI estimated it would be.
+  //
+  // layerName (optional): used to detect structural overlays (door, panel) that
+  // should fill their region exactly rather than preserving aspect ratio.
+
   const analysis = await assetToolService.inspectPngBuffer(buffer);
   if (!analysis.bounds || analysis.emptyAlpha) return buffer;
 
   const actual = analysis.bounds;
-  const actualCenterX = (actual.left + actual.right) / 2;
-  const actualCenterY = (actual.top + actual.bottom) / 2;
-  const actualW = actual.right - actual.left + 1;
-  const actualH = actual.bottom - actual.top + 1;
+  const contentW = actual.right - actual.left + 1;
+  const contentH = actual.bottom - actual.top + 1;
 
-  // Structural parts (inset, surface-mounted) need to fit strictly INSIDE their
-  // target region with padding so they don't bleed past parent edges.
-  const attachment = cleanText(layerContext.attachmentType).toLowerCase();
-  const edgeRules = layerContext.edgeRules || {};
-  const isInsetOrMounted = ["inset", "surface-mounted"].includes(attachment);
-  const mustClipToParent = edgeRules.clipToParentEdges === true;
-  const needsStrictContainment = isInsetOrMounted || mustClipToParent;
-
-  // Inset padding: shrink the effective target region so content sits cleanly inside
-  const insetRatio = needsStrictContainment ? 0.04 : 0;
-  const effectiveTarget = {
-    x: targetRegion.x + targetRegion.width * insetRatio,
-    y: targetRegion.y + targetRegion.height * insetRatio,
-    width: targetRegion.width * (1 - insetRatio * 2),
-    height: targetRegion.height * (1 - insetRatio * 2)
-  };
-
-  // Target center from the (possibly inset) region
-  const targetCenterX = effectiveTarget.x + effectiveTarget.width / 2;
-  const targetCenterY = effectiveTarget.y + effectiveTarget.height / 2;
-
-  // Scale to fit within the effective target region
-  const scaleX = effectiveTarget.width / actualW;
-  const scaleY = effectiveTarget.height / actualH;
-  // Always scale DOWN to fit if content is larger than target; cap upscale at 1.5x
-  const scale = needsStrictContainment
-    ? Math.min(scaleX, scaleY, 1.5)                    // strict: must fit inside both axes
-    : Math.min(scaleX, scaleY, 1.5);
-
-  // How much to shift
-  const shiftX = Math.round(targetCenterX - actualCenterX);
-  const shiftY = Math.round(targetCenterY - actualCenterY);
-
-  if (Math.abs(shiftX) < 5 && Math.abs(shiftY) < 5 && Math.abs(scale - 1) < 0.03) {
-    return buffer; // Close enough, don't reprocess
+  // If a parent layer was already drawn, refine the target region relative to
+  // the parent's ACTUAL bounds instead of the AI-estimated region. This keeps
+  // child assets precisely clipped to the real parent edges.
+  let region = targetRegion;
+  if (parentBounds) {
+    const parentW = parentBounds.right - parentBounds.left + 1;
+    const parentH = parentBounds.bottom - parentBounds.top + 1;
+    const relX = (targetRegion.x - parentBounds.estimatedX) / parentBounds.estimatedW;
+    const relY = (targetRegion.y - parentBounds.estimatedY) / parentBounds.estimatedH;
+    const relW = targetRegion.width / parentBounds.estimatedW;
+    const relH = targetRegion.height / parentBounds.estimatedH;
+    region = {
+      x: Math.round(parentBounds.left + relX * parentW),
+      y: Math.round(parentBounds.top + relY * parentH),
+      width: Math.max(1, Math.round(relW * parentW)),
+      height: Math.max(1, Math.round(relH * parentH))
+    };
   }
 
-  // Extract the content, resize if needed, place on fresh canvas at target position
+  const targetW = Math.max(1, region.width);
+  const targetH = Math.max(1, region.height);
+
+  // Structural overlays (door, panel, plate) must FILL their region to cover
+  // the parent surface opening. Other accessories scale proportionally.
+  const isStructural = /door|panel|plate|face|hatch|lid|cover/i.test(cleanText(layerName));
+  const scale = isStructural
+    ? Math.max(targetW / contentW, targetH / contentH)  // fill: cover the region
+    : Math.min(targetW / contentW, targetH / contentH); // fit: stay inside the region
+
+  // Extract just the opaque content
   const contentBuffer = await sharp(buffer)
-    .extract({
-      left: actual.left,
-      top: actual.top,
-      width: actualW,
-      height: actualH
-    })
+    .extract({ left: actual.left, top: actual.top, width: contentW, height: contentH })
     .png()
     .toBuffer();
 
-  const newW = Math.max(1, Math.round(actualW * scale));
-  const newH = Math.max(1, Math.round(actualH * scale));
-  const scaledContent = await sharp(contentBuffer)
-    .resize({ width: newW, height: newH, fit: "contain", background: { r: 0, g: 0, b: 0, alpha: 0 } })
-    .png()
-    .toBuffer();
-
-  let placeLeft = Math.round(targetCenterX - newW / 2);
-  let placeTop = Math.round(targetCenterY - newH / 2);
-
-  // Clamp to canvas bounds
-  placeLeft = Math.max(0, Math.min(canvasW - newW, placeLeft));
-  placeTop = Math.max(0, Math.min(canvasH - newH, placeTop));
-
-  // For strict containment, also clamp to the target region boundaries
-  if (needsStrictContainment) {
-    const regionLeft = Math.round(effectiveTarget.x);
-    const regionTop = Math.round(effectiveTarget.y);
-    const regionRight = Math.round(effectiveTarget.x + effectiveTarget.width);
-    const regionBottom = Math.round(effectiveTarget.y + effectiveTarget.height);
-    placeLeft = Math.max(regionLeft, Math.min(regionRight - newW, placeLeft));
-    placeTop = Math.max(regionTop, Math.min(regionBottom - newH, placeTop));
+  // Scale if meaningfully different from target size (>5% off)
+  let finalContent = contentBuffer;
+  let finalW = contentW;
+  let finalH = contentH;
+  if (isStructural) {
+    // Structural overlays resize to EXACT region dimensions to cover the surface
+    finalW = targetW;
+    finalH = targetH;
+    finalContent = await sharp(contentBuffer)
+      .resize({ width: finalW, height: finalH, fit: "fill" })
+      .png()
+      .toBuffer();
+  } else if (Math.abs(scale - 1) > 0.05) {
+    finalW = Math.max(1, Math.round(contentW * scale));
+    finalH = Math.max(1, Math.round(contentH * scale));
+    finalContent = await sharp(contentBuffer)
+      .resize({ width: finalW, height: finalH, fit: "inside", background: { r: 0, g: 0, b: 0, alpha: 0 } })
+      .png()
+      .toBuffer();
+    const meta = await sharp(finalContent).metadata();
+    finalW = meta.width;
+    finalH = meta.height;
   }
+
+  // Place at the target region's center, clamped to canvas
+  const placeLeft = Math.max(0, Math.min(canvasW - finalW,
+    Math.round(region.x + (targetW - finalW) / 2)));
+  const placeTop = Math.max(0, Math.min(canvasH - finalH,
+    Math.round(region.y + (targetH - finalH) / 2)));
 
   return sharp({
-    create: {
-      width: canvasW,
-      height: canvasH,
-      channels: 4,
-      background: { r: 0, g: 0, b: 0, alpha: 0 }
-    }
+    create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } }
   })
-    .composite([{ input: scaledContent, left: placeLeft, top: placeTop }])
+    .composite([{ input: finalContent, left: placeLeft, top: placeTop }])
     .png()
     .toBuffer();
 }
@@ -6635,10 +6769,10 @@ async function buildCompositeLayers(source, width, height, baseSource = null) {
   const baseHeight = Math.max(1, Number(metadata.height || height));
   const targetWidth = Math.max(1, Math.round(baseWidth * transform.scale));
   const targetHeight = Math.max(1, Math.round(baseHeight * transform.scale));
-  const left = Math.round((width - targetWidth) / 2 + transform.x * width);
-  const top = Math.round((height - targetHeight) / 2 + transform.y * height);
+  let left = Math.round((width - targetWidth) / 2 + transform.x * width);
+  let top = Math.round((height - targetHeight) / 2 + transform.y * height);
 
-  const input = await sharp(source.absolutePath)
+  let input = await sharp(source.absolutePath)
     .resize({
       width: targetWidth,
       height: targetHeight,
@@ -6646,6 +6780,21 @@ async function buildCompositeLayers(source, width, height, baseSource = null) {
     })
     .png()
     .toBuffer();
+
+  // Apply rotation if set (non-zero). Rotate expands the bounding box, so
+  // recalculate left/top to keep the layer centered at its original position.
+  const rotation = transform.rotation || 0;
+  if (rotation > 0) {
+    const preRotateMeta = await sharp(input).metadata();
+    input = await sharp(input)
+      .rotate(rotation, { background: { r: 0, g: 0, b: 0, alpha: 0 } })
+      .png()
+      .toBuffer();
+    const postRotateMeta = await sharp(input).metadata();
+    // Adjust placement so the center stays in the same spot
+    left = left - Math.round((postRotateMeta.width - preRotateMeta.width) / 2);
+    top = top - Math.round((postRotateMeta.height - preRotateMeta.height) / 2);
+  }
 
   const sourceIndex = Number.isFinite(source.layerIndex) ? Number(source.layerIndex) : -1;
   const baseIndex = Number.isFinite(baseSource?.layerIndex) ? Number(baseSource.layerIndex) : -1;
@@ -6829,7 +6978,7 @@ function isPrimaryBaseLayerName(layerName) {
     return false;
   }
 
-  return /(base|body|character|avatar)/.test(token);
+  return /(base|body|character|avatar|shell|vault|safe|chest|crate|trunk)/.test(token);
 }
 
 function publicAssetUrlToAbsolutePath(assetUrl) {
