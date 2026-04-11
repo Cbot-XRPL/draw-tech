@@ -1255,16 +1255,36 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
         ? ` Target region on the ${canvasW}x${canvasH} canvas: approximately centered around (${Math.round(region.x + region.width / 2)}, ${Math.round(region.y + region.height / 2)}) at roughly ${region.width}x${region.height} pixels.`
         : "";
 
-      // For child assets, reinforce that they MUST match the base body's 3D
-      // camera angle shown in the reference image. The reference is always the
-      // base/body layer, so we reference it directly regardless of the child's
-      // immediate parent in the layer hierarchy.
+      // For BASE layers: use the structural opening contract so the opening
+      // matches the exact spec the child layers (door, panel, lid) will use.
+      let bodyOpeningPrompt = "";
+      if (isBase) {
+        const children = getStructuralChildren(project, layer);
+        if (children.length) {
+          const spec = layer.structuralOpening || getStructuralOpeningSpec(layer.name);
+          bodyOpeningPrompt = buildStructuralOpeningPrompt(layer.name, children.map((l) => l.name).join(", "), spec);
+        }
+      }
+
+      // For STRUCTURAL CHILD layers: inject the matching spec so the child
+      // is drawn to fill the parent's opening exactly.
+      let structuralChildPrompt = "";
+      if (!isBase && !isBackground) {
+        const parent = getStructuralParent(project, layer);
+        if (parent) {
+          const spec = parent.structuralOpening || getStructuralOpeningSpec(parent.name);
+          structuralChildPrompt = buildStructuralChildPrompt(layer.name, parent.name, spec);
+        }
+      }
+
+      // For CHILD assets: reinforce that they MUST match the base body's 3D
+      // camera angle shown in the reference image.
       const anchorLayerName = anchorRef?.targetLayerName || "base body";
       const perspectivePrompt = (!isBackground && !isBase && anchorRef)
         ? ` CRITICAL 3D RULE: The reference image shows the ${anchorLayerName} at a specific 3D camera angle. This ${layer.name} sits on that same construct and MUST be drawn at the EXACT same camera angle. Study the reference — match its perspective foreshortening, vanishing point direction, and surface angles precisely. If the ${anchorLayerName} is turned, this ${layer.name} must show the same turn on the surface where it attaches. NEVER draw this element flat, front-facing, or leaning away from the reference's angle.`
         : "";
 
-      const fullPrompt = basePrompt + exclusionPrompt + regionPrompt + perspectivePrompt;
+      const fullPrompt = basePrompt + exclusionPrompt + regionPrompt + bodyOpeningPrompt + structuralChildPrompt + perspectivePrompt;
 
       if (anchorRef?.dataUrl && !isBackground && !isBase) {
         imageAsset = await openaiService.editImageAsset({
@@ -1328,6 +1348,12 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
     layer.variants.push(...variants);
     if (!layer.selectedVariantId && variants[0]) {
       layer.selectedVariantId = variants[0].id;
+    }
+
+    // Persist structural opening spec on base layers so child layers can
+    // reference the same contract later even across separate sessions.
+    if (isBase && !layer.structuralOpening && getStructuralChildren(project, layer).length) {
+      layer.structuralOpening = getStructuralOpeningSpec(layer.name);
     }
 
     project.updatedAt = new Date().toISOString();
@@ -2514,7 +2540,32 @@ async function generateDraftForProject(project, apiKey, options = {}) {
     draftAttachments
   );
   const item = plan.variants[0];
-  const draftPrompt = [item?.prompt, cleanText(options.extraDirection)].filter(Boolean).join(" ");
+  const isBase = isPrimaryBaseLayerName(targetLayerName);
+  const isBackground = isFullCanvasBackgroundLayerName(targetLayerName);
+
+  // For BASE layers: use structural opening contract so both vault and door
+  // reference the same size/shape/position.
+  let bodyOpeningPrompt = "";
+  if (isBase) {
+    const children = getStructuralChildren(project, draftLayer);
+    if (children.length) {
+      const spec = getStructuralOpeningSpec(targetLayerName);
+      bodyOpeningPrompt = buildStructuralOpeningPrompt(targetLayerName, children.map((l) => l.name).join(", "), spec);
+    }
+  }
+
+  // For STRUCTURAL CHILD layers: inject the matching spec so the child
+  // is drawn to fill the parent's opening exactly.
+  let structuralChildPrompt = "";
+  if (!isBase && !isBackground) {
+    const parent = getStructuralParent(project, draftLayer);
+    if (parent) {
+      const spec = parent.structuralOpening || getStructuralOpeningSpec(parent.name);
+      structuralChildPrompt = buildStructuralChildPrompt(targetLayerName, parent.name, spec);
+    }
+  }
+
+  const draftPrompt = [item?.prompt, cleanText(options.extraDirection), bodyOpeningPrompt, structuralChildPrompt].filter(Boolean).join(" ");
   const referenceImages = Array.isArray(draftAttachments)
     ? draftAttachments
         .map((attachment) => cleanText(attachment?.dataUrl))
@@ -2563,6 +2614,22 @@ async function generateDraftForProject(project, apiKey, options = {}) {
 
   project.draftHistory.unshift(draft);
   project.draftHistory = project.draftHistory.slice(0, 30);
+
+  // Ensure the structural opening spec is stamped on the base layer when a
+  // base draft is generated and structural children exist (or vice-versa,
+  // stamp the parent when a child draft triggers awareness of the contract).
+  if (isBase) {
+    const existingBase = project.layers.find((l) => l.id === draftLayer.id);
+    if (existingBase && !existingBase.structuralOpening && getStructuralChildren(project, existingBase).length) {
+      existingBase.structuralOpening = getStructuralOpeningSpec(existingBase.name);
+    }
+  } else if (!fullCanvasBackground) {
+    const parent = getStructuralParent(project, draftLayer);
+    if (parent && !parent.structuralOpening) {
+      parent.structuralOpening = getStructuralOpeningSpec(parent.name);
+    }
+  }
+
   project.updatedAt = new Date().toISOString();
   await projectService.writeProject(project);
   memory = await studioMemoryService.appendChangelog(project, {
@@ -3686,7 +3753,7 @@ function shouldRestoreAccessoryLayerFromCleanSource(layer, promptText, removalTa
 
 function normalizeLayerTransform(transform) {
   const rawRotation = Number(transform?.rotation);
-  const rotation = Number.isFinite(rawRotation) ? ((rawRotation % 360) + 360) % 360 : 0;
+  const rotation = Number.isFinite(rawRotation) ? Math.max(-180, Math.min(180, rawRotation)) : 0;
   return {
     x: clampTransformNumber(transform?.x, 0, -0.45, 0.45),
     y: clampTransformNumber(transform?.y, 0, -0.45, 0.45),
@@ -4870,6 +4937,29 @@ function buildLayerRevisionPrompt(project, layer, sourceVariant, options = {}) {
     isAccessoryLayerName(layer.name)
       ? `This must remain a pure ${layer.name} trait asset. Do not include any base character, body, head, face, hands, or other layer content in the output.`
       : "",
+    // Structural opening contract for base layers — preserve the opening spec.
+    (() => {
+      if (isPrimaryBaseLayerName(layer.name)) {
+        const children = getStructuralChildren(project, layer);
+        if (children.length) {
+          const spec = layer.structuralOpening || getStructuralOpeningSpec(layer.name);
+          return buildStructuralOpeningPrompt(layer.name, children.map((l) => l.name).join(", "), spec)
+            + ` Preserve the existing opening — do NOT paint or fill in the door/panel area.`;
+        }
+      }
+      return "";
+    })(),
+    // Structural child contract for overlay layers being revised.
+    (() => {
+      if (!isPrimaryBaseLayerName(layer.name)) {
+        const parent = getStructuralParent(project, layer);
+        if (parent) {
+          const spec = parent.structuralOpening || getStructuralOpeningSpec(parent.name);
+          return buildStructuralChildPrompt(layer.name, parent.name, spec);
+        }
+      }
+      return "";
+    })(),
     "Do not redraw or restyle the whole character.",
     "Do not change any part of the source image except the requested feature adjustment.",
     "If reference images are attached, use them only to improve positioning, scale, and fit while preserving the source asset style.",
@@ -4918,9 +5008,17 @@ function buildLayerFitPromptGuidance(project, layer) {
   }
 
   if (cleanText(fitProfile?.id) === "surface-overlay") {
+    // If the parent base layer has a structural opening spec, include the
+    // precise dimensions so the overlay is drawn to the same contract.
+    const parentLayer = getStructuralParent(project, layer);
+    const openingSpec = parentLayer?.structuralOpening || (parentLayer ? getStructuralOpeningSpec(parentLayer.name) : null);
+    const specNote = openingSpec
+      ? ` The ${parentLayer.name}'s opening is a ${openingSpec.shape} at roughly ${Math.round(openingSpec.widthRatio * 100)}% width × ${Math.round(openingSpec.heightRatio * 100)}% height of the front face, positioned at ${openingSpec.placement}. Draw this overlay to exactly fill that opening.`
+      : "";
     return [
       `Fit this structural overlay to ${anchorLabel}: study the visible front face, opening, recess, or seat on the anchor construct and draw only the removable overlay piece shaped to sit on that surface.`,
       `Match the anchor's contour, scale, curvature, edge spacing, and hinge alignment as closely as possible, but do not redraw the anchor body, casing, or any other base content into the trait.`,
+      specNote,
       fitContractGuidance
     ]
       .filter(Boolean)
@@ -6264,11 +6362,27 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
     const regionPrompt = region && !isBackground
       ? ` Target region on the ${canvasW}x${canvasH} canvas: approximately centered around (${Math.round(region.x + region.width / 2)}, ${Math.round(region.y + region.height / 2)}) at roughly ${region.width}x${region.height} pixels.`
       : "";
+    let bodyOpeningPrompt = "";
+    if (isBase) {
+      const children = getStructuralChildren(project, layer);
+      if (children.length) {
+        const spec = layer.structuralOpening || getStructuralOpeningSpec(layer.name);
+        bodyOpeningPrompt = buildStructuralOpeningPrompt(layer.name, children.map((l) => l.name).join(", "), spec);
+      }
+    }
+    let structuralChildPrompt = "";
+    if (!isBase && !isBackground) {
+      const parent = getStructuralParent(project, layer);
+      if (parent) {
+        const spec = parent.structuralOpening || getStructuralOpeningSpec(parent.name);
+        structuralChildPrompt = buildStructuralChildPrompt(layer.name, parent.name, spec);
+      }
+    }
     const anchorLayerName = anchorRef?.targetLayerName || "base body";
     const perspectivePrompt = (!isBackground && !isBase && anchorRef)
       ? ` CRITICAL 3D RULE: The reference image shows the ${anchorLayerName} at a specific 3D camera angle. This ${layer.name} sits on that same construct and MUST be drawn at the EXACT same camera angle. Study the reference — match its perspective foreshortening, vanishing point direction, and surface angles precisely. If the ${anchorLayerName} is turned, this ${layer.name} must show the same turn on the surface where it attaches. NEVER draw this element flat, front-facing, or leaning away from the reference's angle.`
       : "";
-    const fullPrompt = basePrompt + exclusionPrompt + regionPrompt + perspectivePrompt;
+    const fullPrompt = basePrompt + exclusionPrompt + regionPrompt + bodyOpeningPrompt + structuralChildPrompt + perspectivePrompt;
 
     let imageAsset;
     if (anchorRef?.dataUrl && !isBackground && !isBase) {
@@ -6979,6 +7093,92 @@ function isPrimaryBaseLayerName(layerName) {
   }
 
   return /(base|body|character|avatar|shell|vault|safe|chest|crate|trunk)/.test(token);
+}
+
+// ---------------------------------------------------------------------------
+// Structural opening contract — shared spec for base openings and their
+// overlay children so both sides reference the same size, shape, and position.
+// ---------------------------------------------------------------------------
+
+const STRUCTURAL_OPENING_REGEX = /door|panel|plate|face|hatch|lid|cover/i;
+
+function getStructuralOpeningSpec(baseLayerName) {
+  const token = cleanText(baseLayerName).toLowerCase();
+
+  // Chest / crate / trunk — lid on top
+  if (/chest|crate|trunk/.test(token)) {
+    return {
+      shape: "rectangular lid",
+      widthRatio: 0.88,
+      heightRatio: 0.30,
+      centerXRatio: 0.50,
+      centerYRatio: 0.15,
+      placement: "top",
+      description: "wide rectangular lid opening across the top face with visible hinge line at the back edge and a latch seat at the front lip"
+    };
+  }
+
+  // Vault / safe — front door
+  if (/vault|safe/.test(token)) {
+    return {
+      shape: "rectangular door",
+      widthRatio: 0.52,
+      heightRatio: 0.64,
+      centerXRatio: 0.50,
+      centerYRatio: 0.48,
+      placement: "front-center",
+      description: "rectangular recessed door opening on the front face with beveled frame edges, visible hinge mounts on one side, and a locking mechanism seat on the opposite side"
+    };
+  }
+
+  // Generic fallback for any other base with structural children
+  return {
+    shape: "rectangular",
+    widthRatio: 0.50,
+    heightRatio: 0.60,
+    centerXRatio: 0.50,
+    centerYRatio: 0.50,
+    placement: "front-center",
+    description: "rectangular recessed opening on the front-facing surface with clear geometric boundaries and visible frame edges"
+  };
+}
+
+function buildStructuralOpeningPrompt(baseLayerName, childNames, spec) {
+  if (!spec) spec = getStructuralOpeningSpec(baseLayerName);
+  const pctW = Math.round(spec.widthRatio * 100);
+  const pctH = Math.round(spec.heightRatio * 100);
+  return (
+    ` STRUCTURAL OPENING RULE: This ${baseLayerName} has removable overlay layers (${childNames}) that will be drawn separately and placed on its ${spec.placement} face.` +
+    ` Draw the ${baseLayerName} with a clearly defined ${spec.description}.` +
+    ` The opening should occupy roughly ${pctW}% of the front face width and ${pctH}% of the front face height, centered at approximately ${Math.round(spec.centerXRatio * 100)}% horizontal and ${Math.round(spec.centerYRatio * 100)}% vertical on the visible surface.` +
+    ` Do NOT draw the door/panel/lid itself — just the shell with the empty opening at those proportions.`
+  );
+}
+
+function buildStructuralChildPrompt(childLayerName, baseLayerName, spec) {
+  if (!spec) spec = getStructuralOpeningSpec(baseLayerName);
+  const pctW = Math.round(spec.widthRatio * 100);
+  const pctH = Math.round(spec.heightRatio * 100);
+  return (
+    ` STRUCTURAL FIT RULE: This ${childLayerName} must exactly fill the ${spec.description} on the ${baseLayerName}.` +
+    ` The opening is roughly ${pctW}% of the ${baseLayerName}'s front face width and ${pctH}% of its height, positioned at ${spec.placement}.` +
+    ` Draw this ${childLayerName} at exactly that shape, size, and proportion so it snaps flush into the ${baseLayerName}'s recess.` +
+    ` Match the ${baseLayerName}'s perspective angle, surface curvature, and edge geometry precisely.` +
+    ` Do NOT include any of the ${baseLayerName} body, casing, or frame in this asset — only the removable ${childLayerName} piece on a transparent background.`
+  );
+}
+
+function getStructuralChildren(project, baseLayer) {
+  return (project?.layers || []).filter((l) =>
+    l.id !== baseLayer?.id && STRUCTURAL_OPENING_REGEX.test(cleanText(l.name))
+  );
+}
+
+function getStructuralParent(project, childLayer) {
+  if (!STRUCTURAL_OPENING_REGEX.test(cleanText(childLayer?.name))) return null;
+  return (project?.layers || []).find((l) =>
+    l.id !== childLayer?.id && isPrimaryBaseLayerName(l.name)
+  ) || null;
 }
 
 function publicAssetUrlToAbsolutePath(assetUrl) {

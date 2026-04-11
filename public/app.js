@@ -59,14 +59,12 @@ const elements = {
   toggleFitDebugBtn: document.getElementById("toggleFitDebugBtn"),
   toggleDragModeBtn: document.getElementById("toggleDragModeBtn"),
   saveDragBtn: document.getElementById("saveDragBtn"),
-  dragScaleControls: document.getElementById("dragScaleControls"),
+  dragEditorBar: document.getElementById("dragEditorBar"),
+  dragUndoBtn: document.getElementById("dragUndoBtn"),
   dragScaleDownBtn: document.getElementById("dragScaleDownBtn"),
   dragScaleReadout: document.getElementById("dragScaleReadout"),
   dragScaleUpBtn: document.getElementById("dragScaleUpBtn"),
-  dragRotateControls: document.getElementById("dragRotateControls"),
-  dragRotateLeftBtn: document.getElementById("dragRotateLeftBtn"),
-  dragRotateReadout: document.getElementById("dragRotateReadout"),
-  dragRotateRightBtn: document.getElementById("dragRotateRightBtn"),
+  dragRotateInput: document.getElementById("dragRotateInput"),
   refreshPreviewBtn: document.getElementById("refreshPreviewBtn"),
   downloadHashlipsBtn: document.getElementById("downloadHashlipsBtn"),
   projectTitle: document.getElementById("projectTitle"),
@@ -256,19 +254,11 @@ elements.toggleDragModeBtn.addEventListener("click", () => {
   }
 
   if (state.dragMode && hasPendingDragTransforms()) {
-    // Undo the last pending transform instead of discarding all at once
-    const keys = Object.keys(state.pendingDragTransforms);
-    if (keys.length > 0) {
-      delete state.pendingDragTransforms[keys[keys.length - 1]];
-    }
-    if (!hasPendingDragTransforms()) {
-      state.dragSelection = null;
-      state.dragMode = false;
-      showToast("All moves undone. Drag mode off.");
-    } else {
-      showToast(`Undid last move. ${Object.keys(state.pendingDragTransforms).length} pending.`);
-    }
+    state.pendingDragTransforms = {};
+    state.dragSelection = null;
+    state.dragMode = false;
     render();
+    showToast("Drag mode off. Unsaved moves discarded.");
     return;
   }
 
@@ -292,12 +282,24 @@ elements.dragScaleUpBtn.addEventListener("click", () => {
   adjustSelectedLayerScale(0.05);
 });
 
-elements.dragRotateLeftBtn.addEventListener("click", () => {
-  adjustSelectedLayerRotation(-15);
+elements.dragUndoBtn.addEventListener("click", () => {
+  const keys = Object.keys(state.pendingDragTransforms);
+  if (keys.length > 0) {
+    delete state.pendingDragTransforms[keys[keys.length - 1]];
+    if (!hasPendingDragTransforms()) {
+      showToast("All moves undone.");
+    } else {
+      showToast(`Undid last move. ${Object.keys(state.pendingDragTransforms).length} pending.`);
+    }
+    render();
+  }
 });
 
-elements.dragRotateRightBtn.addEventListener("click", () => {
-  adjustSelectedLayerRotation(15);
+elements.dragRotateInput.addEventListener("input", () => {
+  const val = Number(elements.dragRotateInput.value);
+  if (Number.isFinite(val)) {
+    adjustSelectedLayerRotation(val - (getActiveDragEntryRotation() || 0));
+  }
 });
 
 elements.refreshPreviewBtn.addEventListener("click", async () => {
@@ -810,14 +812,15 @@ function renderPreview() {
   elements.toggleDragModeBtn.classList.toggle("is-active", state.dragMode);
   elements.saveDragBtn.classList.toggle("hidden", !state.dragMode || !hasPendingDragTransforms());
   elements.saveDragBtn.textContent = hasPendingDragTransforms() ? "Save Drag" : "Save Drag";
-  elements.dragScaleControls.classList.toggle("hidden", !state.dragMode || !activeDragEntry);
-  elements.dragScaleReadout.textContent = activeDragEntry
-    ? `Scale ${Math.round(getEntryDisplayTransform(activeDragEntry).scale * 100)}%`
-    : "Scale 100%";
-  elements.dragRotateControls.classList.toggle("hidden", !state.dragMode || !activeDragEntry);
-  elements.dragRotateReadout.textContent = activeDragEntry
-    ? `${Math.round(getEntryDisplayTransform(activeDragEntry).rotation || 0)}\u00B0`
-    : "0\u00B0";
+  elements.dragEditorBar.classList.toggle("hidden", !state.dragMode);
+  if (state.dragMode && activeDragEntry) {
+    const activeTransform = getEntryDisplayTransform(activeDragEntry);
+    elements.dragScaleReadout.textContent = `${Math.round(activeTransform.scale * 100)}%`;
+    elements.dragRotateInput.value = Math.round(activeTransform.rotation || 0);
+  } else if (state.dragMode) {
+    elements.dragScaleReadout.textContent = "100%";
+    elements.dragRotateInput.value = 0;
+  }
   elements.previewImage.decoding = "sync";
   elements.previewImage.loading = "eager";
   elements.previewImage.style.display = "none";
@@ -2126,7 +2129,7 @@ function renderStageLayerStack(selectedEntries) {
           class="stage-drag-layer ${active ? "is-active" : ""} ${selected ? "is-selected" : ""}"
           data-layer-id="${entry.layerId}"
           data-variant-id="${entry.id}"
-          style="left:${formatPercent(layout.leftPercent)}%;top:${formatPercent(layout.topPercent)}%;width:${formatPercent(layout.widthPercent)}%;height:${formatPercent(layout.heightPercent)}%;z-index:${entry.layerIndex + 1};${layout.rotation ? `transform:rotate(${layout.rotation}deg);` : ""}"
+          style="left:${formatPercent(layout.leftPercent)}%;top:${formatPercent(layout.topPercent)}%;width:${formatPercent(layout.widthPercent)}%;height:${formatPercent(layout.heightPercent)}%;z-index:${entry.layerIndex + 1};${layout.rotation ? `transform:rotate(${layout.rotation}deg);transform-origin:center;` : ""}"
         >
           <img
             class="stage-drag-image"
@@ -2184,7 +2187,7 @@ function computeStageLayerLayout(entry, transformOverride = null) {
 
 function normalizeClientTransform(transform) {
   const rawRotation = Number(transform?.rotation);
-  const rotation = Number.isFinite(rawRotation) ? ((rawRotation % 360) + 360) % 360 : 0;
+  const rotation = Number.isFinite(rawRotation) ? Math.max(-180, Math.min(180, rawRotation)) : 0;
   return {
     x: clampClientNumber(transform?.x, 0, -0.45, 0.45),
     y: clampClientNumber(transform?.y, 0, -0.45, 0.45),
@@ -2474,6 +2477,13 @@ function adjustSelectedLayerScale(delta) {
   render();
 }
 
+function getActiveDragEntryRotation() {
+  const selectedEntries = getSelectedLayerEntries();
+  const activeEntry = getActiveDragEntry(selectedEntries);
+  if (!activeEntry) return 0;
+  return getEntryDisplayTransform(activeEntry).rotation || 0;
+}
+
 function adjustSelectedLayerRotation(delta) {
   if (!state.dragMode || state.busy) {
     return;
@@ -2609,6 +2619,9 @@ async function savePendingDragTransforms() {
     }
 
     await applyProject(latestProject);
+    state.pendingDragTransforms = {};
+    state.dragSelection = null;
+    state.dragMode = false;
     render();
     completed = true;
   });

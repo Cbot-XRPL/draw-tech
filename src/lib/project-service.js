@@ -95,7 +95,8 @@ export function createProjectService({ projectsDir }) {
       variants: Array.isArray(layer.variants) ? layer.variants : [],
       selectedVariantId: cleanText(layer.selectedVariantId) || null,
       transform: typeof layer === "object" && layer?.transform ? layer.transform : null,
-      fitContract: normalizeLayerFitContract(layer?.fitContract)
+      fitContract: normalizeLayerFitContract(layer?.fitContract),
+      structuralOpening: normalizeStructuralOpening(layer?.structuralOpening)
     };
   }
 
@@ -114,7 +115,8 @@ export function createProjectService({ projectsDir }) {
       variants: Array.isArray(layer?.variants) ? layer.variants : [],
       selectedVariantId: cleanText(typeof layer === "object" ? layer?.selectedVariantId : "") || null,
       transform: typeof layer === "object" && layer?.transform ? layer.transform : null,
-      fitContract: normalizeLayerFitContract(typeof layer === "object" ? layer?.fitContract : null)
+      fitContract: normalizeLayerFitContract(typeof layer === "object" ? layer?.fitContract : null),
+      structuralOpening: normalizeStructuralOpening(typeof layer === "object" ? layer?.structuralOpening : null)
     };
   }
 
@@ -151,6 +153,24 @@ export function createProjectService({ projectsDir }) {
       frontStart: coerceNumber(contract.frontStart),
       summary: cleanText(contract.summary),
       updatedAt: cleanText(contract.updatedAt)
+    };
+
+    return Object.values(normalized).some((value) => value !== "" && value !== null) ? normalized : null;
+  }
+
+  function normalizeStructuralOpening(opening) {
+    if (!opening || typeof opening !== "object") {
+      return null;
+    }
+
+    const normalized = {
+      shape: cleanText(opening.shape),
+      widthRatio: coerceNumber(opening.widthRatio),
+      heightRatio: coerceNumber(opening.heightRatio),
+      centerXRatio: coerceNumber(opening.centerXRatio),
+      centerYRatio: coerceNumber(opening.centerYRatio),
+      placement: cleanText(opening.placement),
+      description: cleanText(opening.description)
     };
 
     return Object.values(normalized).some((value) => value !== "" && value !== null) ? normalized : null;

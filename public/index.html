@@ -153,25 +153,6 @@
             <div class="preview-head-actions">
               <button id="toggleFitDebugBtn" class="btn btn-ghost btn-fit-debug" type="button">Layer Inspector</button>
               <button id="toggleDragModeBtn" class="btn btn-ghost btn-drag-mode" type="button">Drag Layers</button>
-              <button id="saveDragBtn" class="btn btn-primary hidden" type="button">Save Drag</button>
-              <div id="dragScaleControls" class="drag-scale-controls hidden">
-                <button id="dragScaleDownBtn" class="btn btn-ghost btn-scale" type="button" aria-label="Make selected layer smaller">
-                  -
-                </button>
-                <span id="dragScaleReadout" class="badge drag-scale-readout">Scale 100%</span>
-                <button id="dragScaleUpBtn" class="btn btn-ghost btn-scale" type="button" aria-label="Make selected layer bigger">
-                  +
-                </button>
-              </div>
-              <div id="dragRotateControls" class="drag-scale-controls hidden">
-                <button id="dragRotateLeftBtn" class="btn btn-ghost btn-scale" type="button" aria-label="Rotate layer left">
-                  &#x21BA;
-                </button>
-                <span id="dragRotateReadout" class="badge drag-scale-readout">0&deg;</span>
-                <button id="dragRotateRightBtn" class="btn btn-ghost btn-scale" type="button" aria-label="Rotate layer right">
-                  &#x21BB;
-                </button>
-              </div>
               <button id="refreshPreviewBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Shuffle layer variants" title="Shuffle — randomly pick one variant per layer">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path
@@ -202,6 +183,22 @@
               <div id="stageLayerStack" class="stage-layer-stack hidden" aria-hidden="true"></div>
               <div id="stageEmpty" class="stage-empty">Type a prompt above to generate your first preview</div>
             </div>
+          </div>
+
+          <div id="dragEditorBar" class="drag-editor-bar hidden">
+            <button id="dragUndoBtn" class="btn btn-ghost" type="button">Undo</button>
+            <div class="drag-editor-group">
+              <label class="drag-editor-label">Scale</label>
+              <button id="dragScaleDownBtn" class="btn btn-ghost btn-scale" type="button">-</button>
+              <span id="dragScaleReadout" class="badge drag-editor-readout">100%</span>
+              <button id="dragScaleUpBtn" class="btn btn-ghost btn-scale" type="button">+</button>
+            </div>
+            <div class="drag-editor-group">
+              <label class="drag-editor-label">Rotate</label>
+              <input id="dragRotateInput" class="drag-editor-input" type="number" min="-180" max="180" step="1" value="0" />
+              <span class="drag-editor-unit">&deg;</span>
+            </div>
+            <button id="saveDragBtn" class="btn btn-primary" type="button">Save</button>
           </div>
         </article>
 

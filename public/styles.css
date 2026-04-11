@@ -708,6 +708,64 @@ textarea:focus {
   font-weight: 700;
 }
 
+.drag-editor-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 16px;
+  background: var(--surface-2, #1a1a2e);
+  border-radius: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.drag-editor-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.drag-editor-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted, #888);
+  margin-right: 2px;
+}
+
+.drag-editor-readout {
+  min-width: 52px;
+  text-align: center;
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.drag-editor-input {
+  width: 56px;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid var(--border, #333);
+  background: var(--surface-1, #111);
+  color: var(--text, #eee);
+  font-size: 0.85rem;
+  text-align: center;
+  font-weight: 600;
+  -moz-appearance: textfield;
+}
+
+.drag-editor-input::-webkit-inner-spin-button,
+.drag-editor-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.drag-editor-unit {
+  font-size: 0.85rem;
+  color: var(--text-muted, #888);
+  font-weight: 600;
+}
+
 .chat-log {
   max-height: 520px;
   overflow: auto;

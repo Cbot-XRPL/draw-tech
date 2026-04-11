@@ -986,7 +986,7 @@ async function generateImageAsset({ apiKey, prompt, size, background }) {
       model: "gpt-image-1.5",
       prompt,
       size,
-      quality: "medium",
+      quality: "high",
       output_format: "png",
       background,
       moderation: "low"
