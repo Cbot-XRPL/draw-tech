@@ -862,7 +862,8 @@ app.post("/api/chat", async (req, res, next) => {
             prompt: restylePrompt,
             images: [sourceDataUrl],
             background: isBackground ? "opaque" : "transparent",
-            inputFidelity: "high"
+            inputFidelity: "high",
+            size: project.canvas.generationSize
           });
           const variantId = createId("variant");
           const variantFolder = path.join(generatedDir, project.id, "layers", targetLayer.id);
@@ -1292,7 +1293,8 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
           prompt: fullPrompt,
           images: [anchorRef.dataUrl],
           background: "transparent",
-          inputFidelity: "high"
+          inputFidelity: "high",
+          size: project.canvas.generationSize
         });
       } else {
         // Background, base, and layers without anchor: generate from prompt alone
@@ -2578,7 +2580,8 @@ async function generateDraftForProject(project, apiKey, options = {}) {
         prompt: draftPrompt,
         images: referenceImages,
         background: fullCanvasBackground ? "opaque" : "transparent",
-        inputFidelity: "high"
+        inputFidelity: "high",
+        size: project.canvas.generationSize
       })
     : await openaiService.generateImageAsset({
         apiKey,
@@ -2796,7 +2799,8 @@ async function reviseLayerVariantForProject(project, apiKey, options = {}) {
     prompt: editPrompt,
     images: referenceImages,
     background: "transparent",
-    inputFidelity: "high"
+    inputFidelity: "high",
+    size: project.canvas.generationSize
   });
 
   const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
@@ -5013,11 +5017,11 @@ function buildLayerFitPromptGuidance(project, layer) {
     const parentLayer = getStructuralParent(project, layer);
     const openingSpec = parentLayer?.structuralOpening || (parentLayer ? getStructuralOpeningSpec(parentLayer.name) : null);
     const specNote = openingSpec
-      ? ` The ${parentLayer.name}'s opening is a ${openingSpec.shape} at roughly ${Math.round(openingSpec.widthRatio * 100)}% width × ${Math.round(openingSpec.heightRatio * 100)}% height of the front face, positioned at ${openingSpec.placement}. Draw this overlay to exactly fill that opening.`
+      ? ` The opening on ${parentLayer.name} is a ${openingSpec.shape} at roughly ${Math.round(openingSpec.widthRatio * 100)}% width × ${Math.round(openingSpec.heightRatio * 100)}% height of the front face. Match that size for the panel.`
       : "";
     return [
-      `Fit this structural overlay to ${anchorLabel}: study the visible front face, opening, recess, or seat on the anchor construct and draw only the removable overlay piece shaped to sit on that surface.`,
-      `Match the anchor's contour, scale, curvature, edge spacing, and hinge alignment as closely as possible, but do not redraw the anchor body, casing, or any other base content into the trait.`,
+      `Draw ONLY the removable overlay piece for ${anchorLabel} — just the detachable panel/door/lid with its thin bezel rim and compact mounting hardware (hinges, handle/latch).`,
+      `Do NOT redraw any part of ${anchorLabel} — no body, no casing, no walls, no frame edges, no corners, no shell structure. The reference image is for matching art style and camera angle ONLY.`,
       specNote,
       fitContractGuidance
     ]
@@ -6386,7 +6390,7 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
 
     let imageAsset;
     if (anchorRef?.dataUrl && !isBackground && !isBase) {
-      imageAsset = await openaiService.editImageAsset({ apiKey, prompt: fullPrompt, images: [anchorRef.dataUrl], background: "transparent", inputFidelity: "high" });
+      imageAsset = await openaiService.editImageAsset({ apiKey, prompt: fullPrompt, images: [anchorRef.dataUrl], background: "transparent", inputFidelity: "high", size: project.canvas.generationSize });
     } else {
       imageAsset = await openaiService.generateImageAsset({ apiKey, prompt: fullPrompt, size: project.canvas.generationSize, background: backgroundMode });
     }
@@ -7114,7 +7118,12 @@ function getStructuralOpeningSpec(baseLayerName) {
       centerXRatio: 0.50,
       centerYRatio: 0.15,
       placement: "top",
-      description: "wide rectangular lid opening across the top face with visible hinge line at the back edge and a latch seat at the front lip"
+      description: "wide rectangular lid opening across the top face with visible hinge line at the back edge and a latch seat at the front lip",
+      interconnects: [
+        "the surround rim plate that frames the lid opening edge-to-edge",
+        "hinge hardware along the back edge connecting lid to body",
+        "front latch, clasp, or lock mechanism"
+      ]
     };
   }
 
@@ -7127,7 +7136,13 @@ function getStructuralOpeningSpec(baseLayerName) {
       centerXRatio: 0.50,
       centerYRatio: 0.48,
       placement: "front-center",
-      description: "rectangular recessed door opening on the front face with beveled frame edges, visible hinge mounts on one side, and a locking mechanism seat on the opposite side"
+      description: "rectangular recessed door opening on the front face with beveled frame edges, visible hinge mounts on one side, and a locking mechanism seat on the opposite side",
+      interconnects: [
+        "the surround rim plate / bezel frame that borders the door opening and overlaps the body edge",
+        "hinge barrels or knuckles on one side that visually connect the door to the body",
+        "locking handle, dial, or latch mechanism on the opposite side",
+        "any bolts, rivets, or mounting studs that sit on the door surface"
+      ]
     };
   }
 
@@ -7139,7 +7154,12 @@ function getStructuralOpeningSpec(baseLayerName) {
     centerXRatio: 0.50,
     centerYRatio: 0.50,
     placement: "front-center",
-    description: "rectangular recessed opening on the front-facing surface with clear geometric boundaries and visible frame edges"
+    description: "rectangular recessed opening on the front-facing surface with clear geometric boundaries and visible frame edges",
+    interconnects: [
+      "the surround rim plate or bezel frame that borders the opening",
+      "any hinge or pivot hardware on one edge",
+      "any latch, handle, or closure mechanism"
+    ]
   };
 }
 
@@ -7147,11 +7167,15 @@ function buildStructuralOpeningPrompt(baseLayerName, childNames, spec) {
   if (!spec) spec = getStructuralOpeningSpec(baseLayerName);
   const pctW = Math.round(spec.widthRatio * 100);
   const pctH = Math.round(spec.heightRatio * 100);
+  const interconnectList = Array.isArray(spec.interconnects) && spec.interconnects.length
+    ? spec.interconnects.join("; ")
+    : "surround plate, hinges, and latch hardware";
   return (
     ` STRUCTURAL OPENING RULE: This ${baseLayerName} has removable overlay layers (${childNames}) that will be drawn separately and placed on its ${spec.placement} face.` +
     ` Draw the ${baseLayerName} with a clearly defined ${spec.description}.` +
     ` The opening should occupy roughly ${pctW}% of the front face width and ${pctH}% of the front face height, centered at approximately ${Math.round(spec.centerXRatio * 100)}% horizontal and ${Math.round(spec.centerYRatio * 100)}% vertical on the visible surface.` +
-    ` Do NOT draw the door/panel/lid itself — just the shell with the empty opening at those proportions.`
+    ` Do NOT draw the door/panel/lid itself — just the shell with the empty opening at those proportions.` +
+    ` Also do NOT draw any of the interconnecting hardware that belongs to the overlay layer: ${interconnectList}. Those will be included on the overlay asset. Leave the opening bare — visible cavity, recessed edges, and raw mounting points only.`
   );
 }
 
@@ -7159,12 +7183,17 @@ function buildStructuralChildPrompt(childLayerName, baseLayerName, spec) {
   if (!spec) spec = getStructuralOpeningSpec(baseLayerName);
   const pctW = Math.round(spec.widthRatio * 100);
   const pctH = Math.round(spec.heightRatio * 100);
+  const totalW = Math.round(spec.widthRatio * 100 + 10);
+  const totalH = Math.round(spec.heightRatio * 100 + 10);
+  const interconnectList = Array.isArray(spec.interconnects) && spec.interconnects.length
+    ? spec.interconnects.join("; ")
+    : "surround plate, hinges, and latch hardware";
   return (
-    ` STRUCTURAL FIT RULE: This ${childLayerName} must exactly fill the ${spec.description} on the ${baseLayerName}.` +
-    ` The opening is roughly ${pctW}% of the ${baseLayerName}'s front face width and ${pctH}% of its height, positioned at ${spec.placement}.` +
-    ` Draw this ${childLayerName} at exactly that shape, size, and proportion so it snaps flush into the ${baseLayerName}'s recess.` +
-    ` Match the ${baseLayerName}'s perspective angle, surface curvature, and edge geometry precisely.` +
-    ` Do NOT include any of the ${baseLayerName} body, casing, or frame in this asset — only the removable ${childLayerName} piece on a transparent background.`
+    ` STRUCTURAL FIT RULE — WHAT TO DRAW: Draw ONLY an isolated ${childLayerName} piece — a single removable panel/door/lid on a transparent background. Nothing else.` +
+    ` SIZE: The ${childLayerName} panel is roughly ${pctW}% wide × ${pctH}% tall relative to the ${baseLayerName}'s front face. With its thin surround rim the total footprint is about ${totalW}% × ${totalH}%. It must NOT be bigger than that.` +
+    ` INCLUDE: The ${childLayerName} panel surface, a thin bezel rim around its edge, and compact mounting hardware: ${interconnectList}.` +
+    ` CRITICAL EXCLUSION — WHAT NOT TO DRAW: Do NOT draw ANY part of the ${baseLayerName} — no body walls, no side panels, no frame edges, no corners, no legs, no casing, no structural shell. The reference image shows the ${baseLayerName} for angle and style reference ONLY — do not reproduce its surfaces. This asset is JUST the detachable ${childLayerName} floating on transparency.` +
+    ` Match the ${baseLayerName}'s art style, camera angle, and lighting direction but draw ONLY the ${childLayerName} itself.`
   );
 }
 

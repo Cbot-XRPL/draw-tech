@@ -800,7 +800,8 @@ function renderPreview() {
   syncDragSelection(selectedEntries);
   const activeDragEntry = getActiveDragEntry(selectedEntries);
   const stackSources = buildPreviewStackSources(selectedEntries);
-  const renderToken = stackSources.map((item) => `${item.imageUrl}:${item.cacheKey}`).join("|");
+  const renderToken = stackSources.map((item) => `${item.imageUrl}:${item.cacheKey}`).join("|")
+    + `|t:${state.project?.updatedAt || ""}`;
   const previewUrl =
     state.project?.id && stackSources.length
       ? `/api/projects/${state.project.id}/preview/render?v=${encodeURIComponent(

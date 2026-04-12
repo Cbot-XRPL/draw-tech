@@ -1013,7 +1013,7 @@ async function generateImageAsset({ apiKey, prompt, size, background }) {
   };
 }
 
-async function editImageAsset({ apiKey, prompt, images, background = "transparent", inputFidelity = "high" }) {
+async function editImageAsset({ apiKey, prompt, images, background = "transparent", inputFidelity = "high", size = "1024x1024", quality = "high" }) {
   const references = Array.isArray(images)
     ? images
         .map((imageUrl) => cleanText(imageUrl))
@@ -1040,6 +1040,8 @@ async function editImageAsset({ apiKey, prompt, images, background = "transparen
       prompt,
       background,
       input_fidelity: inputFidelity,
+      size,
+      quality,
       output_format: "png",
       moderation: "low"
     })

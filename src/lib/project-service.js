@@ -170,10 +170,15 @@ export function createProjectService({ projectsDir }) {
       centerXRatio: coerceNumber(opening.centerXRatio),
       centerYRatio: coerceNumber(opening.centerYRatio),
       placement: cleanText(opening.placement),
-      description: cleanText(opening.description)
+      description: cleanText(opening.description),
+      interconnects: Array.isArray(opening.interconnects)
+        ? opening.interconnects.map(cleanText).filter(Boolean)
+        : []
     };
 
-    return Object.values(normalized).some((value) => value !== "" && value !== null) ? normalized : null;
+    return Object.values(normalized).some((value) =>
+      value !== "" && value !== null && !(Array.isArray(value) && value.length === 0)
+    ) ? normalized : null;
   }
 
   function coerceNumber(value) {
