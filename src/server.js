@@ -7118,10 +7118,9 @@ function getStructuralOpeningSpec(baseLayerName) {
       centerXRatio: 0.50,
       centerYRatio: 0.15,
       placement: "top",
-      description: "wide rectangular lid opening across the top face with visible hinge line at the back edge and a latch seat at the front lip",
+      description: "wide rectangular lid opening across the top face with a clean recessed edge",
       interconnects: [
         "the surround rim plate that frames the lid opening edge-to-edge",
-        "hinge hardware along the back edge connecting lid to body",
         "front latch, clasp, or lock mechanism"
       ]
     };
@@ -7136,11 +7135,10 @@ function getStructuralOpeningSpec(baseLayerName) {
       centerXRatio: 0.50,
       centerYRatio: 0.48,
       placement: "front-center",
-      description: "rectangular recessed door opening on the front face with beveled frame edges, visible hinge mounts on one side, and a locking mechanism seat on the opposite side",
+      description: "rectangular recessed door opening on the front face with clean beveled frame edges and no hinge or mounting hardware",
       interconnects: [
-        "the surround rim plate / bezel frame that borders the door opening and overlaps the body edge",
-        "hinge barrels or knuckles on one side that visually connect the door to the body",
-        "locking handle, dial, or latch mechanism on the opposite side",
+        "the surround rim plate / bezel frame that borders the door opening",
+        "locking handle, dial, or latch mechanism",
         "any bolts, rivets, or mounting studs that sit on the door surface"
       ]
     };
@@ -7154,10 +7152,9 @@ function getStructuralOpeningSpec(baseLayerName) {
     centerXRatio: 0.50,
     centerYRatio: 0.50,
     placement: "front-center",
-    description: "rectangular recessed opening on the front-facing surface with clear geometric boundaries and visible frame edges",
+    description: "rectangular recessed opening on the front-facing surface with clean geometric boundaries",
     interconnects: [
       "the surround rim plate or bezel frame that borders the opening",
-      "any hinge or pivot hardware on one edge",
       "any latch, handle, or closure mechanism"
     ]
   };
@@ -7167,15 +7164,12 @@ function buildStructuralOpeningPrompt(baseLayerName, childNames, spec) {
   if (!spec) spec = getStructuralOpeningSpec(baseLayerName);
   const pctW = Math.round(spec.widthRatio * 100);
   const pctH = Math.round(spec.heightRatio * 100);
-  const interconnectList = Array.isArray(spec.interconnects) && spec.interconnects.length
-    ? spec.interconnects.join("; ")
-    : "surround plate, hinges, and latch hardware";
   return (
     ` STRUCTURAL OPENING RULE: This ${baseLayerName} has removable overlay layers (${childNames}) that will be drawn separately and placed on its ${spec.placement} face.` +
     ` Draw the ${baseLayerName} with a clearly defined ${spec.description}.` +
     ` The opening should occupy roughly ${pctW}% of the front face width and ${pctH}% of the front face height, centered at approximately ${Math.round(spec.centerXRatio * 100)}% horizontal and ${Math.round(spec.centerYRatio * 100)}% vertical on the visible surface.` +
     ` Do NOT draw the door/panel/lid itself — just the shell with the empty opening at those proportions.` +
-    ` Also do NOT draw any of the interconnecting hardware that belongs to the overlay layer: ${interconnectList}. Those will be included on the overlay asset. Leave the opening bare — visible cavity, recessed edges, and raw mounting points only.`
+    ` Do NOT draw hinges, handles, latches, or any mounting hardware on the ${baseLayerName} body — all hardware belongs to the overlay layer. Leave the opening as a clean bare cavity with simple recessed edges only.`
   );
 }
 
