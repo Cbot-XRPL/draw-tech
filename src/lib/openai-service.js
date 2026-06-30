@@ -113,7 +113,7 @@ async function createPreviewPlan(apiKey, project, memory, brain, toolManifest, a
   return validatePreviewPlan(response);
 }
 
-async function createLayerVariantPlan(apiKey, project, layer, count, memory, brain, toolManifest, attachments = []) {
+async function createLayerVariantPlan(apiKey, project, layer, count, memory, brain, toolManifest, attachments = [], anchorGeometry = null) {
   const fullCanvasBackground = isFullCanvasBackgroundLayerName(layer?.name);
   const structuralOverlay = isStructuralOverlayLayerName(layer?.name);
   const prompt = [
@@ -193,7 +193,8 @@ async function createLayerVariantPlan(apiKey, project, layer, count, memory, bra
       prompt: buildLayerAssetPrompt({
         project,
         layer,
-        promptText: cleanText(item?.prompt)
+        promptText: cleanText(item?.prompt),
+        anchorGeometry
       })
     }))
   };
@@ -492,17 +493,31 @@ async function refreshStudioBrain(apiKey, project, memory, brain, toolManifest, 
   };
 }
 
-function buildLayerAssetPrompt({ project, layer, promptText }) {
+function buildLayerAssetPrompt({ project, layer, promptText, anchorGeometry = null }) {
   if (isFullCanvasBackgroundLayerName(layer?.name)) {
     return buildFullCanvasBackgroundPrompt({ project, layer, promptText });
   }
 
-  return buildTransparentPrompt({ project, layer, promptText });
+  return buildTransparentPrompt({ project, layer, promptText, anchorGeometry });
 }
 
-function buildTransparentPrompt({ project, layer, promptText }) {
+function buildTransparentPrompt({ project, layer, promptText, anchorGeometry = null }) {
+  const anchor = getActiveAnchorLayer(project);
+  const isAnchorSelf = Boolean(anchor?.layer?.id && layer?.id && anchor.layer.id === layer.id);
+  const isAccent = isBackgroundAccentLayerName(layer?.name);
+  // A trait mounts onto the base body whenever there is a selected anchor that is not this layer
+  // itself and this is not a free-floating background accent. The generation flow (M1) attaches
+  // that anchor PNG as the FIRST reference image, so the prompt can speak about it concretely.
+  const mountsOnAnchor = Boolean(anchor?.variant) && !isAnchorSelf && !isAccent;
+
   const activeConstruct = buildActiveConstructSummary(project);
   const layerFitGuidance = buildLayerFitPromptGuidance(project, layer);
+  const anchorClause = buildAnchorConstructionClause({
+    mountsOnAnchor,
+    anchorLabel: anchor?.layer?.name,
+    anchorGeometry
+  });
+
   const fragments = [
     promptText,
     `Collection title: ${project.title}.`,
@@ -513,16 +528,72 @@ function buildTransparentPrompt({ project, layer, promptText }) {
     layer.placementNotes ? `Placement notes: ${layer.placementNotes}.` : "",
     activeConstruct,
     layerFitGuidance,
-    "If an anchor or example reference image is attached, use it as a construction map for scale, curvature, seat geometry, edge spacing, and contact points while still outputting only the isolated requested trait.",
+    anchorClause,
     `Canvas: ${project.canvas?.width || 1024}x${project.canvas?.height || 1024} pixels, ${project.canvas?.aspect || "square"} aspect ratio.`,
-    "Output a single isolated asset only.",
-    "Transparent background.",
-    "No mockup, no scene, no body parts from other layers, no labels, no watermark.",
+    "Output ONLY this single trait, fully isolated.",
+    "Transparent background — no scene, frame, backdrop, mockup, label, or watermark.",
+    "Do NOT redraw or include the body, head, face, eyes, paws, or any other layer's content.",
     "Centered composition, stack-friendly proportions, crisp edges, PNG-ready.",
+    "The asset must contain visible, fully-rendered content that fills a clear central region — never an empty, blank, or nearly-transparent frame. If unsure about size, draw the trait larger rather than smaller.",
     "Use consistent top-left soft lighting and matching shadow direction so this asset composites cleanly with other layers."
   ];
 
   return fragments.filter(Boolean).join(" ");
+}
+
+// Body-aware vs. blind construction language. When the base body is attached as a reference
+// (the common trait case), tell the model to read geometry from that FIRST image; otherwise give
+// an explicit default construction target so a blind generation still lands consistently.
+function buildAnchorConstructionClause({ mountsOnAnchor, anchorLabel, anchorGeometry }) {
+  if (mountsOnAnchor) {
+    const base = `The FIRST attached image is the ${
+      anchorLabel || "base body"
+    } this trait mounts onto. Read its silhouette, overall width, contact edge, and key feature lines — head-dome width, face center, eye line, neck seam, and hand/paw position — directly from that image, then size, curve, and place this trait so it seats flush against the body instead of floating. Any other attached images are sibling trait layers already on this body; do not collide with or redraw them.`;
+    const geo = buildAnchorGeometryClause(anchorGeometry);
+    return geo ? `${base} ${geo}` : base;
+  }
+  return "No base image is attached, so assume a centered creature whose head dome spans roughly 60% of the canvas width with the face in the upper-middle third and the body filling the central ~70% of the canvas; size and place this trait to that construction.";
+}
+
+// D1: turn measured body geometry (normalized 0..1 ratios off the anchor PNG's alpha bounds, plus
+// optional per-trait connection sub-region) into explicit pixel-anchor language.
+function buildAnchorGeometryClause(anchorGeometry) {
+  if (!anchorGeometry || typeof anchorGeometry !== "object") {
+    return "";
+  }
+  const canvasW = Number(anchorGeometry.canvasWidth) || 1024;
+  const canvasH = Number(anchorGeometry.canvasHeight) || 1024;
+  const pct = (v) => Math.round(Number(v) * 100);
+  const px = (v, dim) => Math.round(Number(v) * dim);
+  const parts = [];
+
+  const b = anchorGeometry.bodyBounds;
+  if (b && Number.isFinite(b.x0) && Number.isFinite(b.x1)) {
+    parts.push(
+      `Measured from the base image, the body occupies x=${px(b.x0, canvasW)}→${px(b.x1, canvasW)}px (≈${pct(
+        b.x1 - b.x0
+      )}% of width) and y=${px(b.y0, canvasH)}→${px(b.y1, canvasH)}px (≈${pct(b.y1 - b.y0)}% of height), centered near x=${px(
+        (b.x0 + b.x1) / 2,
+        canvasW
+      )}px.`
+    );
+  }
+
+  const r = anchorGeometry.connectionRegion;
+  if (r && Number.isFinite(r.x0) && Number.isFinite(r.x1)) {
+    const label = cleanText(r.label) || "connection zone";
+    parts.push(
+      `Place this trait against the ${label}: x=${px(r.x0, canvasW)}→${px(r.x1, canvasW)}px, y=${px(
+        r.y0,
+        canvasH
+      )}→${px(r.y1, canvasH)}px (center x=${px((r.x0 + r.x1) / 2, canvasW)}px, y=${px(
+        (r.y0 + r.y1) / 2,
+        canvasH
+      )}px). Match that width and seat so the trait reads as physically attached there.`
+    );
+  }
+
+  return parts.join(" ");
 }
 
 function buildFullCanvasBackgroundPrompt({ project, layer, promptText }) {
@@ -722,42 +793,45 @@ function buildLayerFitPromptGuidance(project, layer) {
       .join(" ");
   }
 
-  if (/headwear|hat|crown|tiara/.test(lowered)) {
+  if (/expression|face|eyes|eyewear|glasses|shades|goggles|visor|mouth|smile|teeth|tongue|blush/.test(lowered)) {
     return [
-      `Fit this headwear to ${anchorLabel}: keep it centered in the upper anchor region, readable at thumbnail size, and proportioned so it sits on the character instead of floating above a blank canvas.`,
+      `Fit these face features to ${anchorLabel}: place the eyes symmetrically about the vertical centerline at the face midline, spaced about one eye-width apart and sized to the visible face width (not the full canvas); set any mouth just below and between the eyes on the centerline. Align everything to where the face actually sits on the base and never redraw the head, ears, or fur.`,
       fitContractGuidance
     ]
       .filter(Boolean)
       .join(" ");
   }
 
-  if (/eyes|eyewear|glasses|shades/.test(lowered)) {
+  if (/headwear|hat|crown|tiara|helmet|hair|headband|cap|beanie/.test(lowered)) {
     return [
-      `Fit this eyewear to ${anchorLabel}: keep it centered over the eye line, sized to the visible face width instead of the full canvas, and never redraw extra face or head content into the trait.`,
+      `Fit this headwear to ${anchorLabel}: the inner brim must curve to clamp the top of the head dome and sit low enough to touch the forehead rather than float above it. Match the dome width, follow the dome curvature, and leave gaps for any ears that should poke through.`,
       fitContractGuidance
     ]
       .filter(Boolean)
       .join(" ");
   }
 
-  if (/neckwear|necklace|chain|scarf|bow/.test(lowered)) {
-    return [`Fit this neckwear to ${anchorLabel}: keep it centered around the neck/chest area with clean stack-safe spacing.`, fitContractGuidance]
-      .filter(Boolean)
-      .join(" ");
-  }
-
-  if (/handheld|weapon|sword|staff|wand|gun|tool|prop|item|orb|flower|cane|bat|microphone/.test(lowered)) {
+  if (/neckwear|necklace|chain|scarf|bow|collar|tie|bandana|bib/.test(lowered)) {
     return [
-      `Fit this handheld trait to ${anchorLabel}: size it for the active construct and place it so it reads as being held by the visible hand, paw, arm, or grip area instead of floating beside the body.`,
+      `Fit this neckwear to ${anchorLabel}: wrap it around the base of the neck where the head meets the body, curving the band to sit ON that seam with the top edge meeting the chin/jaw line and the ends tapering behind the neck. Match the neck/upper-chest width and do not float it down over the belly.`,
       fitContractGuidance
     ]
       .filter(Boolean)
       .join(" ");
   }
 
-  if (/outfit|shirt|hoodie|jacket|body/.test(lowered)) {
+  if (/handheld|held|weapon|sword|staff|wand|gun|tool|prop|item|orb|flower|cane|bat|microphone|carrot|bottle/.test(lowered)) {
     return [
-      `Fit this body-related layer to ${anchorLabel}: preserve the active character proportions and keep the silhouette aligned to the torso area.`,
+      `Fit this handheld trait to ${anchorLabel}: size it to the visible hand/paw/grip and position it so the grip edge overlaps slightly IN FRONT of that hand, reading as physically held rather than floating beside the body. Do not duplicate a prop that another layer already places.`,
+      fitContractGuidance
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  if (/outfit|clothing|clothes|shirt|hoodie|jacket|armor|torso|body/.test(lowered)) {
+    return [
+      `Fit this body-related layer to ${anchorLabel}: keep the active character proportions, aligning the shoulders to the neck seam and the hem to the torso contour so the garment wraps the body mass without changing its pose.`,
       fitContractGuidance
     ]
       .filter(Boolean)

@@ -1174,17 +1174,6 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
 
     const brain = await studioBrainService.getBrain();
     const toolManifest = await studioBrainService.getToolManifest();
-    const plan = await openaiService.createLayerVariantPlan(
-      apiKey,
-      project,
-      layer,
-      count,
-      memory,
-      brain,
-      toolManifest
-    );
-    const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
-    await fs.mkdir(variantFolder, { recursive: true });
 
     const isBackground = isFullCanvasBackgroundLayerName(layer.name);
     const isBase = isPrimaryBaseLayerName(layer.name);
@@ -1193,6 +1182,27 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
     const anchorRef = (!isBackground && !isBase && !isBgAccent)
       ? await getActiveAnchorReferenceAttachment(project, layer)
       : null;
+    // M1: sibling trait references so the new trait can see what is already on the body.
+    const siblingRefs = (!isBackground && !isBase && !isBgAccent)
+      ? await getSiblingReferenceAttachments(project, layer, [anchorRef?.imageUrl].filter(Boolean), 3)
+      : [];
+    // D1 + D2: measured connection geometry from the anchor body, injected into the prompt.
+    const anchorGeometry = anchorRef ? await buildAnchorGeometryForPrompt(project, layer, anchorRef) : null;
+
+    const plan = await openaiService.createLayerVariantPlan(
+      apiKey,
+      project,
+      layer,
+      count,
+      memory,
+      brain,
+      toolManifest,
+      [],
+      anchorGeometry
+    );
+    const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
+    await fs.mkdir(variantFolder, { recursive: true });
+
     const region = layer.region || null;
     const canvasW = project.canvas?.width || 1024;
     const canvasH = project.canvas?.height || 1024;
@@ -1241,7 +1251,7 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
       // First variant uses the detailed preview-analyzed prompt wrapped with isolation rules
       const isFirstVariant = variantIndex === 0;
       const basePrompt = (isFirstVariant && previewPromptForLayer)
-        ? openaiService.buildLayerAssetPrompt({ project, layer, promptText: previewPromptForLayer })
+        ? openaiService.buildLayerAssetPrompt({ project, layer, promptText: previewPromptForLayer, anchorGeometry })
         : item.prompt;
 
       // Build exclusion list — what NOT to draw
@@ -1287,37 +1297,51 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
 
       const fullPrompt = basePrompt + exclusionPrompt + regionPrompt + bodyOpeningPrompt + structuralChildPrompt + perspectivePrompt;
 
-      if (anchorRef?.dataUrl && !isBackground && !isBase) {
-        imageAsset = await openaiService.editImageAsset({
-          apiKey,
-          prompt: fullPrompt,
-          images: [anchorRef.dataUrl],
-          background: "transparent",
-          inputFidelity: "high",
-          size: project.canvas.generationSize
-        });
-      } else {
-        // Background, base, and layers without anchor: generate from prompt alone
-        // The detailed preview-analyzed prompt has all the visual info needed
-        imageAsset = await openaiService.generateImageAsset({
-          apiKey,
-          prompt: fullPrompt,
-          size: project.canvas.generationSize,
-          background: backgroundMode
-        });
+      // M1: pass the body anchor first, then sibling traits, as reference images.
+      const referenceImages = (anchorRef?.dataUrl && !isBackground && !isBase)
+        ? [anchorRef.dataUrl, ...siblingRefs.map((s) => s.dataUrl)].slice(0, 16)
+        : [];
+
+      // M2: generate, and retry once if a trait comes back blank/near-empty.
+      let resizedBuffer = null;
+      let analysis = null;
+      const maxAttempts = isBackground ? 1 : 2;
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        if (referenceImages.length) {
+          imageAsset = await openaiService.editImageAsset({
+            apiKey,
+            prompt: fullPrompt,
+            images: referenceImages,
+            background: "transparent",
+            inputFidelity: "high",
+            size: project.canvas.generationSize
+          });
+        } else {
+          // Background, base, and layers without anchor: generate from prompt alone.
+          imageAsset = await openaiService.generateImageAsset({
+            apiKey,
+            prompt: fullPrompt,
+            size: project.canvas.generationSize,
+            background: backgroundMode
+          });
+        }
+
+        resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+
+        // Fit CHILD layers to their target region relative to the parent's drawn bounds.
+        if (region && !isBackground && !isBase) {
+          resizedBuffer = await fitLayerToRegion(resizedBuffer, region, canvasW, canvasH, parentBounds, layer.name);
+        }
+
+        analysis = await inspectVariantAgainstLayer(layer, resizedBuffer);
+
+        if (!isTraitTooEmpty(analysis, isBackground)) {
+          break;
+        }
+        if (attempt < maxAttempts) {
+          warnings.push(`${item.name} came back nearly empty — regenerating (attempt ${attempt + 1} of ${maxAttempts}).`);
+        }
       }
-
-      let resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
-
-      // Fit CHILD layers to their target region. The base/body layer is the
-      // anchor — it renders at whatever size DALL-E chose, unmodified. Only
-      // trait/accessory layers get fitted to their region relative to the
-      // parent's actual drawn bounds.
-      if (region && !isBackground && !isBase) {
-        resizedBuffer = await fitLayerToRegion(resizedBuffer, region, canvasW, canvasH, parentBounds, layer.name);
-      }
-
-      const analysis = await inspectVariantAgainstLayer(layer, resizedBuffer);
 
       if (analysis.possibleDuplicate) {
         warnings.push(`${item.name} looks very similar to ${analysis.strongestMatchName}`);
@@ -1328,8 +1352,8 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
       if (!isBackground && !isBase && analysis.touchesEdge) {
         warnings.push(`${item.name} bleeds to canvas edge — may not stack cleanly`);
       }
-      if (analysis.emptyAlpha) {
-        warnings.push(`${item.name} appears completely empty/transparent`);
+      if (isTraitTooEmpty(analysis, isBackground)) {
+        warnings.push(`${item.name} is still empty/near-empty after retry — not auto-selected.`);
       }
 
       const variantId = createId("variant");
@@ -1348,8 +1372,10 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
     }
 
     layer.variants.push(...variants);
-    if (!layer.selectedVariantId && variants[0]) {
-      layer.selectedVariantId = variants[0].id;
+    // M2: never auto-select a blank/near-empty variant.
+    const firstUsable = variants.find((v) => !isTraitTooEmpty(v.analysis, isBackground)) || variants[0];
+    if (!layer.selectedVariantId && firstUsable) {
+      layer.selectedVariantId = firstUsable.id;
     }
 
     // Persist structural opening spec on base layers so child layers can
@@ -1357,6 +1383,9 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
     if (isBase && !layer.structuralOpening && getStructuralChildren(project, layer).length) {
       layer.structuralOpening = getStructuralOpeningSpec(layer.name);
     }
+
+    // M3: flag redundant/overlapping props across the committed stack.
+    warnings.push(...findPropOverlapWarnings(project));
 
     project.updatedAt = new Date().toISOString();
     await projectService.writeProject(project);
@@ -2531,6 +2560,11 @@ async function generateDraftForProject(project, apiKey, options = {}) {
   let memory = await studioMemoryService.getMemory(project);
   const brain = await studioBrainService.getBrain();
   const toolManifest = await studioBrainService.getToolManifest();
+  // D1 + D2: measured connection geometry from the attached base body, for the draft prompt.
+  const draftAnchorRef = (Array.isArray(draftAttachments) ? draftAttachments : []).find(
+    (attachment) => cleanText(attachment?.referenceType) === "active-anchor"
+  );
+  const draftAnchorGeometry = draftAnchorRef ? await buildAnchorGeometryForPrompt(project, draftLayer, draftAnchorRef) : null;
   const plan = await openaiService.createLayerVariantPlan(
     apiKey,
     project,
@@ -2539,7 +2573,8 @@ async function generateDraftForProject(project, apiKey, options = {}) {
     memory,
     brain,
     toolManifest,
-    draftAttachments
+    draftAttachments,
+    draftAnchorGeometry
   );
   const item = plan.variants[0];
   const isBase = isPrimaryBaseLayerName(targetLayerName);
@@ -2676,6 +2711,8 @@ function shouldUseReferenceGuidedDraftRender(promptText, targetLayerName, attach
 
   return (
     hasSavedProjectReference ||
+    // M1: any non-background trait with the base body attached renders body-aware.
+    (hasActiveAnchorReference && !fullCanvasBackground) ||
     (fullCanvasBackground && (hasUploadReference || explicitReferenceIntent)) ||
     ((hasActiveAnchorReference || hasUploadReference || explicitReferenceIntent) &&
       (structuralOverlayTarget || structuralFitIntent))
@@ -2720,17 +2757,10 @@ function shouldAttachActiveAnchorToDraft(project, layer, promptText, attachments
     return false;
   }
 
-  if (fitProfileId === "surface-overlay") {
-    return true;
-  }
-
-  const lowered = cleanText(promptText).toLowerCase();
-  return (
-    /\b(fit|fits|fitted|attach|attached|align|aligned|seat|seated|sit|sits|overlay|mapped|match|inside|recessed|middle|center(?:ed)?|flush)\b/.test(
-      lowered
-    ) &&
-    mentionsAnchorPlacementArea(lowered)
-  );
+  // M1: attach the base body for every non-background trait so drafts seat onto the
+  // real construct instead of a blank canvas (the guards above already excluded
+  // backgrounds/accents, missing anchors, and cases where one is already attached).
+  return true;
 }
 
 async function reviseLayerVariantForProject(project, apiKey, options = {}) {
@@ -5145,6 +5175,180 @@ async function getActiveAnchorReferenceAttachment(project, targetLayer, excludeU
   }
 }
 
+// ---------------------------------------------------------------------------
+// Layer-to-layer awareness helpers (M1 siblings, M2 empty floor, M3 overlap,
+// D1/D2 measured connection geometry).
+// ---------------------------------------------------------------------------
+
+// M2: a trait that comes back below this fraction of opaque canvas is treated as
+// a failed/blank generation (the blank-neckwear class). Backgrounds are exempt.
+const MIN_TRAIT_COVERAGE = 0.004;
+
+function isTraitTooEmpty(analysis, isBackground) {
+  if (isBackground || !analysis) {
+    return false;
+  }
+  if (analysis.emptyAlpha) {
+    return true;
+  }
+  const coverage = Number(analysis.alphaCoverage);
+  return Number.isFinite(coverage) && coverage < MIN_TRAIT_COVERAGE;
+}
+
+// M1: selected variant PNGs of already-committed sibling trait layers, so a new
+// trait can SEE the other traits already on the body (enables overlap awareness
+// and prevents redrawing them). Backgrounds, accents, the base and the anchor
+// are excluded, blank siblings are skipped, and the list is capped to bound cost.
+async function getSiblingReferenceAttachments(project, layer, excludeUrls = [], max = 3) {
+  const blocked = new Set(excludeUrls.map((value) => cleanText(value)).filter(Boolean));
+  const out = [];
+  for (const sibling of Array.isArray(project.layers) ? project.layers : []) {
+    if (out.length >= max) break;
+    if (sibling.id === layer.id) continue;
+    if (
+      isPrimaryBaseLayerName(sibling.name) ||
+      isFullCanvasBackgroundLayerName(sibling.name) ||
+      isBackgroundAccentLayerName(sibling.name)
+    ) {
+      continue;
+    }
+    const variant =
+      (sibling.variants || []).find((item) => item.id === sibling.selectedVariantId) || (sibling.variants || [])[0];
+    const imageUrl = cleanText(variant?.imageUrl);
+    if (!imageUrl || blocked.has(imageUrl)) continue;
+    // Skip blank/near-blank siblings — they teach the model nothing.
+    if (variant?.analysis && isTraitTooEmpty(variant.analysis, false)) continue;
+    try {
+      const fileBuffer = await fs.readFile(publicAssetUrlToAbsolutePath(imageUrl));
+      out.push({
+        id: cleanText(variant.id) || createId("sibling-ref"),
+        name: cleanText(variant.name) || `${sibling.name} sibling`,
+        imageUrl,
+        dataUrl: `data:image/png;base64,${fileBuffer.toString("base64")}`,
+        layerName: cleanText(sibling.name),
+        referenceType: "sibling-layer"
+      });
+      blocked.add(imageUrl);
+    } catch {
+      // Ignore a missing sibling asset.
+    }
+  }
+  return out;
+}
+
+// D2: map a trait layer to the base sub-region it attaches to, using measured
+// bands from analyzeAnchorGeometry. Falls back to the whole-body box.
+function deriveConnectionRegion(layerName, geo) {
+  if (!geo || geo.empty || !geo.boundsRatio) return null;
+  const b = geo.boundsRatio;
+  const lowered = cleanText(layerName).toLowerCase();
+  const band = (centerYRatio, widthRatio, halfHeight, label) => {
+    const cx = (b.x0 + b.x1) / 2;
+    const halfW = Math.max(0.05, widthRatio / 2);
+    return {
+      label,
+      x0: Math.max(0, cx - halfW),
+      x1: Math.min(1, cx + halfW),
+      y0: Math.max(0, centerYRatio - halfHeight),
+      y1: Math.min(1, centerYRatio + halfHeight)
+    };
+  };
+
+  if (/expression|face|eyes|eyewear|glasses|shades|goggles|visor|mouth|smile|teeth|blush/.test(lowered)) {
+    return band(geo.face.centerYRatio + 0.04, geo.face.widthRatio * 0.7, 0.1, "face / eye line");
+  }
+  if (/headwear|hat|crown|tiara|helmet|hair|headband|cap|beanie/.test(lowered)) {
+    return band(b.y0 + (geo.face.centerYRatio - b.y0) * 0.6, geo.face.widthRatio, 0.08, "top of the head dome");
+  }
+  if (/neckwear|necklace|chain|scarf|collar|tie|bandana|bib/.test(lowered)) {
+    return band(geo.neck.centerYRatio, geo.neck.widthRatio, 0.06, "neck seam (head meets body)");
+  }
+  if (/handheld|held|weapon|sword|staff|wand|tool|prop|item|orb|flower|cane|carrot|bottle/.test(lowered)) {
+    return band(geo.hand.centerYRatio, geo.hand.widthRatio * 0.6, 0.12, "hand / paw / grip area");
+  }
+  if (/outfit|clothing|clothes|shirt|hoodie|jacket|armor|torso/.test(lowered)) {
+    return band(geo.shoulder.centerYRatio + 0.08, geo.shoulder.widthRatio, 0.16, "torso / body mass");
+  }
+  return null;
+}
+
+// D1 + D2: assemble the measured-geometry payload the prompt builder turns into
+// explicit pixel anchors. Returns null when there is no usable anchor image.
+async function buildAnchorGeometryForPrompt(project, layer, anchorRef) {
+  if (!anchorRef?.dataUrl && !anchorRef?.imageUrl) return null;
+  try {
+    const buffer = anchorRef.imageUrl
+      ? await fs.readFile(publicAssetUrlToAbsolutePath(anchorRef.imageUrl))
+      : Buffer.from(String(anchorRef.dataUrl).split(",")[1] || "", "base64");
+    const geo = await assetToolService.analyzeAnchorGeometry(buffer);
+    if (!geo || geo.empty || !geo.boundsRatio) return null;
+    return {
+      canvasWidth: project.canvas?.width || geo.width || 1024,
+      canvasHeight: project.canvas?.height || geo.height || 1024,
+      bodyBounds: geo.boundsRatio,
+      connectionRegion: deriveConnectionRegion(layer.name, geo)
+    };
+  } catch {
+    return null;
+  }
+}
+
+// M3: intersection-over-union of two layers' placed bounding boxes, used to flag
+// redundant/overlapping props (e.g. a carrot+bottle handheld vs a companion item).
+function placedBoxFromVariant(layer, variant, width, height) {
+  const bounds = variant?.analysis?.bounds;
+  if (!bounds) return null;
+  const transform = getVariantPlacementTransform(layer, variant);
+  const t = normalizeLayerTransform(transform);
+  // bounds are in source-pixel space; map through scale + normalized offset to canvas space.
+  const scale = t.scale || 1;
+  const cx = (bounds.left + bounds.right) / 2;
+  const cy = (bounds.top + bounds.bottom) / 2;
+  const w = (bounds.right - bounds.left + 1) * scale;
+  const h = (bounds.bottom - bounds.top + 1) * scale;
+  const centerX = width / 2 + (cx - width / 2) * scale + t.x * width;
+  const centerY = height / 2 + (cy - height / 2) * scale + t.y * height;
+  return { x0: centerX - w / 2, x1: centerX + w / 2, y0: centerY - h / 2, y1: centerY + h / 2 };
+}
+
+function boxIoU(a, b) {
+  if (!a || !b) return 0;
+  const ix = Math.max(0, Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0));
+  const iy = Math.max(0, Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0));
+  const inter = ix * iy;
+  if (inter <= 0) return 0;
+  const areaA = (a.x1 - a.x0) * (a.y1 - a.y0);
+  const areaB = (b.x1 - b.x0) * (b.y1 - b.y0);
+  return inter / (areaA + areaB - inter);
+}
+
+const PROP_LAYER_REGEX = /handheld|held|companion|item|prop|accessory|weapon|tool/;
+
+function findPropOverlapWarnings(project) {
+  const width = Math.max(1, Number(project.canvas?.width || 1024));
+  const height = Math.max(1, Number(project.canvas?.height || 1024));
+  const props = [];
+  for (const layer of project.layers || []) {
+    if (!PROP_LAYER_REGEX.test(cleanText(layer.name).toLowerCase())) continue;
+    if (isPrimaryBaseLayerName(layer.name)) continue;
+    const variant = (layer.variants || []).find((item) => item.id === layer.selectedVariantId);
+    const box = variant ? placedBoxFromVariant(layer, variant, width, height) : null;
+    if (box) props.push({ name: layer.name, box });
+  }
+  const warnings = [];
+  for (let i = 0; i < props.length; i += 1) {
+    for (let j = i + 1; j < props.length; j += 1) {
+      const iou = boxIoU(props[i].box, props[j].box);
+      if (iou >= 0.35) {
+        warnings.push(
+          `${props[i].name} and ${props[j].name} overlap heavily (${Math.round(iou * 100)}%) — they may be redundant props.`
+        );
+      }
+    }
+  }
+  return warnings;
+}
+
 async function getChatExampleReferenceAttachments(project, layer, promptText, excludeUrls = []) {
   const matches = findChatImageReferencesForLayer(project, layer, promptText, excludeUrls);
   const attachments = [];
@@ -6307,16 +6511,22 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
   const brain = await studioBrainService.getBrain();
   const toolManifest = await studioBrainService.getToolManifest();
   const memory = await studioMemoryService.getMemory(project);
-  const plan = await openaiService.createLayerVariantPlan(apiKey, project, layer, count, memory, brain, toolManifest);
-
-  const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
-  await fs.mkdir(variantFolder, { recursive: true });
 
   const isBackground = isFullCanvasBackgroundLayerName(layer.name);
   const isBase = isPrimaryBaseLayerName(layer.name);
   const isBgAccent = isBackgroundAccentLayerName(layer.name);
   const backgroundMode = isBackground ? "opaque" : "transparent";
   const anchorRef = (!isBackground && !isBase && !isBgAccent) ? await getActiveAnchorReferenceAttachment(project, layer) : null;
+  // M1 + D1/D2: sibling references and measured connection geometry.
+  const siblingRefs = (!isBackground && !isBase && !isBgAccent)
+    ? await getSiblingReferenceAttachments(project, layer, [anchorRef?.imageUrl].filter(Boolean), 3)
+    : [];
+  const anchorGeometry = anchorRef ? await buildAnchorGeometryForPrompt(project, layer, anchorRef) : null;
+  const plan = await openaiService.createLayerVariantPlan(apiKey, project, layer, count, memory, brain, toolManifest, [], anchorGeometry);
+
+  const variantFolder = path.join(generatedDir, project.id, "layers", layer.id);
+  await fs.mkdir(variantFolder, { recursive: true });
+
   const region = layer.region || null;
   const canvasW = project.canvas?.width || 1024;
   const canvasH = project.canvas?.height || 1024;
@@ -6358,7 +6568,7 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
     const item = plan.variants[vi];
     const isFirst = vi === 0;
     const basePrompt = (isFirst && previewPromptForLayer)
-      ? openaiService.buildLayerAssetPrompt({ project, layer, promptText: previewPromptForLayer })
+      ? openaiService.buildLayerAssetPrompt({ project, layer, promptText: previewPromptForLayer, anchorGeometry })
       : item.prompt;
     const exclusionPrompt = otherLayerNames.length
       ? ` STRICT RULE: Output ONLY the ${layer.name} element. Do NOT draw, include, or reproduce ANY of these: ${otherLayerNames.join(", ")}. The reference image is ONLY for understanding scale, position, and perspective — do NOT copy its content. Draw ONLY ${layer.name} on a transparent background.`
@@ -6388,17 +6598,28 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
       : "";
     const fullPrompt = basePrompt + exclusionPrompt + regionPrompt + bodyOpeningPrompt + structuralChildPrompt + perspectivePrompt;
 
+    // M1: body anchor first, then sibling traits, as reference images.
+    const referenceImages = (anchorRef?.dataUrl && !isBackground && !isBase)
+      ? [anchorRef.dataUrl, ...siblingRefs.map((s) => s.dataUrl)].slice(0, 16)
+      : [];
+
+    // M2: generate, retry once if a trait comes back blank/near-empty.
     let imageAsset;
-    if (anchorRef?.dataUrl && !isBackground && !isBase) {
-      imageAsset = await openaiService.editImageAsset({ apiKey, prompt: fullPrompt, images: [anchorRef.dataUrl], background: "transparent", inputFidelity: "high", size: project.canvas.generationSize });
-    } else {
-      imageAsset = await openaiService.generateImageAsset({ apiKey, prompt: fullPrompt, size: project.canvas.generationSize, background: backgroundMode });
-    }
-
-    let resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
-
-    if (region && !isBackground && !isBase) {
-      resizedBuffer = await fitLayerToRegion(resizedBuffer, region, canvasW, canvasH, parentBounds);
+    let resizedBuffer = null;
+    let analysis = null;
+    const maxAttempts = isBackground ? 1 : 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (referenceImages.length) {
+        imageAsset = await openaiService.editImageAsset({ apiKey, prompt: fullPrompt, images: referenceImages, background: "transparent", inputFidelity: "high", size: project.canvas.generationSize });
+      } else {
+        imageAsset = await openaiService.generateImageAsset({ apiKey, prompt: fullPrompt, size: project.canvas.generationSize, background: backgroundMode });
+      }
+      resizedBuffer = await resizePng(imageAsset.buffer, project.canvas);
+      if (region && !isBackground && !isBase) {
+        resizedBuffer = await fitLayerToRegion(resizedBuffer, region, canvasW, canvasH, parentBounds, layer.name);
+      }
+      analysis = await inspectVariantAgainstLayer(layer, resizedBuffer);
+      if (!isTraitTooEmpty(analysis, isBackground)) break;
     }
 
     const variantId = createId("variant");
@@ -6411,10 +6632,12 @@ async function drawLayerVariantWithFullContext(project, layerId, count, apiKey) 
       notes: item.notes,
       prompt: item.prompt,
       imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
+      analysis,
       createdAt: new Date().toISOString()
     });
 
-    if (!layer.selectedVariantId) layer.selectedVariantId = variantId;
+    // M2: don't auto-select a blank/near-empty variant.
+    if (!layer.selectedVariantId && !isTraitTooEmpty(analysis, isBackground)) layer.selectedVariantId = variantId;
   }
 
   project.updatedAt = new Date().toISOString();
@@ -6830,6 +7053,11 @@ function buildHashLipsExportManifest(project, layerFolders) {
   };
 }
 
+// D3 (opt-in): when enabled, the compositor lets stored layer relationship
+// metadata (zOrderNote / attachmentType) override the index-based front/back
+// decision. Default OFF — when off, composite output is byte-identical to before.
+const DEPTH_COMPOSITE = process.env.DRAWTECH_DEPTH_COMPOSITE === "1";
+
 async function getPreviewCompositeSources(project) {
   const sources = [];
   const seen = new Set();
@@ -6850,7 +7078,9 @@ async function getPreviewCompositeSources(project) {
         layerName: cleanText(meta.layerName),
         layerIndex: Number.isFinite(meta.layerIndex) ? Number(meta.layerIndex) : -1,
         isBaseLayer: Boolean(meta.isBaseLayer),
-        analysis: meta.analysis || null
+        analysis: meta.analysis || null,
+        attachmentType: cleanText(meta.attachmentType),
+        zOrderNote: cleanText(meta.zOrderNote)
       });
       seen.add(cleanUrl);
     } catch (err) {
@@ -6866,7 +7096,9 @@ async function getPreviewCompositeSources(project) {
         layerName: layer.name,
         layerIndex: project.layers.indexOf(layer),
         isBaseLayer: isPrimaryBaseLayerName(layer.name),
-        analysis: variant.analysis || null
+        analysis: variant.analysis || null,
+        attachmentType: layer.attachmentType,
+        zOrderNote: layer.zOrderNote
       });
       const latest = sources[sources.length - 1];
       if (latest) {
@@ -6916,8 +7148,26 @@ async function buildCompositeLayers(source, width, height, baseSource = null) {
 
   const sourceIndex = Number.isFinite(source.layerIndex) ? Number(source.layerIndex) : -1;
   const baseIndex = Number.isFinite(baseSource?.layerIndex) ? Number(baseSource.layerIndex) : -1;
-  const isBehindBase = baseSource && sourceIndex !== -1 && baseIndex !== -1 && sourceIndex < baseIndex;
-  const isInFrontOfBase = baseSource && sourceIndex !== -1 && baseIndex !== -1 && sourceIndex > baseIndex;
+  let isBehindBase = baseSource && sourceIndex !== -1 && baseIndex !== -1 && sourceIndex < baseIndex;
+  let isInFrontOfBase = baseSource && sourceIndex !== -1 && baseIndex !== -1 && sourceIndex > baseIndex;
+
+  // D3 (opt-in): honor stored relationship metadata over pure array-index depth.
+  if (DEPTH_COMPOSITE && baseSource && !source.isBaseLayer) {
+    const z = cleanText(source.zOrderNote).toLowerCase();
+    const at = cleanText(source.attachmentType).toLowerCase();
+    const saysBehindBody = /behind/.test(z) && /(body|base|character|subject|vault|head)/.test(z);
+    const saysFrontBody =
+      /(in front of|front of|on top of|over the|above the)/.test(z) ||
+      ["surface-mounted", "sitting-on-top", "hanging", "inset"].includes(at);
+    if (saysBehindBody || at === "background") {
+      isBehindBase = true;
+      isInFrontOfBase = false;
+    } else if (saysFrontBody) {
+      isInFrontOfBase = true;
+      isBehindBase = false;
+    }
+  }
+
   const shouldWrapBehindBase =
     transform.depthMode === "headwear_wrap" &&
     /headwear|hat|crown|tiara/.test(cleanText(source.layerName).toLowerCase()) &&

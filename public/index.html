@@ -7,265 +7,273 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=39" />
+    <link rel="stylesheet" href="/styles.css?v=41" />
   </head>
   <body>
     <div class="app-shell">
-      <header class="topbar">
-        <div>
-          <p class="eyebrow">Prompt First NFT Builder</p>
+      <!-- ===================== APP BAR ===================== -->
+      <header class="appbar">
+        <div class="appbar-brand">
+          <span class="appbar-dot" aria-hidden="true"></span>
           <h1>Draw Tech</h1>
         </div>
 
-        <div class="topbar-actions">
-          <div id="apiKeyControls" class="topbar-key-controls">
-            <label class="mini-field">
-              <span>API key</span>
-              <input id="apiKeyInput" type="password" placeholder="sk-..." />
-            </label>
-            <button id="saveKeyBtn" class="btn btn-primary">Use Key</button>
+        <div class="appbar-actions">
+          <div class="appbar-status">
+            <span id="keyStatus" class="badge badge-warn">No key</span>
+            <span id="projectStatus" class="badge badge-project">No saved project</span>
           </div>
-          <span id="keyStatus" class="badge badge-warn">No key</span>
-          <span id="projectStatus" class="badge badge-project">No saved project</span>
-          <div class="topbar-primary-actions">
+
+          <details id="apiKeyControls" class="menu menu-key">
+            <summary class="btn btn-ghost">API Key</summary>
+            <div class="menu-panel">
+              <label class="mini-field">
+                <span>Session API key</span>
+                <input id="apiKeyInput" type="password" placeholder="sk-..." />
+              </label>
+              <button id="saveKeyBtn" class="btn btn-primary" type="button">Use Key</button>
+            </div>
+          </details>
+
+          <div class="appbar-group">
             <button id="undoBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Undo" title="Undo (Ctrl+Z)" disabled>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 14L4 9l5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 9h10a5 5 0 0 1 0 10H11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
             <button id="redoBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Redo" title="Redo (Ctrl+Y)" disabled>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 14l5-5-5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M20 9H10a5 5 0 0 0 0 10h3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
             </button>
-            <button id="saveProjectBtn" class="btn btn-ghost" type="button">Save Project</button>
-            <button id="toggleProjectShelfBtn" class="btn btn-ghost" type="button">Projects</button>
           </div>
-          <div class="topbar-secondary-actions">
-            <button id="newProjectBtn" class="btn btn-ghost" type="button">New Project</button>
-            <button id="cloneProjectBtn" class="btn btn-ghost" type="button">Clone Project</button>
-            <button id="toggleCollectionGridBtn" class="btn btn-ghost" type="button">Collection Grid</button>
-            <button id="downloadHashlipsBtn" class="btn btn-ghost">Export Layers</button>
-          </div>
+
+          <button id="toggleProjectShelfBtn" class="btn btn-ghost" type="button">Projects</button>
+          <button id="saveProjectBtn" class="btn btn-ghost" type="button">Save</button>
+          <button id="downloadHashlipsBtn" class="btn btn-primary" type="button">Export</button>
+
+          <details class="menu">
+            <summary class="btn btn-ghost btn-icon" aria-label="More actions" title="More">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6" fill="currentColor"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/><circle cx="19" cy="12" r="1.6" fill="currentColor"/></svg>
+            </summary>
+            <div class="menu-panel">
+              <button id="newProjectBtn" class="btn btn-ghost" type="button">New Project</button>
+              <button id="cloneProjectBtn" class="btn btn-ghost" type="button">Clone Project</button>
+              <button id="toggleCollectionGridBtn" class="btn btn-ghost" type="button">Collection Grid</button>
+            </div>
+          </details>
         </div>
       </header>
 
-      <section id="projectShelf" class="panel project-shelf hidden">
-        <div class="project-shelf-head">
-          <div>
-            <p class="eyebrow">Project Shelf</p>
-            <h2>Save And Reopen Builds</h2>
-          </div>
-          <button id="closeProjectShelfBtn" class="btn btn-ghost" type="button">Close</button>
-        </div>
-
-        <div class="project-shelf-grid">
-          <section class="project-current-card">
-            <p class="project-section-label">Current Project</p>
-            <label class="mini-field project-name-field">
-              <span>Project name</span>
-              <input id="projectNameInput" type="text" placeholder="Untitled NFT Collection" />
-            </label>
-            <div id="projectCurrentMeta" class="project-current-meta">
-              Save the current build, then open another one whenever you want.
-            </div>
-            <div class="project-current-actions">
-              <button id="saveProjectShelfBtn" class="btn btn-primary" type="button">Save Project</button>
-              <button id="newProjectShelfBtn" class="btn btn-ghost" type="button">New Project</button>
-            </div>
-          </section>
-
-          <section class="project-library-card">
-            <div class="project-library-head">
-              <div>
-                <p class="project-section-label">Saved Projects</p>
-                <p class="project-library-copy">Jump back into older builds anytime.</p>
+      <!-- ===================== WORKSPACE ===================== -->
+      <main class="workspace">
+        <!-- Center column: stage + composer -->
+        <section class="stage-column">
+          <article class="preview-panel">
+            <div class="panel-head">
+              <h2 id="projectTitle">New Session</h2>
+              <div class="preview-head-actions">
+                <button id="toggleFitDebugBtn" class="btn btn-ghost btn-fit-debug" type="button">Inspector</button>
+                <button id="toggleDragModeBtn" class="btn btn-ghost btn-drag-mode" type="button">Drag Layers</button>
+                <button id="refreshPreviewBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Shuffle layer variants" title="Shuffle — randomly pick one variant per layer">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M20 11a8 8 0 1 0 2 5.29" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" />
+                    <path d="M20 4v7h-7" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" />
+                  </svg>
+                </button>
+                <span id="canvasBadge" class="badge">1024 x 1024</span>
               </div>
-              <span id="projectCountBadge" class="badge">0 saved</span>
             </div>
-            <div id="projectList" class="project-list empty-state">
-              Save a project to see it here.
+
+            <div class="stage-wrap">
+              <div id="stage" class="stage">
+                <img id="previewImage" class="preview-stage-image hidden" alt="NFT preview" />
+                <div id="stageLayerStack" class="stage-layer-stack hidden" aria-hidden="true"></div>
+                <div id="stageEmpty" class="stage-empty">Type a prompt below to generate your first preview</div>
+              </div>
             </div>
-          </section>
-        </div>
-      </section>
 
-      <section class="prompt-card">
-        <div class="prompt-copy">
-          <h2>Type what you want.</h2>
-          <p>Ask for a new preview, a new layer image, or a tweak like "make me another blue background layer".</p>
-        </div>
-
-        <div class="prompt-controls">
-          <div class="canvas-inline">
-            <label class="mini-field">
-              <span>Width</span>
-              <input id="canvasWidthInput" type="number" min="256" max="4096" step="1" value="1024" />
-            </label>
-            <label class="mini-field">
-              <span>Height</span>
-              <input id="canvasHeightInput" type="number" min="256" max="4096" step="1" value="1024" />
-            </label>
-          </div>
-
-          <div class="attach-row">
-            <input id="imageUploadInput" type="file" accept="image/*" multiple class="hidden-file" />
-            <button id="attachImagesBtn" class="btn btn-ghost" type="button">Attach Images</button>
-            <div id="attachmentPreviewList" class="attachment-preview-list empty-inline">
-              No image refs attached
+            <div id="dragEditorBar" class="drag-editor-bar hidden">
+              <button id="dragUndoBtn" class="btn btn-ghost" type="button">Undo</button>
+              <div class="drag-editor-group">
+                <label class="drag-editor-label">Scale</label>
+                <button id="dragScaleDownBtn" class="btn btn-ghost btn-scale" type="button">-</button>
+                <span id="dragScaleReadout" class="badge drag-editor-readout">100%</span>
+                <button id="dragScaleUpBtn" class="btn btn-ghost btn-scale" type="button">+</button>
+              </div>
+              <div class="drag-editor-group">
+                <label class="drag-editor-label">Rotate</label>
+                <input id="dragRotateInput" class="drag-editor-input" type="number" min="-180" max="180" step="1" value="0" />
+                <span class="drag-editor-unit">&deg;</span>
+              </div>
+              <button id="saveDragBtn" class="btn btn-primary" type="button">Save</button>
             </div>
-          </div>
+          </article>
 
-          <div class="prompt-editor">
-            <textarea
-              id="promptInput"
-              rows="3"
-              placeholder="Describe what you want — a full collection preview, a new layer trait, or a tweak to an existing one. Press Ctrl+Enter to generate."
-            ></textarea>
-          </div>
-          <div class="preset-row">
-            <label class="mini-field">
-              <span>Layer preset</span>
-              <select id="layerPresetSelect">
-                <option value="">None — AI decides layers</option>
-                <option value="pfp">PFP Character (Background, Body, Outfit, Headwear, Eyewear, Mouth, Handheld)</option>
-                <option value="pixel">Pixel Art (Background, Base, Hat, Eyes, Mouth, Accessory)</option>
-                <option value="abstract">Abstract (Background, Shape Layer, Texture, Accent, Overlay)</option>
-                <option value="animal">Animal PFP (Background, Body, Fur Pattern, Headwear, Eyewear, Neckwear)</option>
-              </select>
-            </label>
-          </div>
-          <div class="prompt-submit-row">
-            <button id="sendPromptBtn" class="btn btn-primary btn-compact">Generate</button>
+          <!-- Composer dock -->
+          <div class="composer-dock">
+            <div class="composer-row">
+              <input id="imageUploadInput" type="file" accept="image/*" multiple class="hidden-file" />
+              <button id="attachImagesBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Attach reference images" title="Attach reference images">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 11.5l-8.5 8.5a5 5 0 0 1-7-7l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7L10.2 17.5a1.6 1.6 0 0 1-2.3-2.3l7.8-7.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <textarea
+                id="promptInput"
+                rows="2"
+                placeholder="Describe what you want — a full collection preview, a new layer trait, or a tweak. Ctrl+Enter to generate."
+              ></textarea>
+              <button id="sendPromptBtn" class="btn btn-primary btn-compact" type="button">Generate</button>
+            </div>
+
             <div id="loadingRail" class="loading-rail" aria-hidden="true">
               <div id="loadingFill" class="loading-fill"></div>
             </div>
+
+            <div id="attachmentPreviewList" class="attachment-preview-list empty-inline">
+              No image refs attached
+            </div>
+
+            <details class="composer-options">
+              <summary>Canvas &amp; preset options</summary>
+              <div class="composer-options-body">
+                <div class="canvas-inline">
+                  <label class="mini-field">
+                    <span>Width</span>
+                    <input id="canvasWidthInput" type="number" min="256" max="4096" step="1" value="1024" />
+                  </label>
+                  <label class="mini-field">
+                    <span>Height</span>
+                    <input id="canvasHeightInput" type="number" min="256" max="4096" step="1" value="1024" />
+                  </label>
+                </div>
+                <label class="mini-field">
+                  <span>Layer preset</span>
+                  <select id="layerPresetSelect">
+                    <option value="">None — AI decides layers</option>
+                    <option value="pfp">PFP Character (Background, Body, Outfit, Headwear, Eyewear, Mouth, Handheld)</option>
+                    <option value="pixel">Pixel Art (Background, Base, Hat, Eyes, Mouth, Accessory)</option>
+                    <option value="abstract">Abstract (Background, Shape Layer, Texture, Accent, Overlay)</option>
+                    <option value="animal">Animal PFP (Background, Body, Fur Pattern, Headwear, Eyewear, Neckwear)</option>
+                  </select>
+                </label>
+              </div>
+            </details>
+          </div>
+        </section>
+
+        <!-- Right rail: Layers / Notes -->
+        <aside class="side-rail">
+          <div class="rail-tabs">
+            <button class="rail-tab is-active" type="button" data-rail-tab="layers">Layers</button>
+            <button class="rail-tab" type="button" data-rail-tab="notes">Build Notes</button>
+          </div>
+
+          <div class="rail-pane" data-rail-pane="layers">
+            <section id="proposedLayersPanel" class="proposed-layers-panel hidden"></section>
+
+            <section class="layers-panel-shell">
+              <div class="panel-head">
+                <h2>Layers</h2>
+                <span id="layerCount" class="badge">0 layers</span>
+              </div>
+              <div class="panel-head-actions">
+                <div class="variation-controls">
+                  <button id="buildAllLayersBtn" class="btn btn-primary" type="button">Generate Variations</button>
+                  <input id="variationCountInput" type="number" min="1" max="20" value="1" class="variation-count-input" title="Variations per layer" />
+                </div>
+                <button id="resetAllPositionsBtn" class="btn btn-ghost" type="button">Fix Positions</button>
+                <button id="newLayerBtn" class="btn btn-ghost" type="button">Add Layer</button>
+              </div>
+              <div id="layersPanel" class="layer-folder-list empty-state">
+                <div class="layers-empty-guide">
+                  <p>No layers yet.</p>
+                  <p class="layers-empty-tip">Generate a preview first, then layers will appear here automatically. You can also add layers manually.</p>
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div class="rail-pane hidden" data-rail-pane="notes">
+            <section class="chat-panel">
+              <div id="chatLog" class="chat-log empty-state">
+                Send a prompt to start the session.
+              </div>
+            </section>
+          </div>
+        </aside>
+      </main>
+
+      <!-- ===================== OVERLAYS ===================== -->
+      <section id="projectShelf" class="overlay-panel overlay-center project-shelf hidden">
+        <div class="overlay-card">
+          <div class="project-shelf-head">
+            <div>
+              <p class="eyebrow">Project Shelf</p>
+              <h2>Save And Reopen Builds</h2>
+            </div>
+            <button id="closeProjectShelfBtn" class="btn btn-ghost" type="button">Close</button>
+          </div>
+
+          <div class="project-shelf-grid">
+            <section class="project-current-card">
+              <p class="project-section-label">Current Project</p>
+              <label class="mini-field project-name-field">
+                <span>Project name</span>
+                <input id="projectNameInput" type="text" placeholder="Untitled NFT Collection" />
+              </label>
+              <div id="projectCurrentMeta" class="project-current-meta">
+                Save the current build, then open another one whenever you want.
+              </div>
+              <div class="project-current-actions">
+                <button id="saveProjectShelfBtn" class="btn btn-primary" type="button">Save Project</button>
+                <button id="newProjectShelfBtn" class="btn btn-ghost" type="button">New Project</button>
+              </div>
+            </section>
+
+            <section class="project-library-card">
+              <div class="project-library-head">
+                <div>
+                  <p class="project-section-label">Saved Projects</p>
+                  <p class="project-library-copy">Jump back into older builds anytime.</p>
+                </div>
+                <span id="projectCountBadge" class="badge">0 saved</span>
+              </div>
+              <div id="projectList" class="project-list empty-state">
+                Save a project to see it here.
+              </div>
+            </section>
           </div>
         </div>
       </section>
 
-      <section class="main-grid">
-        <article class="panel preview-panel">
+      <section id="fitDebugPanel" class="overlay-panel overlay-right fit-debug-panel hidden">
+        <div class="overlay-card">
+          <div class="fit-debug-head">
+            <div>
+              <p class="eyebrow">Inspector</p>
+              <h2>Layer Fit Profiles</h2>
+            </div>
+            <button id="downloadFitDebugBtn" class="btn btn-ghost" type="button">Download JSON</button>
+          </div>
+          <div id="fitDebugSummary" class="fit-debug-summary"></div>
+          <div id="fitDebugContent" class="fit-debug-grid"></div>
+        </div>
+      </section>
+
+      <section id="collectionGridPanel" class="overlay-panel overlay-center collection-grid-panel hidden">
+        <div class="overlay-card">
           <div class="panel-head">
             <div>
-              <p class="eyebrow">Preview</p>
-              <h2 id="projectTitle">New Session</h2>
+              <p class="eyebrow">Collection Preview</p>
+              <h2>Random Combos</h2>
             </div>
-            <div class="preview-head-actions">
-              <button id="toggleFitDebugBtn" class="btn btn-ghost btn-fit-debug" type="button">Layer Inspector</button>
-              <button id="toggleDragModeBtn" class="btn btn-ghost btn-drag-mode" type="button">Drag Layers</button>
-              <button id="refreshPreviewBtn" class="btn btn-ghost btn-icon" type="button" aria-label="Shuffle layer variants" title="Shuffle — randomly pick one variant per layer">
-                <svg viewBox="0 0 24 24" aria-hidden="true">
-                  <path
-                    d="M20 11a8 8 0 1 0 2 5.29"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="1.8"
-                  />
-                  <path
-                    d="M20 4v7h-7"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="1.8"
-                  />
-                </svg>
-              </button>
-              <span id="canvasBadge" class="badge">1024 x 1024</span>
+            <div class="panel-head-actions">
+              <span id="supplyBadge" class="badge">0 combos</span>
+              <button id="reshuffleGridBtn" class="btn btn-ghost" type="button">Reshuffle</button>
+              <button id="closeCollectionGridBtn" class="btn btn-ghost" type="button">Close</button>
             </div>
           </div>
-
-          <div class="stage-wrap">
-            <div id="stage" class="stage">
-              <img id="previewImage" class="preview-stage-image hidden" alt="NFT preview" />
-              <div id="stageLayerStack" class="stage-layer-stack hidden" aria-hidden="true"></div>
-              <div id="stageEmpty" class="stage-empty">Type a prompt above to generate your first preview</div>
-            </div>
-          </div>
-
-          <div id="dragEditorBar" class="drag-editor-bar hidden">
-            <button id="dragUndoBtn" class="btn btn-ghost" type="button">Undo</button>
-            <div class="drag-editor-group">
-              <label class="drag-editor-label">Scale</label>
-              <button id="dragScaleDownBtn" class="btn btn-ghost btn-scale" type="button">-</button>
-              <span id="dragScaleReadout" class="badge drag-editor-readout">100%</span>
-              <button id="dragScaleUpBtn" class="btn btn-ghost btn-scale" type="button">+</button>
-            </div>
-            <div class="drag-editor-group">
-              <label class="drag-editor-label">Rotate</label>
-              <input id="dragRotateInput" class="drag-editor-input" type="number" min="-180" max="180" step="1" value="0" />
-              <span class="drag-editor-unit">&deg;</span>
-            </div>
-            <button id="saveDragBtn" class="btn btn-primary" type="button">Save</button>
-          </div>
-        </article>
-
-        <article class="panel chat-panel">
-          <div class="panel-head">
-            <div>
-              <p class="eyebrow">Chat Log</p>
-              <h2>Build Notes</h2>
-            </div>
-          </div>
-          <div id="chatLog" class="chat-log empty-state">
-            Send a prompt to start the session.
-          </div>
-        </article>
-      </section>
-
-      <section id="fitDebugPanel" class="panel fit-debug-panel hidden">
-        <div class="fit-debug-head">
-          <div>
-            <p class="eyebrow">Inspector</p>
-            <h2>Layer Fit Profiles</h2>
-          </div>
-          <button id="downloadFitDebugBtn" class="btn btn-ghost" type="button">Download JSON</button>
-        </div>
-        <div id="fitDebugSummary" class="fit-debug-summary"></div>
-        <div id="fitDebugContent" class="fit-debug-grid"></div>
-      </section>
-
-      <section id="collectionGridPanel" class="panel collection-grid-panel hidden">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Collection Preview</p>
-            <h2>Random Combos</h2>
-          </div>
-          <div class="panel-head-actions">
-            <span id="supplyBadge" class="badge">0 combos</span>
-            <button id="reshuffleGridBtn" class="btn btn-ghost" type="button">Reshuffle</button>
-            <button id="closeCollectionGridBtn" class="btn btn-ghost" type="button">Close</button>
-          </div>
-        </div>
-        <div id="supplyInfo" class="supply-info"></div>
-        <div id="collectionGrid" class="collection-grid"></div>
-      </section>
-
-      <section id="proposedLayersPanel" class="panel proposed-layers-panel hidden"></section>
-
-      <section class="panel layers-panel-shell">
-        <div class="panel-head">
-          <div>
-            <p class="eyebrow">Layer Stack</p>
-            <h2>Layers</h2>
-          </div>
-          <div class="panel-head-actions">
-            <div class="variation-controls">
-              <button id="buildAllLayersBtn" class="btn btn-primary" type="button">Generate Variations</button>
-              <input id="variationCountInput" type="number" min="1" max="20" value="1" class="variation-count-input" title="Variations per layer" />
-            </div>
-            <button id="resetAllPositionsBtn" class="btn btn-ghost" type="button">Fix Positions</button>
-            <button id="newLayerBtn" class="btn btn-ghost" type="button">Add Layer</button>
-            <span id="layerCount" class="badge">0 layers</span>
-          </div>
-        </div>
-        <div id="layersPanel" class="layer-folder-list empty-state">
-          <div class="layers-empty-guide">
-            <p>No layers yet.</p>
-            <p class="layers-empty-tip">Generate a preview first, then layers will appear here automatically. You can also add layers manually.</p>
-          </div>
+          <div id="supplyInfo" class="supply-info"></div>
+          <div id="collectionGrid" class="collection-grid"></div>
         </div>
       </section>
 
@@ -279,7 +287,9 @@
         </div>
       </div>
       <div id="toast" class="toast hidden"></div>
-      <script type="module" src="/app.js?v=39"></script>
+
+      <script type="module" src="/app.js?v=41"></script>
+      <script src="/shell.js?v=41"></script>
     </div>
   </body>
 </html>
