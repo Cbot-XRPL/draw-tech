@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/styles.css?v=41" />
+    <link rel="stylesheet" href="/styles.css?v=44" />
   </head>
   <body>
     <div class="app-shell">
@@ -119,9 +119,13 @@
               <textarea
                 id="promptInput"
                 rows="2"
-                placeholder="Describe what you want — a full collection preview, a new layer trait, or a tweak. Ctrl+Enter to generate."
+                placeholder="Describe your character and its swappable traits — e.g. “a chibi fox, swappable hats and eyes, holding a wand.” Ctrl+Enter to build."
               ></textarea>
-              <button id="sendPromptBtn" class="btn btn-primary btn-compact" type="button">Generate</button>
+              <button id="buildLayerFirstBtn" class="btn btn-accent btn-compact" type="button" title="Plan slots → blank base body → measure connection points on it → generate each trait isolated → seat into its slot. Cheap, no prompt bleed, genuinely swappable.">⚡ Build Layer-First</button>
+            </div>
+
+            <div class="composer-actions">
+              <span class="composer-hint">Builds this project as a fresh swappable layer stack from your prompt: a base body, then traits seated into measured connection points.</span>
             </div>
 
             <div id="loadingRail" class="loading-rail" aria-hidden="true">
@@ -133,7 +137,7 @@
             </div>
 
             <details class="composer-options">
-              <summary>Canvas &amp; preset options</summary>
+              <summary>Canvas size</summary>
               <div class="composer-options-body">
                 <div class="canvas-inline">
                   <label class="mini-field">
@@ -145,16 +149,6 @@
                     <input id="canvasHeightInput" type="number" min="256" max="4096" step="1" value="1024" />
                   </label>
                 </div>
-                <label class="mini-field">
-                  <span>Layer preset</span>
-                  <select id="layerPresetSelect">
-                    <option value="">None — AI decides layers</option>
-                    <option value="pfp">PFP Character (Background, Body, Outfit, Headwear, Eyewear, Mouth, Handheld)</option>
-                    <option value="pixel">Pixel Art (Background, Base, Hat, Eyes, Mouth, Accessory)</option>
-                    <option value="abstract">Abstract (Background, Shape Layer, Texture, Accent, Overlay)</option>
-                    <option value="animal">Animal PFP (Background, Body, Fur Pattern, Headwear, Eyewear, Neckwear)</option>
-                  </select>
-                </label>
               </div>
             </details>
           </div>
@@ -168,8 +162,6 @@
           </div>
 
           <div class="rail-pane" data-rail-pane="layers">
-            <section id="proposedLayersPanel" class="proposed-layers-panel hidden"></section>
-
             <section class="layers-panel-shell">
               <div class="panel-head">
                 <h2>Layers</h2>
@@ -177,8 +169,8 @@
               </div>
               <div class="panel-head-actions">
                 <div class="variation-controls">
-                  <button id="buildAllLayersBtn" class="btn btn-primary" type="button">Generate Variations</button>
-                  <input id="variationCountInput" type="number" min="1" max="20" value="1" class="variation-count-input" title="Variations per layer" />
+                  <button id="buildAllLayersBtn" class="btn btn-primary" type="button" title="Add fresh isolated+seated variants to each swappable slot">Add Variants</button>
+                  <input id="variationCountInput" type="number" min="1" max="8" value="1" class="variation-count-input" title="Variants per slot" />
                 </div>
                 <button id="resetAllPositionsBtn" class="btn btn-ghost" type="button">Fix Positions</button>
                 <button id="newLayerBtn" class="btn btn-ghost" type="button">Add Layer</button>
@@ -186,7 +178,7 @@
               <div id="layersPanel" class="layer-folder-list empty-state">
                 <div class="layers-empty-guide">
                   <p>No layers yet.</p>
-                  <p class="layers-empty-tip">Generate a preview first, then layers will appear here automatically. You can also add layers manually.</p>
+                  <p class="layers-empty-tip">Type a description above and hit ⚡ Build Layer-First — a base body plus swappable trait slots will appear here.</p>
                 </div>
               </div>
             </section>
@@ -288,8 +280,8 @@
       </div>
       <div id="toast" class="toast hidden"></div>
 
-      <script type="module" src="/app.js?v=41"></script>
-      <script src="/shell.js?v=41"></script>
+      <script type="module" src="/app.js?v=44"></script>
+      <script src="/shell.js?v=44"></script>
     </div>
   </body>
 </html>

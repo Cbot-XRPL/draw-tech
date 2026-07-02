@@ -55,7 +55,7 @@ const elements = {
   promptInput: document.getElementById("promptInput"),
   loadingRail: document.getElementById("loadingRail"),
   loadingFill: document.getElementById("loadingFill"),
-  sendPromptBtn: document.getElementById("sendPromptBtn"),
+  buildLayerFirstBtn: document.getElementById("buildLayerFirstBtn"),
   toggleFitDebugBtn: document.getElementById("toggleFitDebugBtn"),
   toggleDragModeBtn: document.getElementById("toggleDragModeBtn"),
   saveDragBtn: document.getElementById("saveDragBtn"),
@@ -88,8 +88,6 @@ const elements = {
   closeCollectionGridBtn: document.getElementById("closeCollectionGridBtn"),
   supplyBadge: document.getElementById("supplyBadge"),
   supplyInfo: document.getElementById("supplyInfo"),
-  layerPresetSelect: document.getElementById("layerPresetSelect"),
-  proposedLayersPanel: document.getElementById("proposedLayersPanel"),
   layersPanel: document.getElementById("layersPanel"),
   buildAllLayersBtn: document.getElementById("buildAllLayersBtn"),
   variationCountInput: document.getElementById("variationCountInput"),
@@ -180,14 +178,54 @@ elements.imageUploadInput.addEventListener("change", async () => {
   elements.imageUploadInput.value = "";
 });
 
-elements.sendPromptBtn.addEventListener("click", async () => {
-  await submitPrompt();
-});
+// The prompt box drives the layer-first build — the single generation entry point.
+async function runLayerFirstBuild() {
+  if (state.busy) return;
+  if (!state.project?.id) { showToast("No project open.", true); return; }
+  const prompt = elements.promptInput.value.trim()
+    || state.project.artDirection
+    || state.project.title
+    || "";
+  if (!prompt) {
+    showToast("Describe what to build first (type it in the box).", true);
+    elements.promptInput.focus();
+    return;
+  }
+  const confirmed = await confirmAction(
+    `Rebuild "${state.project.title}" as a fresh layer-first stack from:\n\n“${prompt}”\n\nThis replaces the current layers with a new swappable base + traits. Uses your API key (~6–12 image gens).`,
+    { confirmLabel: "Build Layer-First", confirmClass: "btn-primary" }
+  );
+  if (!confirmed) return;
+
+  state.busy = true;
+  syncBusyState();
+  showToast("Planning slots → base body → connection points → isolated traits…");
+  try {
+    const response = await api(`/api/projects/${state.project.id}/build-layer-first`, {
+      method: "POST",
+      body: { prompt }
+    });
+    await applyProject(response.project);
+    elements.promptInput.value = "";
+    render();
+    const s = response.stats || {};
+    const warn = (response.warnings || []).length ? ` (${response.warnings.length} warning${response.warnings.length === 1 ? "" : "s"})` : "";
+    showToast(`Layer-first build done — ${s.imageGens || 0} image gens + ${s.visionCalls || 0} vision calls.${warn}`);
+  } catch (error) {
+    showToast(`Layer-first build failed: ${error.message}`, true);
+  } finally {
+    state.busy = false;
+    syncBusyState();
+    render();
+  }
+}
+
+elements.buildLayerFirstBtn.addEventListener("click", runLayerFirstBuild);
 
 document.addEventListener("keydown", async (e) => {
   if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && document.activeElement === elements.promptInput) {
     e.preventDefault();
-    await submitPrompt();
+    await runLayerFirstBuild();
   }
   if (e.key === "z" && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
     e.preventDefault();
@@ -332,13 +370,6 @@ window.addEventListener("pointerup", handleStageLayerPointerUp);
 window.addEventListener("pointercancel", handleStageLayerPointerUp);
 window.addEventListener("keydown", handleDragModeKeyDown);
 
-elements.promptInput.addEventListener("keydown", async (event) => {
-  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
-    event.preventDefault();
-    await submitPrompt();
-  }
-});
-
 elements.promptInput.addEventListener("paste", async (event) => {
   const files = extractImageFilesFromClipboard(event.clipboardData);
   if (!files.length) {
@@ -385,51 +416,56 @@ elements.downloadFitDebugBtn.addEventListener("click", async () => {
   }
 });
 
+// Add Variants: layer-first only. Adds isolated+seated variants to each swappable
+// slot (and fresh scenes to backgrounds). Base + non-slot layers are skipped.
 elements.buildAllLayersBtn.addEventListener("click", async () => {
   if (!state.project?.id) { showToast("No project open.", true); return; }
   const allLayers = state.project.layers || [];
+  const eligible = allLayers.filter((l) => l.connectionSlot?.box || l.layerRole === "background");
+  const skipped = allLayers.length - eligible.length;
 
-  if (!allLayers.length) {
-    showToast("Approve a layer plan first.", true);
+  if (!eligible.length) {
+    showToast("No swappable slots yet — build a character with ⚡ Build Layer-First first.", true);
     return;
   }
 
-  const count = Math.max(1, Math.min(20, Number(elements.variationCountInput.value) || 1));
+  const count = Math.max(1, Math.min(8, Number(elements.variationCountInput.value) || 1));
   const confirmed = await confirmAction(
-    `Generate ${count} new variation${count === 1 ? "" : "s"} for each of ${allLayers.length} layers? This uses your API key and may take a while.`,
-    { confirmLabel: "Generate", confirmClass: "btn-primary" }
+    `Add ${count} new variant${count === 1 ? "" : "s"} to each of ${eligible.length} swappable ${eligible.length === 1 ? "slot" : "slots"}?${skipped ? ` (${skipped} non-slot layer${skipped === 1 ? "" : "s"} skipped.)` : ""} Uses your API key.`,
+    { confirmLabel: "Add Variants", confirmClass: "btn-primary" }
   );
   if (!confirmed) return;
 
   state.busy = true;
   syncBusyState();
-  let generated = 0;
+  let done = 0;
+  let addedTotal = 0;
   const errors = [];
-  const layerIds = allLayers.map((l) => ({ id: l.id, name: l.name }));
+  const layerIds = eligible.map((l) => ({ id: l.id, name: l.name }));
   for (const { id, name } of layerIds) {
     try {
-      showToast(`Generating ${name} variations... (${generated + 1}/${layerIds.length})`);
-      const response = await api(`/api/projects/${state.project.id}/layers/${id}/variants`, {
+      showToast(`Adding ${name} variants... (${done + 1}/${layerIds.length})`);
+      const response = await api(`/api/projects/${state.project.id}/layers/${id}/seat-variants`, {
         method: "POST",
         body: { count }
       });
       await applyProject(response.project);
       render();
-      generated++;
+      addedTotal += (response.variants || []).length;
+      done++;
     } catch (error) {
       errors.push(`${name}: ${error.message}`);
-      showToast(`Failed on ${name}: ${error.message}`, true);
     }
   }
   state.busy = false;
   syncBusyState();
   render();
-  if (errors.length && !generated) {
-    showToast(`All layers failed. ${errors[0]}`, true);
+  if (errors.length && !done) {
+    showToast(`All slots failed. ${errors[0]}`, true);
   } else if (errors.length) {
-    showToast(`Generated for ${generated} layer${generated === 1 ? "" : "s"}, ${errors.length} failed.`, true);
+    showToast(`Added ${addedTotal} variant${addedTotal === 1 ? "" : "s"} across ${done} slot${done === 1 ? "" : "s"}, ${errors.length} failed.`, true);
   } else {
-    showToast(`Generated ${count} variation${count === 1 ? "" : "s"} for ${generated} layers.`);
+    showToast(`Added ${addedTotal} variant${addedTotal === 1 ? "" : "s"} across ${done} slot${done === 1 ? "" : "s"}.`);
   }
 });
 
@@ -608,57 +644,6 @@ async function createNewProject() {
   });
 }
 
-async function submitPrompt(options = {}) {
-  let prompt = resolvePromptForSubmit(options);
-  if (!prompt) {
-    showToast("Type a prompt first or rerun a previous one.", true);
-    return;
-  }
-
-  const preset = elements.layerPresetSelect.value;
-  if (preset) {
-    const presetLayers = getPresetLayers(preset);
-    if (presetLayers) {
-      prompt += ` Use these layers in this order: ${presetLayers.join(", ")}.`;
-    }
-    elements.layerPresetSelect.value = "";
-  }
-
-  await withBusy(async () => {
-    showChatLoading(prompt);
-    try {
-      const response = await api("/api/chat", {
-        method: "POST",
-        body: {
-          projectId: state.project?.id || null,
-          prompt,
-          canvas: readCanvas(),
-          attachmentIds: state.pendingAttachments.map((item) => item.id)
-        }
-      });
-
-      state.lastFailedPrompt = null;
-      await applyProject(response.project);
-      if (!options.preservePrompt) {
-        elements.promptInput.value = "";
-      }
-      state.pendingAttachments = [];
-      render();
-
-      const warns = response.qualityWarnings || [];
-      if (warns.length) {
-        showToast(`${response.assistantReply || "Done."}\n⚠ ${warns.join(" • ")}`, true);
-      } else {
-        showToast(response.assistantReply || "Done.");
-      }
-    } catch (error) {
-      state.lastFailedPrompt = prompt;
-      hideChatLoading();
-      throw error;
-    }
-  });
-}
-
 async function uploadAttachmentFiles(files, successMessage = "Image refs attached.") {
   const uploadFiles = Array.from(files || []).filter((file) => String(file?.type || "").startsWith("image/"));
   if (!uploadFiles.length) {
@@ -707,7 +692,6 @@ function render() {
   renderChat();
   renderFitDebug();
   renderCollectionGrid();
-  renderProposedLayers();
   renderLayers();
   syncBusyState();
 }
@@ -858,23 +842,17 @@ function renderChat() {
   if (!messages.length && !state.busy) {
     elements.chatLog.className = "chat-log empty-state";
     elements.chatLog.innerHTML = `<div class="chat-empty-guide">
-      <p>Send a prompt to start building.</p>
-      <p class="chat-empty-tips">Try something like:<br>"Make me a cyber frog NFT with layered traits"<br>"Generate a full preview of a pixel art robot collection"</p>
+      <p>Describe your character, then hit ⚡ Build Layer-First.</p>
+      <p class="chat-empty-tips">Try something like:<br>"a chibi cyber frog, swappable hats and eyes, holding a boba tea"<br>"a pixel-art robot mascot with swappable visors and chest plates"</p>
     </div>`;
     return;
   }
 
   elements.chatLog.className = "chat-log";
-  let previewCounter = 0;
   elements.chatLog.innerHTML = messages
-    .map(
-      (message) => {
-        if (message.generatedImage?.type === "preview" || (!message.generatedImage?.type && !message.generatedImage?.targetLayerName && message.generatedImage?.imageUrl)) {
-          previewCounter++;
-        }
-        const generatedTargetLayerName = resolveGeneratedTargetLayerName(message.generatedImage);
-        const timestamp = message.createdAt ? formatChatTimestamp(message.createdAt) : "";
-        return `
+    .map((message) => {
+      const timestamp = message.createdAt ? formatChatTimestamp(message.createdAt) : "";
+      return `
         <article class="chat-entry ${message.role === "user" ? "user" : "assistant"}">
           <div class="chat-entry-head">
             <div class="chat-role">${escapeHtml(message.role === "draw-tech" ? "Draw-Tech" : message.role)}</div>
@@ -887,7 +865,7 @@ function renderChat() {
                 <div class="generated-card">
                   <img class="generated-preview" src="${message.generatedImage.imageUrl}" alt="${escapeHtml(message.generatedImage.name || "Generated image")}" />
                   <div class="generated-meta">
-                    <div class="generated-name">${escapeHtml(message.generatedImage.name || (message.generatedImage.type === "preview" ? `Preview ${previewCounter}` : "Draft"))}</div>
+                    <div class="generated-name">${escapeHtml(message.generatedImage.name || "Image")}</div>
                     <div
                       class="generated-notes"
                       title="${escapeHtml(message.generatedImage.notes || message.generatedImage.prompt || "")}"
@@ -901,29 +879,6 @@ function renderChat() {
                       >
                         View Full
                       </button>
-                      ${
-                        message.generatedImage.type === "preview" || (!message.generatedImage.targetLayerName && message.generatedImage.imageUrl?.includes("/preview/"))
-                          ? `<button
-                              class="btn btn-ghost"
-                              data-action="rebuild-from-preview"
-                              data-preview-id="${escapeHtml(message.generatedImage.id)}"
-                            >
-                              Rebuild Layers
-                            </button>`
-                          : ""
-                      }
-                      ${
-                        message.generatedImage.type === "draft" && message.generatedImage.status !== "committed"
-                          ? `<button
-                              class="btn btn-ghost"
-                              data-action="commit-draft"
-                              data-draft-id="${message.generatedImage.id}"
-                              data-layer-name="${escapeHtml(generatedTargetLayerName)}"
-                            >
-                              Add To ${escapeHtml(generatedTargetLayerName || "Layer")}
-                            </button>`
-                          : ""
-                      }
                     </div>
                   </div>
                 </div>
@@ -942,18 +897,8 @@ function renderChat() {
           }
         </article>
       `;
-      }
-    )
+    })
     .join("");
-
-  if (state.lastFailedPrompt) {
-    elements.chatLog.insertAdjacentHTML("beforeend", `
-      <article class="chat-entry chat-entry-error">
-        <div class="chat-role">Error</div>
-        <div class="chat-text">Generation failed. <button class="btn btn-ghost btn-retry" data-action="retry-prompt">Retry</button></div>
-      </article>
-    `);
-  }
 
   bindChatActions();
 }
@@ -1164,126 +1109,6 @@ function bindCollectionGridActions() {
   });
 }
 
-function renderProposedLayers() {
-  const proposed = state.project?.proposedLayers || [];
-
-  if (!proposed.length) {
-    elements.proposedLayersPanel.classList.add("hidden");
-    return;
-  }
-
-  elements.proposedLayersPanel.classList.remove("hidden");
-  elements.proposedLayersPanel.innerHTML = `
-    <div class="proposed-layers-head">
-      <div>
-        <p class="eyebrow">Layer Plan</p>
-        <h2>Proposed Layers</h2>
-        <p class="proposed-layers-copy">Review these layers before building. Keep chatting to add, remove, or change them.</p>
-      </div>
-    </div>
-    <div class="proposed-layers-list">
-      ${proposed.map((layer, i) => `
-        <div class="proposed-layer-card">
-          <div class="proposed-layer-info">
-            <strong>${escapeHtml(layer.name)}</strong>
-            ${layer.description ? `<p class="proposed-layer-desc">${escapeHtml(layer.description)}</p>` : ""}
-            ${layer.variantIdeas?.length ? `<p class="proposed-layer-ideas">Ideas: ${escapeHtml(layer.variantIdeas.join(", "))}</p>` : ""}
-            ${layer.region ? `<p class="proposed-layer-region">Region: ${layer.region.x},${layer.region.y} ${layer.region.width}x${layer.region.height}px • Stack #${layer.stackOrder ?? i}</p>` : ""}
-            ${layer.previewGenerationPrompt ? `<details class="proposed-layer-prompt-details"><summary>Generation Prompt</summary><p class="proposed-layer-prompt">${escapeHtml(layer.previewGenerationPrompt)}</p></details>` : ""}
-          </div>
-          <button class="btn btn-ghost btn-compact" data-action="remove-proposed" data-index="${i}">Remove</button>
-        </div>
-      `).join("")}
-    </div>
-    <div class="proposed-layers-actions">
-      <button class="btn btn-primary" id="approvePlanBtn" type="button">Redraw All Layers</button>
-      ${state.project?.styleGuide && !state.project?.lockedStyleGuide
-        ? `<button class="btn btn-ghost" id="lockStyleBtn" type="button">Lock Style Guide</button>`
-        : state.project?.lockedStyleGuide
-          ? `<span class="badge">Style Locked</span>`
-          : ""}
-      <p class="proposed-layers-hint">Or keep chatting to adjust the plan first.</p>
-    </div>
-  `;
-
-  elements.proposedLayersPanel.querySelector("#approvePlanBtn")?.addEventListener("click", async () => {
-    if (!state.project?.id) return;
-
-    const allLayers = state.project.layers || [];
-    const confirmed = await confirmAction(
-      `Redraw all ${allLayers.length} layers from the preview? This uses your API key.`,
-      { confirmLabel: "Redraw All", confirmClass: "btn-primary" }
-    );
-    if (!confirmed) return;
-
-    state.busy = true;
-    syncBusyState();
-    try {
-      const approveResponse = await api(`/api/projects/${state.project.id}/approve-plan`, { method: "POST" });
-      await applyProject(approveResponse.project);
-      render();
-      showToast("Redrawing all layers from preview...");
-
-      const layers = sortLayersForBuild(state.project.layers || []);
-      const layerIds = layers.map((l) => ({ id: l.id, name: l.name }));
-      let generated = 0;
-      const errors = [];
-
-      for (const { id, name } of layerIds) {
-        try {
-          showToast(`Drawing ${name}... (${generated + 1}/${layerIds.length})`);
-          const response = await api(`/api/projects/${state.project.id}/layers/${id}/variants`, {
-            method: "POST",
-            body: { count: 1 }
-          });
-          await applyProject(response.project);
-          render();
-          generated++;
-        } catch (error) {
-          errors.push(`${name}: ${error.message}`);
-        }
-      }
-
-      if (errors.length && !generated) {
-        showToast(`Failed to draw layers. ${errors[0]}`, true);
-      } else if (errors.length) {
-        showToast(`Drew ${generated} layers, ${errors.length} failed.`, true);
-      } else {
-        showToast(`All ${generated} layers drawn from preview.`);
-      }
-    } catch (error) {
-      showToast(error.message || "Failed to approve plan.", true);
-    } finally {
-      state.busy = false;
-      syncBusyState();
-      render();
-    }
-  });
-
-  elements.proposedLayersPanel.querySelector("#lockStyleBtn")?.addEventListener("click", async () => {
-    if (!state.project?.id || !state.project?.styleGuide) return;
-    await withBusy(async () => {
-      const response = await api(`/api/projects/${state.project.id}/lock-style`, {
-        method: "POST",
-        body: { styleGuide: state.project.styleGuide }
-      });
-      await applyProject(response.project);
-      render();
-      showToast("Style guide locked. All future generations will match this style.");
-    });
-  });
-
-  elements.proposedLayersPanel.querySelectorAll("[data-action='remove-proposed']").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const idx = Number(btn.dataset.index);
-      if (!state.project?.proposedLayers) return;
-      state.project.proposedLayers.splice(idx, 1);
-      render();
-      showToast("Removed proposed layer.");
-    });
-  });
-}
-
 function renderLayers() {
   const layers = state.project?.layers || [];
   elements.layerCount.textContent = `${layers.length} layer${layers.length === 1 ? "" : "s"}`;
@@ -1455,14 +1280,16 @@ function renderLayers() {
                 : `<div class="empty-state">No images in this layer folder yet.</div>`
             }
             <div class="folder-footer">
-              <button
+              ${layer.layerRole === "base"
+                ? `<span class="folder-footer-note">Base body — rebuild with ⚡ Build Layer-First to change it.</span>`
+                : `<button
                 class="btn btn-primary btn-gen-variants"
                 data-action="generate-layer-variants"
                 data-layer-id="${layer.id}"
                 data-layer-name="${escapeHtml(layer.name)}"
               >
-                Generate Variants
-              </button>
+                + Add Variant
+              </button>`}
               <label class="btn btn-ghost btn-upload-variant">
                 Upload PNG
                 <input type="file" accept="image/png,image/webp,image/jpeg" class="hidden-file"
@@ -1755,24 +1582,26 @@ function bindLayerActions() {
     button.addEventListener("click", async () => {
       const layerId = button.dataset.layerId;
       const layerName = button.dataset.layerName || "layer";
-      const count = Math.max(1, Math.min(20, Number(elements.variationCountInput.value) || 1));
+      const count = Math.max(1, Math.min(8, Number(elements.variationCountInput.value) || 1));
       const confirmed = await confirmAction(
-        `Generate ${count} new variation${count === 1 ? "" : "s"} for ${layerName}? This uses your API key.`,
-        { confirmLabel: "Generate", confirmClass: "btn-primary" }
+        `Add ${count} new variant${count === 1 ? "" : "s"} to ${layerName}? This generates isolated traits and seats them into the slot. Uses your API key.`,
+        { confirmLabel: "Add Variants", confirmClass: "btn-primary" }
       );
       if (!confirmed) return;
 
       state.busy = true;
       syncBusyState();
       try {
-        showToast(`Generating ${layerName} variations...`);
-        const response = await api(`/api/projects/${state.project.id}/layers/${layerId}/variants`, {
+        showToast(`Adding ${layerName} variants...`);
+        const response = await api(`/api/projects/${state.project.id}/layers/${layerId}/seat-variants`, {
           method: "POST",
           body: { count }
         });
         await applyProject(response.project);
         render();
-        showToast(`Generated ${response.variants?.length || 0} ${layerName} variants.`);
+        const warn = (response.warnings || []).length ? ` (${response.warnings.length} skipped)` : "";
+        const n = response.variants?.length || 0;
+        showToast(`Added ${n} ${layerName} variant${n === 1 ? "" : "s"}.${warn}`);
       } catch (error) {
         showToast(`Failed: ${error.message}`, true);
       } finally {
@@ -1807,89 +1636,6 @@ function bindLayerActions() {
 }
 
 function bindChatActions() {
-  elements.chatLog.querySelectorAll("[data-action='commit-draft']").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await withBusy(async () => {
-        const response = await api(`/api/projects/${state.project.id}/drafts/${button.dataset.draftId}/commit`, {
-          method: "POST",
-          body: { layerName: button.dataset.layerName || "" }
-        });
-        await applyProject(response.project);
-        render();
-        showToast(`Draft added to ${response.layer?.name || "layer"}.`);
-      });
-    });
-  });
-
-  elements.chatLog.querySelectorAll("[data-action='retry-prompt']").forEach((button) => {
-    button.addEventListener("click", async () => {
-      if (!state.lastFailedPrompt) return;
-      const prompt = state.lastFailedPrompt;
-      state.lastFailedPrompt = null;
-      elements.promptInput.value = prompt;
-      await submitPrompt({ preservePrompt: true });
-    });
-  });
-
-  elements.chatLog.querySelectorAll("[data-action='rebuild-from-preview']").forEach((button) => {
-    button.addEventListener("click", async () => {
-      if (!state.project?.id) return;
-      const previewId = button.dataset.previewId;
-
-      state.busy = true;
-      syncBusyState();
-      try {
-        // Step 1: Rebuild plan + create folders from this preview
-        showToast("Rebuilding layer plan from preview...");
-        const response = await api(`/api/projects/${state.project.id}/rebuild-layers-from-preview`, {
-          method: "POST",
-          body: { previewId, proposeOnly: false }
-        });
-        await applyProject(response.project);
-        render();
-
-        // Step 2: Draw 1 image per layer
-        const layers = sortLayersForBuild(state.project.layers || []);
-        const layerIds = layers.map((l) => ({ id: l.id, name: l.name }));
-        let drawn = 0;
-
-        for (const { id, name } of layerIds) {
-          try {
-            showToast(`Drawing ${name}... (${drawn + 1}/${layerIds.length})`);
-            const varResponse = await api(`/api/projects/${state.project.id}/layers/${id}/variants`, {
-              method: "POST",
-              body: { count: 1 }
-            });
-            await applyProject(varResponse.project);
-            render();
-            drawn++;
-          } catch (err) {
-            console.warn(`Failed to draw ${name}:`, err.message);
-          }
-        }
-
-        // Step 3: Re-read project to get proposedLayers back for display
-        const freshProject = await api(`/api/projects/${state.project.id}`);
-        await applyProject(freshProject.project || freshProject);
-        // Restore proposedLayers for the UI panel (they got cleared by rebuild)
-        if (!(state.project.proposedLayers || []).length) {
-          state.project.proposedLayers = layers.map((l) => ({
-            name: l.name, description: l.description, region: l.region,
-            stackOrder: l.stackOrder, previewGenerationPrompt: l.previewGenerationPrompt,
-            parentLayer: l.parentLayer, interactionDescription: l.interactionDescription
-          }));
-        }
-        render();
-        showToast(`Rebuilt ${drawn} layers from preview.`);
-      } catch (error) {
-        showToast(error.message || "Rebuild failed.", true);
-      } finally {
-        state.busy = false;
-        syncBusyState();
-      }
-    });
-  });
-
   elements.chatLog.querySelectorAll("[data-action='view-in-stage']").forEach((button) => {
     button.addEventListener("click", () => {
       const imageUrl = button.dataset.imageUrl;
@@ -2632,23 +2378,6 @@ async function savePendingDragTransforms() {
   }
 }
 
-function resolvePromptForSubmit(options = {}) {
-  const typedPrompt = elements.promptInput.value.trim();
-  if (typedPrompt) {
-    return typedPrompt;
-  }
-
-  if (!options.rerunLatest) {
-    return "";
-  }
-
-  const latestUserMessage = [...(state.project?.chatHistory || [])]
-    .reverse()
-    .find((message) => message.role === "user" && String(message.text || "").trim());
-
-  return String(latestUserMessage?.text || "").trim();
-}
-
 function extractImageFilesFromClipboard(clipboardData) {
   if (!clipboardData) {
     return [];
@@ -2864,27 +2593,6 @@ function confirmAction(message, { confirmLabel = "Delete", confirmClass = "btn-d
   });
 }
 
-function sortLayersForBuild(layers) {
-  const lowName = (l) => (l.name || "").toLowerCase();
-  return [...layers].sort((a, b) => {
-    const aName = lowName(a);
-    const bName = lowName(b);
-    const aScore = /background/.test(aName) ? 0 : /(base|body|character|avatar)/.test(aName) ? 1 : 2;
-    const bScore = /background/.test(bName) ? 0 : /(base|body|character|avatar)/.test(bName) ? 1 : 2;
-    return aScore - bScore;
-  });
-}
-
-function getPresetLayers(preset) {
-  const presets = {
-    pfp: ["Background", "Body", "Outfit", "Headwear", "Eyewear", "Mouth", "Handheld"],
-    pixel: ["Background", "Base", "Hat", "Eyes", "Mouth", "Accessory"],
-    abstract: ["Background", "Shape Layer", "Texture", "Accent", "Overlay"],
-    animal: ["Background", "Body", "Fur Pattern", "Headwear", "Eyewear", "Neckwear"]
-  };
-  return presets[preset] || null;
-}
-
 function formatChatTimestamp(value) {
   const date = new Date(value || "");
   if (Number.isNaN(date.getTime())) return "";
@@ -2892,25 +2600,6 @@ function formatChatTimestamp(value) {
     hour: "numeric",
     minute: "2-digit"
   }).format(date);
-}
-
-function showChatLoading(promptText) {
-  const el = document.getElementById("chatLoadingIndicator");
-  if (el) el.remove();
-  elements.chatLog.insertAdjacentHTML("beforeend", `
-    <article id="chatLoadingIndicator" class="chat-entry chat-entry-loading">
-      <div class="chat-role">Draw-Tech</div>
-      <div class="chat-text chat-loading-text">
-        <span class="chat-loading-dots"></span> Working on it...
-      </div>
-    </article>
-  `);
-  elements.chatLog.scrollTop = elements.chatLog.scrollHeight;
-}
-
-function hideChatLoading() {
-  const el = document.getElementById("chatLoadingIndicator");
-  if (el) el.remove();
 }
 
 function showToast(message, isError = false) {

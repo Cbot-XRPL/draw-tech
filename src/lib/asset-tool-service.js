@@ -91,8 +91,11 @@ async function analyzeAnchorGeometry(buffer) {
     return { width, height, bounds: null, empty: true };
   }
 
-  // Width of opaque content per row (in px) across the body's vertical span.
+  // Width of opaque content per row (in px) across the body's vertical span, plus the
+  // left/right opaque edge per row (used to detect a raised paw / held-item hand).
   const rowWidth = [];
+  const leftEdge = [];
+  const rightEdge = [];
   for (let y = bounds.top; y <= bounds.bottom; y += 1) {
     let lo = -1;
     let hi = -1;
@@ -103,6 +106,8 @@ async function analyzeAnchorGeometry(buffer) {
       }
     }
     rowWidth.push(hi === -1 ? 0 : hi - lo + 1);
+    leftEdge.push(lo);
+    rightEdge.push(hi);
   }
 
   const bodyTop = bounds.top;
@@ -142,6 +147,38 @@ async function analyzeAnchorGeometry(buffer) {
   const neckHi = Math.round(shoulder.y - bodyH * 0.02);
   const neck = neckHi > neckLo ? narrowestIn(neckLo, neckHi) : { y: Math.round(bodyTop + bodyH * 0.45), w: face.w };
 
+  // Raised paw / held-item hand: when one paw is raised to hold a staff/wand, the body
+  // becomes ASYMMETRIC — that side's edge reaches farther from the body center than the
+  // other side does. (Comparing against the shoulder edge is unreliable: the raised arm
+  // pulls the "widest row" into the arm zone, contaminating the reference.) Scan the
+  // upper-torso band for the row of strongest left/right asymmetry; the sign tells the
+  // side. If the body stays symmetric (arms down), fall back to the low side-paw guess.
+  // Search only the chest band just below the neck seam, where a holding paw sits — low
+  // enough to skip the head/ears, high enough to skip a curling tail or splayed legs
+  // lower down (both of which also break left/right symmetry).
+  const idxAt = (yPx) => Math.max(0, Math.min(leftEdge.length - 1, Math.round(yPx) - bodyTop));
+  const cxPx = (bounds.left + bounds.right) / 2;
+  const bandLo = idxAt(neck.y);
+  const bandHi = idxAt(neck.y + bodyH * 0.15);
+  let handInfo = null;
+  {
+    let best = { asym: 0, x: null, y: null, side: null };
+    for (let i = Math.min(bandLo, bandHi); i <= Math.max(bandLo, bandHi); i += 1) {
+      const lo = leftEdge[i];
+      const hi = rightEdge[i];
+      if (lo < 0) continue;
+      const asym = (cxPx - lo) - (hi - cxPx); // >0 left reaches out; <0 right reaches out
+      if (Math.abs(asym) > Math.abs(best.asym)) {
+        best = { asym, x: asym > 0 ? lo : hi, y: bodyTop + i, side: asym > 0 ? "left" : "right" };
+      }
+    }
+    const minAsym = 0.06 * width; // the paw must break symmetry clearly to count
+    const inward = 0.035 * width; // grip sits a little inboard of the paw's outer tip
+    if (best.side && Math.abs(best.asym) >= minAsym) {
+      handInfo = { xPx: best.side === "left" ? best.x + inward : best.x - inward, yPx: best.y, side: best.side };
+    }
+  }
+
   const r = (v, dim) => Number((v / dim).toFixed(4));
   return {
     width,
@@ -157,8 +194,21 @@ async function analyzeAnchorGeometry(buffer) {
     face: { centerYRatio: r(face.y, height), widthRatio: r(face.w, width) },
     neck: { centerYRatio: r(neck.y, height), widthRatio: r(neck.w, width) },
     shoulder: { centerYRatio: r(shoulder.y, height), widthRatio: r(shoulder.w, width) },
-    // Paws/hands sit low and to the sides for a seated character.
-    hand: { centerYRatio: r(Math.round(bounds.bottom - bodyH * 0.14), height), widthRatio: r(shoulder.w, width) }
+    // Held-item hand: the detected RAISED paw when present, else a low side-paw guess.
+    hand: handInfo
+      ? {
+          centerYRatio: r(handInfo.yPx, height),
+          xRatio: r(handInfo.xPx, width),
+          widthRatio: r(Math.round((bounds.right - bounds.left) * 0.16), width),
+          raised: true,
+          side: handInfo.side
+        }
+      : {
+          centerYRatio: r(Math.round(bounds.bottom - bodyH * 0.14), height),
+          xRatio: null,
+          widthRatio: r(shoulder.w, width),
+          raised: false
+        }
   };
 }
 

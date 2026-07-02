@@ -1,14 +1,20 @@
 {
   "permissions": {
     "allow": [
-      "Bash(node -c src/server.js)",
-      "Bash(node -c src/lib/openai-service.js)",
-      "Bash(node -c public/app.js)",
-      "Bash(node -c src/lib/project-service.js)",
-      "Bash(node -e \"const p = require\\('c:/Users/codyr/OneDrive/Desktop/Code/draw-tech/data/projects/project-mnmk43zt-ofmva.json'\\); p.layers.forEach\\(l => console.log\\(l.name, '| region:', JSON.stringify\\(l.region\\)\\)\\)\")",
-      "Bash(node -e ':*)",
-      "Bash(node --check src/server.js)",
-      "Bash(node --check src/lib/openai-service.js)"
+      "Bash(node:*)",
+      "Bash(node --check:*)",
+      "Bash(node -c:*)",
+      "Bash(node -e:*)",
+      "Bash(cd:*)",
+      "Bash(npm:*)",
+      "Bash(npx:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Read(//c/Users/codyr/**)"
     ]
   }
 }

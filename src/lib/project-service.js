@@ -115,8 +115,39 @@ export function createProjectService({ projectsDir }) {
       variants: Array.isArray(layer?.variants) ? layer.variants : [],
       selectedVariantId: cleanText(typeof layer === "object" ? layer?.selectedVariantId : "") || null,
       transform: typeof layer === "object" && layer?.transform ? layer.transform : null,
+      region: typeof layer === "object" && layer?.region ? layer.region : null,
+      layerRole: cleanText(typeof layer === "object" ? layer?.layerRole : "") || null,
+      connectionSlot: normalizeConnectionSlot(typeof layer === "object" ? layer?.connectionSlot : null),
       fitContract: normalizeLayerFitContract(typeof layer === "object" ? layer?.fitContract : null),
       structuralOpening: normalizeStructuralOpening(typeof layer === "object" ? layer?.structuralOpening : null)
+    };
+  }
+
+  // Layer-first connection slot: the measured attachment zone + anchor a layer's
+  // trait variants seat into. Must survive normalization so "Add Variant" can
+  // re-seat new variants without re-running the vision pass.
+  function normalizeConnectionSlot(slot) {
+    if (!slot || typeof slot !== "object") {
+      return null;
+    }
+    const connection = cleanText(slot.connection);
+    const anchor = cleanText(slot.anchor);
+    const box = slot.box && typeof slot.box === "object" ? slot.box : null;
+    if (!connection && !box) {
+      return null;
+    }
+    const normalizedBox = box
+      ? {
+          cx: coerceNumber(box.cx),
+          cy: coerceNumber(box.cy),
+          w: coerceNumber(box.w),
+          h: coerceNumber(box.h)
+        }
+      : null;
+    return {
+      connection,
+      anchor: anchor || "center",
+      box: normalizedBox && Object.values(normalizedBox).every((value) => value !== null) ? normalizedBox : null
     };
   }
 

@@ -1,5 +1,14 @@
 import { cleanSlug, cleanText, safeJsonParse } from "./utils.js";
 
+// Framing clauses appended to layer-first generations so nothing bleeds off the
+// canvas — the seater then keeps everything inside a safe margin as well.
+const FRAMING_TRAIT = "Keep the entire object fully inside the frame with a comfortable margin of empty space around it — nothing cropped, nothing touching the image edges.";
+const FRAMING_BASE = "Frame the full body centered with clear empty space above the head and around all sides; the whole character stays fully inside the frame, not touching or cropped at any edge.";
+const appendFraming = (prompt, clause) => {
+  const base = cleanText(prompt);
+  return base ? `${base} ${clause}` : base;
+};
+
 export function createOpenAIService() {
   return {
     routeUserPrompt,
@@ -11,6 +20,9 @@ export function createOpenAIService() {
     buildLayerAssetPrompt,
     generateImageAsset,
     editImageAsset,
+    planLayerFirstCollection,
+    locateConnectionPoints,
+    planSlotVariants,
     refreshStudioMemory,
     refreshStudioBrain
   };
@@ -1047,6 +1059,189 @@ async function callOpenAIJson(apiKey, body) {
   }
 
   return safeJsonParse(extractResponseText(data));
+}
+
+// ── Layer-first pipeline ──────────────────────────────────────────────────
+// Plan a swappable layer stack: an opaque background, a blank base body, then
+// trait slots that attach to named connection points on the body. Each trait
+// variant is described in isolation so it can never bleed into the base.
+async function planLayerFirstCollection(apiKey, promptText, canvas) {
+  const width = canvas?.width || 1024;
+  const height = canvas?.height || 1024;
+  const system = [
+    "You are the planner for a LAYER-FIRST NFT character builder.",
+    "The app builds ONE front-facing character as a stack of independently swappable layers: an opaque BACKGROUND, a blank BASE BODY, then TRAIT slots that attach to specific connection points on the body.",
+    "Given the user's idea, return a build plan as JSON ONLY (no markdown).",
+    'Schema: {"title":string,"style":string,"background":{"name":string,"prompt":string},"base":{"name":string,"prompt":string},"slots":[{"name":string,"connection":string,"anchor":string,"variants":[{"name":string,"prompt":string}]}]}.',
+    "style: one shared concise art-style clause (medium, line, shading, palette, lighting) appended to every asset so all layers match visually. Contains NO subject nouns.",
+    "background.prompt: a full-canvas opaque background scene. NO character in it.",
+    "base.prompt: the bare character body — full body, front-facing, centered, sitting or standing upright, with a COMPLETELY BLANK face (NO eyes, NO nose, NO mouth) and NO hat, NO clothes, NO held items, NO accessories of any kind. Only the bare body, head and limbs. Transparent background, one isolated character, nothing else in frame.",
+    "If any slot attaches at the 'hand' connection (a held item like a wand, staff, or weapon), pose the base with ONE paw/hand clearly raised or extended forward at its side to hold it — an open gripping hand — instead of both arms hanging flat at the sides.",
+    "slots: list the swappable trait layers in BACK-TO-FRONT draw order (things behind the body first, things in front of the body last). Use 2 to 6 slots.",
+    "Each slot.connection must be EXACTLY ONE of: eyes, mouth, face, headtop, hand, chest, neck, back, feet. Pick the body connection point the trait attaches to.",
+    "Each slot.anchor must be EXACTLY ONE of: center (trait centers in its zone — eyes, mouth, chest), bottom (trait's bottom rests on the zone — hats on headtop, collars on neck, shoes on feet), top.",
+    "Each variant.prompt MUST describe ONLY that single trait floating ALONE on a transparent background, and MUST explicitly forbid drawing the body/head/face/character (e.g. 'ONLY the hat alone, NO head, NO ears, NO body, NO character'). Keep every trait isolated so it can never bleed into the base body.",
+    "DRAW AWARENESS (for correct layering): describe each trait as a COMPLETE, whole object at the SAME front-facing 3D angle as the body, drawn in full with a clear CONTACT AREA where it meets the body — a hat with a full brim that can rest on and wrap a head, a held item with a clear graspable shaft/handle for a paw to grip. Do NOT pre-cut, pre-occlude, or crop away the part that will tuck behind the body; the builder AUTOMATICALLY trims whatever sits behind the body and redraws the body's own parts (ears, fingers, hair) IN FRONT. So the art must show the trait's full form, not a half-hidden one.",
+    "Give each slot 1 to 3 swappable variants that all fit the same connection point.",
+    "Do NOT add a slot for the background or the base body — those are separate fields.",
+    `Target canvas: ${width}x${height}.`
+  ].join("\n");
+
+  const body = {
+    model: "gpt-5.4",
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      { role: "user", content: [{ type: "input_text", text: cleanText(promptText) || "a cute swappable mascot collection" }] }
+    ]
+  };
+  const plan = await callOpenAIJson(apiKey, body);
+  return normalizeLayerFirstPlan(plan);
+}
+
+function normalizeLayerFirstPlan(plan) {
+  const style = cleanText(plan?.style);
+  const withStyle = (value) => {
+    const base = cleanText(value);
+    if (!base) return base;
+    if (!style) return base;
+    return base.toLowerCase().includes(style.toLowerCase().slice(0, 14)) ? base : `${base} ${style}.`;
+  };
+  const VALID_CONN = new Set(["eyes", "mouth", "face", "headtop", "hand", "chest", "neck", "back", "feet"]);
+  const VALID_ANCHOR = new Set(["center", "bottom", "top"]);
+  const slots = (Array.isArray(plan?.slots) ? plan.slots : []).slice(0, 6).map((slot, index) => {
+    const name = cleanText(slot?.name) || `Slot ${index + 1}`;
+    const conn = cleanText(slot?.connection).toLowerCase();
+    const anchor = cleanText(slot?.anchor).toLowerCase();
+    const variants = (Array.isArray(slot?.variants) ? slot.variants : [])
+      .slice(0, 3)
+      .map((variant) => ({ name: cleanText(variant?.name) || name, prompt: appendFraming(withStyle(variant?.prompt), FRAMING_TRAIT) }))
+      .filter((variant) => variant.prompt);
+    return {
+      name,
+      connection: VALID_CONN.has(conn) ? conn : "face",
+      anchor: VALID_ANCHOR.has(anchor) ? anchor : "center",
+      variants
+    };
+  }).filter((slot) => slot.variants.length);
+
+  return {
+    title: cleanText(plan?.title) || "Layer-First Character",
+    style,
+    background: {
+      name: cleanText(plan?.background?.name) || "Background",
+      prompt: withStyle(plan?.background?.prompt) || `A soft simple gradient background filling the whole canvas. ${style}`
+    },
+    base: {
+      name: cleanText(plan?.base?.name) || "Base Body",
+      prompt: appendFraming(
+        withStyle(plan?.base?.prompt) || `A character body, full body, front-facing, centered, with a COMPLETELY BLANK face — NO eyes, NO nose, NO mouth — and NO accessories of any kind. Only the bare body, head and limbs. ${style}. Transparent background, one isolated character.`,
+        FRAMING_BASE
+      )
+    },
+    slots
+  };
+}
+
+// Plan N fresh, distinct trait variants for an existing layer-first slot. Each prompt
+// describes ONLY the isolated trait (no body) so it can be seated into the slot cleanly.
+async function planSlotVariants(apiKey, { layerName, connection, style, existingNames = [], count = 1 }) {
+  const n = Math.max(1, Math.min(8, Number(count) || 1));
+  const system = [
+    "You design swappable trait variants for a LAYER-FIRST NFT character builder.",
+    `You are given ONE trait slot: "${cleanText(layerName)}" (attaches at the character's "${cleanText(connection) || "body"}" connection point).`,
+    "Return JSON ONLY (no markdown).",
+    `Schema: {"variants":[{"name":string,"prompt":string}]} with EXACTLY ${n} variant${n === 1 ? "" : "s"}.`,
+    "Each variant must be a DISTINCT design idea for this trait (different shape/color/theme).",
+    `Each prompt MUST describe ONLY that single trait floating ALONE on a transparent background, and MUST explicitly forbid drawing the body/head/face/character (e.g. "ONLY the ${cleanText(layerName)} alone, NO head, NO body, NO character").`,
+    "DRAW AWARENESS: describe the trait as a COMPLETE whole object at a front-facing angle with a clear CONTACT AREA where it meets the body (a full hat brim, a full graspable handle). Do NOT pre-cut or pre-occlude the part that tucks behind the body — the builder trims hidden sections and redraws the body's parts (ears, fingers) in front automatically.",
+    style ? `Apply this shared art style to every prompt so it matches the collection: ${cleanText(style)}.` : "",
+    existingNames.length ? `Avoid duplicating these existing variants: ${existingNames.map(cleanText).filter(Boolean).join(", ")}.` : ""
+  ].filter(Boolean).join("\n");
+
+  const body = {
+    model: "gpt-5.4",
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      { role: "user", content: [{ type: "input_text", text: `Design ${n} distinct "${cleanText(layerName)}" variants.` }] }
+    ]
+  };
+  const parsed = await callOpenAIJson(apiKey, body);
+  const variants = (Array.isArray(parsed?.variants) ? parsed.variants : [])
+    .slice(0, n)
+    .map((variant, index) => ({
+      name: cleanText(variant?.name) || `${cleanText(layerName)} ${index + 1}`,
+      prompt: appendFraming(cleanText(variant?.prompt), FRAMING_TRAIT)
+    }))
+    .filter((variant) => variant.prompt);
+  return variants;
+}
+
+// One vision call: locate the requested connection-zone boxes on the real base body.
+async function locateConnectionPoints(apiKey, baseDataUrl, connectionKeys) {
+  const keys = Array.from(new Set((connectionKeys || []).map((key) => cleanText(key).toLowerCase()).filter(Boolean)));
+  if (!keys.length || !baseDataUrl) return {};
+
+  const describe = {
+    eyes: "the eye line on the face (where eyes or a visor attach)",
+    face: "the central face area",
+    mouth: "the mouth area, below the eyes",
+    headtop: "the region directly ON TOP of the head where a hat or crown rests — its BOTTOM edge is the top of the skull",
+    hand: "where a hand or paw holds an item, lower front of the body",
+    chest: "the chest / torso front area",
+    neck: "the neck or collar area between the head and the shoulders",
+    back: "the area behind the shoulders, for wings or a cape",
+    feet: "the feet or base area at the bottom of the body"
+  };
+  const lines = keys.map((key) => `- ${key}: ${describe[key] || key}`).join("\n");
+  const system = [
+    "You see a front-facing character BASE BODY on a transparent background (blank face, no accessories).",
+    "Return JSON ONLY giving normalized 0..1 connection-zone boxes where swappable traits attach to this body.",
+    'For each requested key return {"cx":n,"cy":n,"w":n,"h":n} — cx,cy is the box CENTER, w,h its size, all 0..1, top-left origin.',
+    "Measure against THIS body's actual drawn position, not a generic template.",
+    "Requested keys:",
+    lines,
+    `Output exactly: {${keys.map((key) => `"${key}":{...}`).join(",")}}. No extra keys, no markdown.`
+  ].join("\n");
+
+  const body = {
+    model: "gpt-5.4",
+    input: [
+      { role: "system", content: [{ type: "input_text", text: system }] },
+      { role: "user", content: [{ type: "input_text", text: "Base body:" }, { type: "input_image", image_url: baseDataUrl, detail: "high" }] }
+    ]
+  };
+  const boxes = await callOpenAIJson(apiKey, body);
+  return normalizeConnectionBoxes(boxes, keys);
+}
+
+function normalizeConnectionBoxes(boxes, keys) {
+  const fallback = {
+    eyes: { cx: 0.5, cy: 0.4, w: 0.34, h: 0.12 },
+    face: { cx: 0.5, cy: 0.42, w: 0.4, h: 0.2 },
+    mouth: { cx: 0.5, cy: 0.52, w: 0.22, h: 0.1 },
+    headtop: { cx: 0.5, cy: 0.2, w: 0.44, h: 0.14 },
+    hand: { cx: 0.62, cy: 0.66, w: 0.28, h: 0.16 },
+    chest: { cx: 0.5, cy: 0.62, w: 0.4, h: 0.22 },
+    neck: { cx: 0.5, cy: 0.5, w: 0.3, h: 0.1 },
+    back: { cx: 0.5, cy: 0.45, w: 0.6, h: 0.4 },
+    feet: { cx: 0.5, cy: 0.9, w: 0.4, h: 0.12 }
+  };
+  const clamp01 = (value, fallbackValue) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(0, Math.min(1, parsed)) : fallbackValue;
+  };
+  const out = {};
+  for (const key of keys) {
+    const box = boxes?.[key] || {};
+    const fb = fallback[key] || fallback.face;
+    out[key] = {
+      cx: clamp01(box.cx, fb.cx),
+      cy: clamp01(box.cy, fb.cy),
+      w: Math.max(0.05, clamp01(box.w, fb.w)),
+      h: Math.max(0.05, clamp01(box.h, fb.h))
+    };
+  }
+  return out;
 }
 
 async function generateImageAsset({ apiKey, prompt, size, background }) {

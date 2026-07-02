@@ -1401,6 +1401,311 @@ app.post("/api/projects/:projectId/layers/:layerId/variants", async (req, res, n
   }
 });
 
+// Layer-first build: plan slots -> blank base -> measure connection points ->
+// isolated traits seated into slots -> composite preview. This is the cheap,
+// bleed-proof, genuinely-swappable pipeline (vs the preview-then-decompose path).
+app.post("/api/projects/:projectId/build-layer-first", async (req, res, next) => {
+  try {
+    const apiKey = getApiKey();
+    const project = await projectService.readProject(req.params.projectId);
+    const promptText =
+      cleanText(req.body?.prompt) ||
+      cleanText(project.artDirection) ||
+      cleanText(project.title) ||
+      "a cute swappable mascot";
+    const canvas = project.canvas || { width: 1024, height: 1024, generationSize: "1024x1024" };
+    const canvasW = canvas.width || 1024;
+    const canvasH = canvas.height || 1024;
+    const generationSize = canvas.generationSize || "1024x1024";
+    const stats = { imageGens: 0, visionCalls: 0 };
+    const warnings = [];
+    const now = () => new Date().toISOString();
+    const toDataUrl = (buf) => `data:image/png;base64,${buf.toString("base64")}`;
+
+    // 1) Plan the swappable layer stack from the user's idea.
+    const plan = await openaiService.planLayerFirstCollection(apiKey, promptText, canvas);
+    stats.visionCalls += 1;
+
+    // Persist a buffer as a single-or-multi-variant layer (identity transform — already seated).
+    const buildLayer = async (name, parts) => {
+      const layerId = createId("layer");
+      const folder = path.join(generatedDir, project.id, "layers", layerId);
+      await fs.mkdir(folder, { recursive: true });
+      const variants = [];
+      for (const part of parts) {
+        const variantId = createId("variant");
+        const filename = `${variantId}.png`;
+        await fs.writeFile(path.join(folder, filename), part.buffer);
+        const analysis = await assetToolService.inspectPngBuffer(part.buffer);
+        variants.push({
+          id: variantId,
+          name: part.name,
+          notes: part.notes || "",
+          prompt: part.prompt || "",
+          imageUrl: `/generated/${project.id}/layers/${layerId}/${filename}`,
+          analysis,
+          createdAt: now()
+        });
+      }
+      return {
+        id: layerId,
+        name,
+        description: "",
+        placementNotes: "",
+        variantIdeas: [],
+        variants,
+        selectedVariantId: variants[0]?.id || null,
+        transform: { x: 0, y: 0, scale: 1, rotation: 0 },
+        fitContract: null,
+        region: null,
+        layerRole: null,
+        connectionSlot: null,
+        structuralOpening: null
+      };
+    };
+
+    // Generate one image, retrying once if the trait comes back empty.
+    const genIsolated = async (prompt, background) => {
+      let asset = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        asset = await openaiService.generateImageAsset({ apiKey, prompt, size: generationSize, background });
+        stats.imageGens += 1;
+        const meta = await assetToolService.inspectPngBuffer(asset.buffer);
+        if (background === "opaque" || (meta.bounds && !meta.emptyAlpha && meta.alphaCoverage > 0.004)) break;
+      }
+      return asset.buffer;
+    };
+
+    // 2) Background (opaque, full canvas).
+    const bgBuffer = await resizePng(await genIsolated(plan.background.prompt, "opaque"), canvas);
+
+    // 3) Blank base body (transparent) — seated with headroom above the head so
+    //    headtop traits have room and the body stays inside the safe frame.
+    const baseBuffer = await seatBaseOnCanvas(await genIsolated(plan.base.prompt, "transparent"), canvasW, canvasH);
+
+    // 4) Locate connection points on the REAL seated base. Measure them deterministically
+    //    from the body's pixels (reliable + free); fall back to a vision call only if the
+    //    body couldn't be measured.
+    const connectionKeys = plan.slots.map((slot) => slot.connection);
+    const geo = await assetToolService.analyzeAnchorGeometry(baseBuffer);
+    let boxes = deriveConnectionBoxes(geo, connectionKeys);
+    if (!boxes) {
+      boxes = await openaiService.locateConnectionPoints(apiKey, toDataUrl(baseBuffer), connectionKeys);
+      stats.visionCalls += 1;
+    }
+
+    // 5) Traits — generated ISOLATED (cannot bleed), then seated into measured slots.
+    const slotLayers = [];
+    for (const slot of plan.slots) {
+      const box = boxes[slot.connection] || boxes.face || { cx: 0.5, cy: 0.42, w: 0.4, h: 0.2 };
+      // Held items are always gripped by the paw regardless of the planner's anchor
+      // guess, so the item is raised in hand instead of planted on the floor.
+      const anchor = slot.connection === "hand" ? "grip" : slot.anchor;
+      const parts = [];
+      for (const variant of slot.variants) {
+        const traitBuffer = await genIsolated(variant.prompt, "transparent");
+        const seated = await seatTraitOnCanvas(traitBuffer, box, anchor, canvasW, canvasH);
+        if (!seated) {
+          warnings.push(`${slot.name} / ${variant.name} came back empty — skipped.`);
+          continue;
+        }
+        // Ground it: contact shadow beneath + occluder (ears over hat / paw over staff)
+        // on top, baked into the seated PNG so the trait doesn't read as pasted-on.
+        const grounded = await groundTrait(seated, baseBuffer, slot.connection, box, geo, canvasW, canvasH);
+        parts.push({
+          buffer: grounded,
+          name: variant.name,
+          prompt: variant.prompt,
+          notes: `Seated into the ${slot.connection} connection slot. Swappable.`
+        });
+      }
+      if (!parts.length) {
+        warnings.push(`${slot.name} produced no usable variants — slot skipped.`);
+        continue;
+      }
+      const slotLayer = await buildLayer(slot.name, parts);
+      // Remember the measured slot so "Add Variant" can re-seat new traits without a vision pass.
+      slotLayer.layerRole = "trait";
+      slotLayer.connectionSlot = { connection: slot.connection, anchor, box };
+      slotLayers.push(slotLayer);
+    }
+
+    const bgLayer = await buildLayer(plan.background.name, [{ buffer: bgBuffer, name: "Scene", prompt: plan.background.prompt }]);
+    bgLayer.layerRole = "background";
+    const baseLayer = await buildLayer(plan.base.name, [{ buffer: baseBuffer, name: "Body", prompt: plan.base.prompt }]);
+    baseLayer.layerRole = "base";
+
+    // 6) Compose layers back-to-front: background, base, then slots in planner order.
+    const layers = [bgLayer, baseLayer, ...slotLayers];
+
+    // 7) Composite a preview from the selected stack.
+    const selectedBuffers = [];
+    for (const layer of layers) {
+      const sel = layer.variants.find((v) => v.id === layer.selectedVariantId) || layer.variants[0];
+      if (sel) selectedBuffers.push(await fs.readFile(publicAssetUrlToAbsolutePath(sel.imageUrl)));
+    }
+    const previewBuffer = await sharp({ create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+      .composite(selectedBuffers.map((input) => ({ input, left: 0, top: 0 })))
+      .png()
+      .toBuffer();
+    const previewId = createId("preview");
+    const previewFolder = path.join(generatedDir, project.id, "preview");
+    await fs.mkdir(previewFolder, { recursive: true });
+    await fs.writeFile(path.join(previewFolder, `${previewId}.png`), previewBuffer);
+
+    // 8) Replace the project's layers with the layer-first stack.
+    project.title = plan.title || project.title;
+    project.layers = layers;
+    project.proposedLayers = [];
+    project.previewHistory = [
+      {
+        id: previewId,
+        name: `Layer-First ${(project.previewHistory || []).length + 1}`,
+        imageUrl: `/generated/${project.id}/preview/${previewId}.png`,
+        prompt: promptText,
+        notes: "Composited from seated swappable layers.",
+        createdAt: now()
+      },
+      ...(project.previewHistory || [])
+    ].slice(0, 12);
+    project.selectedPreviewId = previewId;
+    project.planSummary = `Layer-first build: ${plan.base.name} + ${slotLayers.map((l) => l.name).join(", ") || "no traits"} seated into measured connection slots.`;
+    project.styleGuide = plan.style || project.styleGuide || "";
+    project.chatHistory = [
+      ...(project.chatHistory || []),
+      { id: createId("user"), role: "user", text: promptText, createdAt: now() },
+      {
+        id: createId("draw-tech"),
+        role: "assistant",
+        text: `Built layer-first: blank base body, located the connection points on it, then generated each trait isolated and seated it into its slot — ${stats.imageGens} image gens + ${stats.visionCalls} vision calls, zero prompt bleed. Toggle any slot's variants for a clean swap.`,
+        createdAt: now()
+      }
+    ].slice(-24);
+    project.updatedAt = now();
+    await projectService.writeProject(project);
+
+    res.json({ project, plan, stats, warnings });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Layer-first "Add Variant": append swappable variants to an existing slot (or a
+// background), staying entirely within the isolated-and-seat pipeline. Base layers
+// are refused because regenerating the base would move the measured connection points.
+app.post("/api/projects/:projectId/layers/:layerId/seat-variants", async (req, res, next) => {
+  try {
+    const apiKey = getApiKey();
+    const count = clampVariantCount(req.body?.count);
+    const project = await projectService.readProject(req.params.projectId);
+    const layer = project.layers.find((l) => l.id === req.params.layerId);
+    if (!layer) {
+      res.status(404).json({ error: `Layer ${req.params.layerId} was not found.` });
+      return;
+    }
+
+    const canvas = project.canvas || { width: 1024, height: 1024, generationSize: "1024x1024" };
+    const canvasW = canvas.width || 1024;
+    const canvasH = canvas.height || 1024;
+    const generationSize = canvas.generationSize || "1024x1024";
+    const style = cleanText(project.styleGuide);
+    const now = () => new Date().toISOString();
+    const warnings = [];
+    const folder = path.join(generatedDir, project.id, "layers", layer.id);
+    await fs.mkdir(folder, { recursive: true });
+
+    const genOne = async (prompt, background) => {
+      let asset = null;
+      for (let attempt = 1; attempt <= 2; attempt += 1) {
+        asset = await openaiService.generateImageAsset({ apiKey, prompt, size: generationSize, background });
+        const meta = await assetToolService.inspectPngBuffer(asset.buffer);
+        if (background === "opaque" || (meta.bounds && !meta.emptyAlpha && meta.alphaCoverage > 0.004)) break;
+      }
+      return asset.buffer;
+    };
+    const saveVariant = async (buffer, name, prompt, notes) => {
+      const variantId = createId("variant");
+      const filename = `${variantId}.png`;
+      await fs.writeFile(path.join(folder, filename), buffer);
+      const analysis = await assetToolService.inspectPngBuffer(buffer);
+      const variant = {
+        id: variantId,
+        name,
+        notes: notes || "",
+        prompt: prompt || "",
+        imageUrl: `/generated/${project.id}/layers/${layer.id}/${filename}`,
+        analysis,
+        createdAt: now()
+      };
+      layer.variants.push(variant);
+      return variant;
+    };
+
+    const added = [];
+
+    if (layer.layerRole === "base") {
+      res.status(400).json({ error: "The base body defines the connection points — regenerating it would misplace every seated trait. Use ⚡ Build Layer-First to rebuild the whole character instead." });
+      return;
+    }
+
+    if (layer.connectionSlot?.box) {
+      // Trait slot: plan fresh isolated ideas, generate them, seat into the stored box.
+      const slot = layer.connectionSlot;
+      // Load the base body so new variants get the same grounding (contact shadow +
+      // ears-over-hat / paw-over-staff occluders) as the original build.
+      let baseBuffer = null;
+      let geo = null;
+      const baseLayer = project.layers.find((l) => l.layerRole === "base");
+      const baseSel = baseLayer && (baseLayer.variants.find((v) => v.id === baseLayer.selectedVariantId) || baseLayer.variants[0]);
+      if (baseSel?.imageUrl) {
+        try {
+          baseBuffer = await fs.readFile(publicAssetUrlToAbsolutePath(baseSel.imageUrl));
+          geo = await assetToolService.analyzeAnchorGeometry(baseBuffer);
+        } catch { /* grounding is best-effort; seat without it if the base can't be read */ }
+      }
+      const ideas = await openaiService.planSlotVariants(apiKey, {
+        layerName: layer.name,
+        connection: slot.connection,
+        style,
+        existingNames: (layer.variants || []).map((v) => v.name),
+        count
+      });
+      for (const idea of ideas) {
+        const raw = await genOne(idea.prompt, "transparent");
+        const seated = await seatTraitOnCanvas(raw, slot.box, slot.anchor || "center", canvasW, canvasH);
+        if (!seated) {
+          warnings.push(`${idea.name} came back empty — skipped.`);
+          continue;
+        }
+        const grounded = baseBuffer
+          ? await groundTrait(seated, baseBuffer, slot.connection, slot.box, geo, canvasW, canvasH)
+          : seated;
+        added.push(await saveVariant(grounded, idea.name, idea.prompt, `Seated into the ${slot.connection} slot. Swappable.`));
+      }
+    } else if (layer.layerRole === "background" || isFullCanvasBackgroundLayerName(layer.name)) {
+      // Background: full-canvas opaque variations, no seating needed.
+      const basePrompt = cleanText(layer.variants?.[0]?.prompt) || `A full-canvas background scene. ${style}`;
+      for (let i = 0; i < count; i += 1) {
+        const prompt = `${basePrompt} Variation: a distinctly different palette and mood, full canvas, no character.`;
+        const buffer = await resizePng(await genOne(prompt, "opaque"), canvas);
+        added.push(await saveVariant(buffer, `${layer.name} ${(layer.variants?.length || 0) + 1}`, prompt, "Background variation."));
+      }
+    } else {
+      res.status(400).json({ error: "This layer isn't a layer-first slot. Rebuild the project with ⚡ Build Layer-First to make its layers swappable." });
+      return;
+    }
+
+    if (!layer.selectedVariantId && layer.variants.length) {
+      layer.selectedVariantId = layer.variants[0].id;
+    }
+    project.updatedAt = now();
+    await projectService.writeProject(project);
+    res.json({ project, variants: added, warnings });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/projects/:projectId/apply-combo", async (req, res, next) => {
   try {
     const project = await projectService.readProject(req.params.projectId);
@@ -2266,6 +2571,425 @@ async function resizePng(buffer, canvas) {
     })
     .png()
     .toBuffer();
+}
+
+// Fraction of the canvas kept clear on every edge so seated traits never touch or
+// hang over the border. ~3.5% ≈ 36px on a 1024 canvas.
+const CANVAS_SAFE_MARGIN = 0.035;
+
+// Layer-first seating: take an isolated trait PNG, crop to its drawn content, scale
+// it to the measured connection box, and bake it onto a full-canvas transparent PNG.
+//   anchor "center" (eyes, mouth, chest): the trait sits centered in the zone.
+//   anchor "bottom" (hats, collars): the trait rests its bottom on the zone and
+//     rises above it. "top" is the mirror (hangs downward from the zone).
+//   anchor "grip" (held items — staff/wand/sword): the paw grips the item GRIP_FRAC
+//     down its length, so the decorated top rises aloft above the hand and the base
+//     stays above the feet.
+// Every trait is scaled so its ENTIRE bounding box stays inside the safe-margin
+// frame — a trait is shrunk to fit rather than allowed to hang over the edge.
+// Returns null if the trait is empty.
+async function seatTraitOnCanvas(buffer, box, anchor, canvasW, canvasH) {
+  const meta = await assetToolService.inspectPngBuffer(buffer);
+  if (!meta.bounds || meta.emptyAlpha) return null;
+  const bw = meta.bounds.right - meta.bounds.left + 1;
+  const bh = meta.bounds.bottom - meta.bounds.top + 1;
+  const content = await sharp(buffer)
+    .extract({ left: meta.bounds.left, top: meta.bounds.top, width: bw, height: bh })
+    .png()
+    .toBuffer();
+
+  // Safe frame the trait must stay entirely within.
+  const minX = CANVAS_SAFE_MARGIN * canvasW;
+  const maxX = (1 - CANVAS_SAFE_MARGIN) * canvasW;
+  const minY = CANVAS_SAFE_MARGIN * canvasH;
+  const maxY = (1 - CANVAS_SAFE_MARGIN) * canvasH;
+  const cx = box.cx * canvasW;
+
+  // Held items grip the paw GRIP_FRAC of the way down their length (the rest, with the
+  // decorated top, rises aloft above the hand). ~0.4 keeps the crystal clearly above
+  // the grip while leaving the base off the floor.
+  const GRIP_FRAC = 0.4;
+
+  // The fixed edge/center the trait seats against.
+  let anchorY;
+  if (anchor === "bottom") anchorY = (box.cy + box.h / 2) * canvasH; // trait bottom
+  else if (anchor === "top") anchorY = (box.cy - box.h / 2) * canvasH; // trait top
+  else anchorY = box.cy * canvasH; // trait center / grip point (the paw)
+
+  // Desired size. For center traits, fit the zone height. For bottom/top traits
+  // (hats, antennas) the box height is only a shallow CONTACT depth that sets where
+  // the brim rests — it must NOT limit the trait's size, or a high brim would force
+  // a tiny hat. Grip (held) items use a tall held-item target. Size is otherwise
+  // governed by the available headroom (hByMargin below).
+  const wDesired = box.w * canvasW;
+  const hDesired = anchor === "center"
+    ? box.h * canvasH
+    : anchor === "grip"
+      ? canvasH * 0.3
+      : canvasH * 0.34;
+
+  // Hard ceiling on size so the trait's whole box fits inside the safe frame,
+  // given where it seats. Horizontally it centers on cx; vertically it grows away
+  // from the anchor edge.
+  const wByMargin = 2 * Math.min(cx - minX, maxX - cx);
+  let hByMargin;
+  if (anchor === "bottom") hByMargin = anchorY - minY; // grows up toward the top margin
+  else if (anchor === "top") hByMargin = maxY - anchorY; // grows down toward the bottom margin
+  else if (anchor === "grip") {
+    // The item extends GRIP_FRAC up and (1-GRIP_FRAC) down from the paw; both ends
+    // must stay inside the frame.
+    hByMargin = Math.min((anchorY - minY) / GRIP_FRAC, (maxY - anchorY) / (1 - GRIP_FRAC));
+  } else hByMargin = 2 * Math.min(anchorY - minY, maxY - anchorY); // grows both ways
+
+  const wLimit = Math.max(8, Math.min(wDesired, wByMargin));
+  const hLimit = Math.max(8, Math.min(hDesired, hByMargin));
+
+  // Fit within both limits, aspect preserved (min-scale — never distorts, never overflows).
+  const scale = Math.min(wLimit / bw, hLimit / bh);
+  const tw = Math.max(8, Math.round(bw * scale));
+  const th = Math.max(8, Math.round(bh * scale));
+
+  // Position from the anchor, then clamp into the safe frame as a final backstop.
+  let left = Math.round(cx - tw / 2);
+  let top;
+  if (anchor === "bottom") top = Math.round(anchorY - th);
+  else if (anchor === "top") top = Math.round(anchorY);
+  else if (anchor === "grip") top = Math.round(anchorY - GRIP_FRAC * th);
+  else top = Math.round(anchorY - th / 2);
+  left = Math.max(Math.round(minX), Math.min(Math.round(maxX) - tw, left));
+  top = Math.max(Math.round(minY), Math.min(Math.round(maxY) - th, top));
+
+  const resized = await sharp(content).resize(tw, th, { fit: "fill" }).png().toBuffer();
+  return sharp({ create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+    .composite([{ input: resized, left, top }])
+    .png()
+    .toBuffer();
+}
+
+// Per-connection soft CONTACT-SHADOW tuning for traits that REST ON the body (a hat
+// brim on the forehead, a scarf on the chest). The shadow is the trait's own
+// silhouette shifted down by (dx,dy) and blurred, then CLIPPED to the body's alpha
+// (multiplied) so it hugs the fur just under the trait and NEVER floats in the air
+// where the trait overhangs the head — `opacity` is the peak darkness (0..1). This
+// replaced a full-silhouette straight offset that produced a hard rectangular box on
+// the forehead. Offsets/blur are px at a 1024 reference, scaled by canvas height.
+// Held items (hand) get NO shadow (raised aloft, nothing to cast onto); flush facial
+// features (eyes/face/mouth) get none either. Verified against free re-composites of
+// the wizard-cat (cand_v3): a soft crescent under the brim, no box.
+const TRAIT_CONTACT_SHADOW = {
+  headtop: { dx: 2, dy: 15, blur: 9, opacity: 0.34 },
+  neck: { dx: 2, dy: 10, blur: 8, opacity: 0.20 },
+  chest: { dx: 2, dy: 11, blur: 9, opacity: 0.18 },
+  back: { dx: 3, dy: 12, blur: 11, opacity: 0.16 },
+  feet: { dx: 2, dy: 7, blur: 8, opacity: 0.18 }
+};
+
+// Ground a seated trait onto the body so it doesn't read as a flat pasted-on layer:
+//   1) a soft CONTACT SHADOW beneath the trait (grounds a hat brim on the forehead,
+//      a held staff on the paw), and
+//   2) an OCCLUDER — redraw the base part that physically sits IN FRONT of the trait
+//      (ears over a hat brim, the raised paw's fingers over a held staff) back on top.
+// All three (shadow, trait, occluder) are baked into ONE full-canvas PNG, so the
+// existing single-image-per-variant compositing (stored preview AND the live
+// /preview/render path) shows them with no changes to the compositor, normalizer, or
+// frontend. Base-derived and free — no API. Falls back to the ungrounded trait on any
+// error. `geo` is the base geometry from analyzeAnchorGeometry.
+// Grounding (trim + contact shadow + occluder segmenting) is DISABLED by default.
+// Empirically it degraded the art more than it helped: the trim flattened a hat's
+// brim and gapped a held shaft, and the occluder step re-pastes flat base crops that
+// leave hard rectangular seams / horizontal banding. The plain SEATED trait composited
+// in natural stack order reads correctly (fingers around a staff, hat on the head) and
+// looks clean. The tool code below is kept for a future, gentler pass — flip GROUND_TRAITS
+// to re-enable. Set per-connection if/when a specific case (a hat's back brim poking out)
+// genuinely needs it, rather than applying surgery to every trait.
+const GROUND_TRAITS = false;
+
+async function groundTrait(seatedBuffer, baseBuffer, connection, box, geo, canvasW, canvasH) {
+  if (!GROUND_TRAITS) return seatedBuffer;
+  try {
+    const k = canvasH / 1024;
+    const seatedMeta = await assetToolService.inspectPngBuffer(seatedBuffer);
+    if (!seatedMeta.bounds) return seatedBuffer;
+    const t = seatedMeta.bounds; // seated trait's opaque bounds (px)
+    const pieces = [];
+
+    // 0) LAYER TRIMMING: erase the trait pixels that are hidden BEHIND the body at this
+    //    connection (a hat's back brim tucked behind the head, a shaft behind the palm),
+    //    so no wrong edge/shadow shows in front. Everything downstream uses the trimmed
+    //    trait. Parts that flare BEYOND the body silhouette survive (a hat's outer brim).
+    const trait = baseBuffer
+      ? await trimHiddenTraitRegions(seatedBuffer, baseBuffer, connection, box, geo, t, canvasW, canvasH)
+      : seatedBuffer;
+
+    // 1) Contact shadow: a soft CONTOUR that hugs the body under the trait, clipped to
+    //    the body alpha so nothing floats where the trait overhangs the head. For a hat
+    //    it's a CRESCENT under the FRONT brim only (floorTop kills any shadow behind the
+    //    head, where the back brim was just trimmed away).
+    const shadowCfg = TRAIT_CONTACT_SHADOW[connection];
+    if (shadowCfg && baseBuffer) {
+      const band = trimBehindBand(connection, box, geo, t, canvasW, canvasH);
+      const floorTop = connection === "headtop" && band ? band.top + Math.round(canvasH * 0.008) : null;
+      const shadow = await buildContourShadow(trait, baseBuffer, shadowCfg, k, canvasW, canvasH, floorTop);
+      if (shadow) pieces.push({ input: shadow, left: 0, top: 0 });
+    }
+
+    // 2) The trait itself (trimmed).
+    pieces.push({ input: trait, left: 0, top: 0 });
+
+    // 3) Occluder (LAYER SEGMENTING): the base region that sits in front of the trait,
+    //    redrawn on top so the body interleaves with the trait (ears/head over the hat
+    //    brim, fingertips over the held shaft).
+    pieces.push(...(await buildTraitOccluders(baseBuffer, connection, t, box, geo, canvasW, canvasH)));
+
+    if (pieces.length <= 1) return seatedBuffer; // nothing to add (e.g. eyes)
+    return await sharp({ create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+      .composite(pieces).png().toBuffer();
+  } catch (err) {
+    console.warn(`[groundTrait] ${connection}: ${err.message} — using ungrounded trait`);
+    return seatedBuffer;
+  }
+}
+
+// A contour contact shadow: the trait's alpha shifted down by (dx,dy) px, blurred,
+// then MULTIPLIED by the body alpha so it only lands on the body (a crescent under a
+// hat brim), never in the air where the brim overhangs. Tinted a cool near-black.
+// `floorTop` (optional px): rows above it get NO shadow, so a hat casts only a front
+// crescent and nothing behind the head. Returns a full-canvas RGBA PNG or null.
+async function buildContourShadow(seatedBuffer, baseBuffer, cfg, k, canvasW, canvasH, floorTop = null) {
+  const dy = Math.round((cfg.dy || 0) * k);
+  const dx = Math.round((cfg.dx || 0) * k);
+  const sigma = Math.max(0.3, (cfg.blur || 6) * k);
+  const K = cfg.opacity ?? 0.3;
+  const traitA = await sharp(seatedBuffer).ensureAlpha().extractChannel("alpha")
+    .resize(canvasW, canvasH, { fit: "fill" }).raw().toBuffer();
+  const baseA = await sharp(baseBuffer).ensureAlpha().extractChannel("alpha")
+    .resize(canvasW, canvasH, { fit: "fill" }).raw().toBuffer();
+  const shifted = Buffer.alloc(canvasW * canvasH, 0);
+  for (let y = 0; y < canvasH; y++) {
+    const sy = y - dy;
+    if (sy < 0 || sy >= canvasH) continue;
+    for (let x = 0; x < canvasW; x++) {
+      const sx = x - dx;
+      if (sx < 0 || sx >= canvasW) continue;
+      shifted[y * canvasW + x] = traitA[sy * canvasW + sx];
+    }
+  }
+  const blurred = await sharp(shifted, { raw: { width: canvasW, height: canvasH, channels: 1 } })
+    .blur(sigma).raw().toBuffer();
+  const rgba = Buffer.alloc(canvasW * canvasH * 4);
+  const floor = floorTop == null ? -1 : floorTop;
+  for (let y = 0; y < canvasH; y++) {
+    for (let x = 0; x < canvasW; x++) {
+      const i = y * canvasW + x;
+      const a = y < floor ? 0 : (blurred[i] / 255) * (baseA[i] / 255) * K;
+      rgba[i * 4] = 25; rgba[i * 4 + 1] = 15; rgba[i * 4 + 2] = 35;
+      rgba[i * 4 + 3] = Math.max(0, Math.min(255, Math.round(a * 255)));
+    }
+  }
+  return await sharp(rgba, { raw: { width: canvasW, height: canvasH, channels: 4 } }).png().toBuffer();
+}
+
+// ===== LAYER TRIMMING TOOL =====
+// Erase the parts of a seated trait that are HIDDEN behind the body at a connection
+// point, so a tucked-away section never renders a wrong edge or shadow in front. The
+// body is "in front" of the trait inside a per-connection BEHIND-BAND (see
+// trimBehindBand); wherever the base is opaque there, the trait's alpha is zeroed
+// (feathered so there's no hard seam). Trait pixels that flare BEYOND the body
+// silhouette in the band survive (a hat's outer brim tips still show). Base-derived and
+// free. Returns the trimmed trait PNG (or the original if there's nothing to trim).
+async function trimHiddenTraitRegions(seatedBuffer, baseBuffer, connection, box, geo, t, canvasW, canvasH) {
+  const band = trimBehindBand(connection, box, geo, t, canvasW, canvasH);
+  if (!band) return seatedBuffer;
+  const k = canvasH / 1024;
+  const baseA = await sharp(baseBuffer).ensureAlpha().extractChannel("alpha")
+    .resize(canvasW, canvasH, { fit: "fill" }).raw().toBuffer();
+  const keep = Buffer.alloc(canvasW * canvasH, 255); // 255 keep, 0 trim
+  const y0 = Math.max(0, band.top), y1 = Math.min(canvasH - 1, band.bottom);
+  const x0 = Math.max(0, band.left), x1 = Math.min(canvasW - 1, band.right);
+  const p = band.protect;
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      const i = y * canvasW + x;
+      if (baseA[i] <= 120) continue; // body transparent here → trait is on top → keep
+      if (p) {
+        const dx = Math.abs(x - p.cx);
+        if (dx <= p.coneHalf) continue; // protect the cone/central column (in front)
+        if (y >= p.frontLipTop && dx <= p.lipHalf) continue; // protect the front brim lip
+      }
+      keep[i] = 0; // body is in front here → hide the trait
+    }
+  }
+  const keepBlur = await sharp(keep, { raw: { width: canvasW, height: canvasH, channels: 1 } })
+    .blur(Math.max(0.3, (band.feather || 4) * k)).raw().toBuffer();
+  const img = await sharp(seatedBuffer).ensureAlpha().resize(canvasW, canvasH, { fit: "fill" }).raw().toBuffer();
+  const out = Buffer.from(img);
+  for (let i = 0; i < canvasW * canvasH; i++) out[i * 4 + 3] = Math.round((img[i * 4 + 3] * keepBlur[i]) / 255);
+  return await sharp(out, { raw: { width: canvasW, height: canvasH, channels: 4 } }).png().toBuffer();
+}
+
+// The per-connection BEHIND-BAND: the px rectangle where the body physically sits IN
+// FRONT of the trait, so trait pixels there (that overlap opaque body) are hidden.
+// Derived from measured geometry ratios so it generalizes across bodies. Returns null
+// when a connection has nothing tucked behind it. `t` = seated trait opaque bounds.
+function trimBehindBand(connection, box, geo, t, canvasW, canvasH) {
+  if (connection === "headtop" && geo?.bounds) {
+    // The back/inner brim wraps behind the head crown: the band runs from ~12% of the way
+    // down from the head crown to just past the seated brim, across the hat's columns.
+    // Only the INNER brim over the opaque head fur is cut; the outer brim tips (beyond the
+    // head width, where the base is transparent) survive. `protect` shields the cone/
+    // central column and the front brim lip so they're never trimmed even over opaque fur.
+    const halfW = (t.right - t.left) / 2;
+    const cx = (t.left + t.right) / 2;
+    const top = Math.round(geo.bounds.top + 0.12 * (t.bottom - geo.bounds.top));
+    const bottom = Math.round(t.bottom + canvasH * 0.03);
+    return {
+      top, bottom, left: t.left - 6, right: t.right + 6, feather: 4,
+      protect: { cx, coneHalf: 0.42 * halfW, frontLipTop: Math.round(t.bottom - 26 * (canvasH / 1024)), lipHalf: 0.95 * halfW }
+    };
+  }
+  // NOTE: `hand` deliberately returns null — the held item must NOT be trimmed behind the
+  // palm. Cutting the shaft where it crosses the palm leaves a GAP that reads as the staff
+  // dropping BEHIND the hand (a regression). The grip is done by the fingertip OCCLUDER
+  // alone (fingertips redrawn in front; the shaft stays in front of the palm below them).
+  return null;
+}
+
+// Redraw the base region(s) that belong IN FRONT of a seated trait. `t` is the seated
+// trait's opaque bounds (px). Returns composite pieces (base crops) to layer on top.
+async function buildTraitOccluders(baseBuffer, connection, t, box, geo, canvasW, canvasH) {
+  const pieces = [];
+  const cropBase = async (x0, y0, x1, y1) => {
+    const left = Math.max(0, Math.round(x0));
+    const top = Math.max(0, Math.round(y0));
+    const width = Math.min(canvasW - left, Math.round(x1) - left);
+    const height = Math.min(canvasH - top, Math.round(y1) - top);
+    if (width < 2 || height < 2) return null;
+    const crop = await sharp(baseBuffer).extract({ left, top, width, height }).png().toBuffer();
+    return { input: crop, left, top };
+  };
+
+  if (connection === "headtop" && geo?.bounds) {
+    // Ears (and the head's side outline) flank the hat: redraw the base to the LEFT and
+    // RIGHT of the seated hat's opaque columns, from the top of the head down to the
+    // brim's bottom edge, so they poke in front of the brim. The bands overlap a little
+    // INTO the hat columns (overlap) so the fur cleanly covers the trimmed inner-brim
+    // seam. Skipped automatically when the hat is as wide as the head (zero-width crops).
+    const padY = Math.round(canvasH * 0.01);
+    const overlap = Math.round(canvasW * 0.012);
+    const left = await cropBase(geo.bounds.left, geo.bounds.top, t.left + overlap, t.bottom + padY);
+    const right = await cropBase(t.right - overlap, geo.bounds.top, geo.bounds.right, t.bottom + padY);
+    if (left) pieces.push(left);
+    if (right) pieces.push(right);
+  } else if (connection === "hand") {
+    // The raised paw grips the held item with a MULTI-LAYER finger wrap: the shaft is
+    // already drawn IN FRONT of the palm (it's the trait, composited after the base);
+    // here we redraw ONLY the TOP of the paw box (the curled fingertips) back over the
+    // shaft, so the fingertips cap it in front while the shaft crosses the palm. This
+    // replaced redrawing the WHOLE fist, which buried the shaft behind a solid paw and
+    // read as the staff being behind the arm.
+    const cx = box.cx * canvasW;
+    const cy = box.cy * canvasH;
+    const hw = Math.max(canvasW * 0.05, (box.w * canvasW) / 2);
+    const hh = Math.max(canvasH * 0.05, (box.h * canvasH) / 2);
+    const boxTop = cy - hh;
+    const boxSplit = cy + hh * 0.2; // top of the paw down to just past its center
+    const fingertips = await cropBase(cx - hw, boxTop, cx + hw, boxSplit);
+    if (fingertips) pieces.push(fingertips);
+  }
+  return pieces;
+}
+
+// Seat the blank base body with reserved HEADROOM above the head so headtop traits
+// (hats, antennas) have room to be full-size while staying inside the frame. The
+// body is scaled to fit the side margins and the area below the reserved top band,
+// then anchored so its feet rest near the bottom margin. Connection points are
+// measured on THIS seated base, so trait boxes land correctly.
+async function seatBaseOnCanvas(buffer, canvasW, canvasH) {
+  const meta = await assetToolService.inspectPngBuffer(buffer);
+  if (!meta.bounds || meta.emptyAlpha) {
+    return resizePng(buffer, { width: canvasW, height: canvasH });
+  }
+  const bw = meta.bounds.right - meta.bounds.left + 1;
+  const bh = meta.bounds.bottom - meta.bounds.top + 1;
+  const content = await sharp(buffer)
+    .extract({ left: meta.bounds.left, top: meta.bounds.top, width: bw, height: bh })
+    .png()
+    .toBuffer();
+
+  const marginX = CANVAS_SAFE_MARGIN * canvasW;
+  const bottomMargin = CANVAS_SAFE_MARGIN * canvasH;
+  const topReserve = 0.18 * canvasH; // headroom band for hats / antennas
+  const availW = canvasW - 2 * marginX;
+  const availH = canvasH - topReserve - bottomMargin;
+  const scale = Math.min(availW / bw, availH / bh);
+  const tw = Math.max(8, Math.round(bw * scale));
+  const th = Math.max(8, Math.round(bh * scale));
+  const left = Math.round((canvasW - tw) / 2);
+  const top = Math.round(canvasH - bottomMargin - th); // feet near the bottom margin
+
+  const resized = await sharp(content).resize(tw, th, { fit: "fill" }).png().toBuffer();
+  return sharp({ create: { width: canvasW, height: canvasH, channels: 4, background: { r: 0, g: 0, b: 0, alpha: 0 } } })
+    .composite([{ input: resized, left, top }])
+    .png()
+    .toBuffer();
+}
+
+// Derive connection-point boxes DETERMINISTICALLY from the measured body geometry
+// (analyzeAnchorGeometry) instead of asking a vision model to guess pixel coords.
+// This is grounded in the actual drawn body: head/face line, shoulders, hand band,
+// and bounds. Returns null if the body couldn't be measured (caller falls back to
+// the vision call). All values are 0..1, top-left origin.
+function deriveConnectionBoxes(geo, keys) {
+  if (!geo || geo.empty || !geo.boundsRatio) return null;
+  const { x0, x1, y0, y1 } = geo.boundsRatio;
+  const cx = (x0 + x1) / 2;
+  const bodyW = Math.max(0.1, x1 - x0);
+  const bodyH = Math.max(0.1, y1 - y0);
+  const faceY = geo.face?.centerYRatio ?? (y0 + bodyH * 0.28);
+  const faceW = Math.max(0.12, geo.face?.widthRatio ?? bodyW * 0.6);
+  const headSpan = Math.max(0.05, faceY - y0); // top-of-head (or ear tips) down to the cheek line
+  const neckY = geo.neck?.centerYRatio ?? (y0 + bodyH * 0.45);
+  const shoulderY = geo.shoulder?.centerYRatio ?? (y0 + bodyH * 0.62);
+  const shoulderW = Math.max(0.2, geo.shoulder?.widthRatio ?? bodyW * 0.7);
+  const handY = geo.hand?.centerYRatio ?? (y1 - bodyH * 0.14);
+
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const mk = (bx, by, bw, bh) => ({ cx: clamp01(bx), cy: clamp01(by), w: clamp01(bw), h: clamp01(bh) });
+
+  // Hat brim RESTS ON the head just above the eyes — not floating over the crown.
+  // The box is a shallow contact band (h≈0.05); with anchor "bottom" the brim lands
+  // at y0 + 0.43*headSpan (43% of the way from the top of the head down to the face
+  // line). At 0.15 the brim floated well above the skull; 0.43 seats it on the head
+  // with the eyes still clear (verified against free re-composites at brim ~0.20).
+  const HEADTOP_H = 0.05;
+  const crownY = clamp01(y0 + headSpan * 0.43 - HEADTOP_H / 2);
+
+  // Eye line: the raw "face center" (widest row) is fooled by wide EARS and lands too
+  // high, so eyes seated there crowd the hat brim. Place the eye line at ~47% of the
+  // way from the top of the head down to the neck seam instead — the middle-ish of the
+  // real face mass (verified against free re-composites at eye-center ~0.355).
+  const eyesY = clamp01(y0 + (neckY - y0) * 0.47);
+  // A raised paw for a held item sits off-center; use the DETECTED paw x when present.
+  const handX = geo.hand?.raised && geo.hand?.xRatio != null ? geo.hand.xRatio : (cx - bodyW * 0.30);
+
+  const out = {};
+  for (const key of keys) {
+    switch (key) {
+      case "headtop": out[key] = mk(cx, crownY, Math.min(0.52, faceW * 0.95), HEADTOP_H); break;
+      case "eyes": out[key] = mk(cx, eyesY, Math.min(faceW * 0.72, bodyW * 0.6), 0.12); break;
+      case "face": out[key] = mk(cx, eyesY + (neckY - eyesY) * 0.25, faceW * 0.85, 0.2); break;
+      case "mouth": out[key] = mk(cx, eyesY + (neckY - eyesY) * 0.5, faceW * 0.45, 0.09); break;
+      case "neck": out[key] = mk(cx, neckY, Math.max(0.14, geo.neck?.widthRatio ?? bodyW * 0.4), 0.08); break;
+      case "chest": out[key] = mk(cx, shoulderY + (y1 - shoulderY) * 0.16, shoulderW * 0.6, 0.2); break;
+      // A held item is gripped by the raised paw (anchor "grip" in the seater raises the
+      // decorated top aloft above the hand). Box center = the measured paw point.
+      case "hand": out[key] = mk(handX, handY, Math.max(0.16, bodyW * 0.26), 0.2); break;
+      case "back": out[key] = mk(cx, shoulderY, bodyW * 0.85, bodyH * 0.4); break;
+      case "feet": out[key] = mk(cx, y1 - bodyH * 0.05, bodyW * 0.7, 0.1); break;
+      default: out[key] = mk(cx, faceY, faceW * 0.8, 0.2);
+    }
+  }
+  return out;
 }
 
 async function generatePreviewForProject(project, apiKey, attachments = []) {
